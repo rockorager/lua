@@ -19,6 +19,7 @@ const Parser = @import("../Parser.zig");
 const undump = @import("../undump.zig");
 const vm = @import("../vm.zig");
 const debuginfo = @import("../debuginfo.zig");
+const auxlib = @import("auxlib.zig");
 const gc = @import("../gc.zig");
 const number = @import("../number.zig");
 const root = @import("../root.zig");
@@ -142,22 +143,13 @@ pub fn checkTable(th: *Thread, base: u32, arg: u32, fname: []const u8) Error!*Ta
 
 /// A number or a string that converts to one, `lua_tonumberx`.
 pub fn toNumber(v: Value) ?number.Number {
-    return switch (v.tag) {
-        .int => .{ .int = v.asInt() },
-        .float => .{ .float = v.asFloat() },
-        .short_string, .long_string => number.parse(v.asString().bytes()),
-        else => null,
-    };
+    const n = vm.toNumber(v) orelse return null;
+    return if (n.tag == .int) .{ .int = n.asInt() } else .{ .float = n.asFloat() };
 }
 
 /// An integer, an integral float, or a string that converts to one,
 /// `lua_tointegerx`.
-pub fn toInteger(v: Value) ?i64 {
-    return switch (toNumber(v) orelse return null) {
-        .int => |i| i,
-        .float => |f| number.floatToInt(f, .exact),
-    };
-}
+pub const toInteger = vm.toInteger;
 
 /// `luaL_checkinteger`.
 pub fn checkInteger(th: *Thread, base: u32, arg: u32, fname: []const u8) Error!i64 {
@@ -243,55 +235,17 @@ fn callValue(th: *Thread, f: Value, args: []const Value, nresults: i16) Error!u3
 pub const index = vm.get;
 
 /// A number as `tostring` writes it, as a new string.
-pub fn numberToString(state: *State, v: Value) error{OutOfMemory}!*String {
-    var buf: [number.max_len]u8 = undefined;
-    return state.newString(formatNumber(&buf, v));
-}
+pub const numberToString = vm.numberToString;
 
 fn formatNumber(buf: *[number.max_len]u8, v: Value) []const u8 {
-    return if (v.tag == .int) number.formatInt(buf, v.asInt()) else number.formatFloat(buf, v.asFloat());
-}
-
-/// The address `%p` prints for a value, `lua_topointer`; null for values
-/// that are not objects.
-pub fn toPointer(v: Value) ?usize {
-    return switch (v.tag) {
-        .light_userdata, .native_fn => @intFromPtr(v.payload.ptr),
-        else => if (v.isCollectable()) @intFromPtr(v.payload.gc) else null,
-    };
+    return vm.formatNumber(v, buf);
 }
 
 /// The string `tostring` makes of a value, `luaL_tolstring`: `__tostring`
 /// when present (it must return a string or a number), otherwise the
 /// value's default form.
 pub fn toStringValue(th: *Thread, v: Value) Error!Value {
-    if (getMetafield(th, v, "__tostring")) |h| {
-        const func = try callValue(th, h, &.{v}, 1);
-        const r = th.stack[func];
-        th.top = func;
-        if (r.isString()) return r;
-        if (r.isNumber()) return .string(try numberToString(th.state, r));
-        return raise(th, "'__tostring' must return a string", .{});
-    }
-    switch (v.tag) {
-        .short_string, .long_string => return v,
-        .int, .float => return .string(try numberToString(th.state, v)),
-        .nil => return .string(try th.state.newString("nil")),
-        .bool_false => return .string(try th.state.newString("false")),
-        .bool_true => return .string(try th.state.newString("true")),
-        else => {
-            const kind = if (getMetafield(th, v, "__name")) |n|
-                (if (n.isString()) n.asString().bytes() else v.typeOf().name())
-            else
-                v.typeOf().name();
-            var buf: [128]u8 = undefined;
-            const s = if (toPointer(v)) |p|
-                std.fmt.bufPrint(&buf, "{s}: 0x{x}", .{ kind[0..@min(kind.len, 80)], p }) catch unreachable
-            else
-                std.fmt.bufPrint(&buf, "{s}: (nil)", .{kind[0..@min(kind.len, 80)]}) catch unreachable;
-            return .string(try th.state.newString(s));
-        },
-    }
+    return .string(try auxlib.tolstring(th, v));
 }
 
 /// Pushes a value and returns 1, for the common one-result case.
