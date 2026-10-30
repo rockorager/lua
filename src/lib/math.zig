@@ -318,7 +318,7 @@ fn toUnitFloat(x: u64) f64 {
 }
 
 fn rngOf(ud: *Userdata) *Rng {
-    return @ptrCast(auxlib.userdataBytes(ud).ptr);
+    return @ptrCast(ud.bytes().ptr);
 }
 
 fn rngArg(th: *Thread, base: u32) *Rng {

@@ -154,6 +154,23 @@ pub fn metatableOf(state: *const State, v: Value) ?*Table {
     };
 }
 
+/// Sets the metatable of any value (`lua_setmetatable`): a table's or
+/// full userdata's own, else the one its basic type shares.
+pub fn setMetatable(state: *State, v: Value, mt: ?*Table) void {
+    const mtv: Value = if (mt) |t| .table(t) else .nil;
+    switch (v.tag) {
+        .table => {
+            v.asTable().metatable = mt;
+            gc.barrier(&state.heap, &v.asTable().header, mtv);
+        },
+        .userdata => {
+            v.asUserdata().metatable = mt;
+            gc.barrier(&state.heap, &v.asUserdata().header, mtv);
+        },
+        else => state.metatables[@intFromEnum(v.typeOf())] = mt,
+    }
+}
+
 /// The handler for event `tm` in metatable `mt`, or null. For the fast
 /// events a miss is remembered in `mt.flags` until a key is added to `mt`.
 pub inline fn fastTm(state: *const State, mt: ?*Table, tm: Tm) ?Value {

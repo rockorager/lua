@@ -412,7 +412,7 @@ fn fileMeta(state: *State) ?*Table {
 }
 
 fn streamOf(u: *Userdata) *Stream {
-    return @ptrCast(@alignCast(aux.userdataBytes(u).ptr));
+    return @ptrCast(@alignCast(u.bytes().ptr));
 }
 
 /// `luaL_testudata(L, n, LUA_FILEHANDLE)`.

@@ -286,7 +286,7 @@ fn gmatch(th: *Thread, base: u32) Error!u32 {
     const init = posrelatI(try a.optInteger(3, 1), s.len) - 1;
     const heap = th.heap();
     const ud = try Userdata.create(heap, @sizeOf(pattern.Gmatch), 0);
-    const g: *pattern.Gmatch = @ptrCast(auxlib.userdataBytes(ud).ptr);
+    const g: *pattern.Gmatch = @ptrCast(ud.bytes().ptr);
     g.* = .init(s.bytes(), p.bytes(), init);
     const cl = try Proto.NativeClosure.create(heap, gmatchAux, 3);
     cl.setUpvalue(heap, 0, .string(s));
@@ -298,7 +298,7 @@ fn gmatch(th: *Thread, base: u32) Error!u32 {
 
 fn gmatchAux(th: *Thread, base: u32) Error!u32 {
     const cl = th.stack[base - 1].asNativeClosure();
-    const g: *pattern.Gmatch = @ptrCast(auxlib.userdataBytes(cl.upvalues()[2].asUserdata()).ptr);
+    const g: *pattern.Gmatch = @ptrCast(cl.upvalues()[2].asUserdata().bytes().ptr);
     const span = (g.next() catch return patternError(th, &g.m.diag)) orelse return 0;
     return pushCaptures(th, &g.m, span, true);
 }

@@ -242,6 +242,88 @@ pub fn where(th: *Thread, level: usize, w: *std.Io.Writer) std.Io.Writer.Error!v
     try w.print(":{d}: ", .{line});
 }
 
+/// Writes "stack traceback:" and a line per call level of `t` from
+/// `level` (0 is its running function), after `msg` and a newline when
+/// given, as `luaL_traceback` does: the first 10 and last 11 levels of a
+/// deeper stack.
+pub fn traceback(w: *std.Io.Writer, t: *Thread, msg: ?[]const u8, level_in: i64) std.Io.Writer.Error!void {
+    const levels1 = 10;
+    const levels2 = 11;
+    if (msg) |m| {
+        try w.writeAll(m);
+        try w.writeByte('\n');
+    }
+    try w.writeAll("stack traceback:");
+    const nframes: i64 = @intCast(t.frames.items.len);
+    // Levels 0 to `last` exist; frame 0 is the thread's base.
+    const last = nframes - 2;
+    var level: i64 = @max(level_in, 0);
+    var limit: i64 = if (last - level > levels1 + levels2) levels1 else -1;
+    while (level <= last) : (level += 1) {
+        if (limit == 0) {
+            // As the reference counts: the level found here is skipped too.
+            const n = last - level - levels2;
+            try w.print("\n\t...\t(skipping {d} levels)", .{n});
+            level += n;
+            limit -= 1;
+            continue;
+        }
+        limit -= 1;
+        const i: usize = @intCast(nframes - 1 - level);
+        const f = &t.frames.items[i];
+        const func = t.stack[f.func];
+        const p: ?*Proto = if (func.tag == .lua_closure) func.asLuaClosure().proto else null;
+        const src = if (p) |q| (if (q.source) |s| s.bytes() else "=?") else "=[C]";
+        try w.writeAll("\n\t");
+        try Thread.writeChunkId(w, src);
+        const line: ?u32 = if (p != null and f.flags.lua) p.?.lineAt(Thread.currentPc(p.?, f)) else null;
+        if (line) |l| try w.print(":{d}: in ", .{l}) else try w.writeAll(": in ");
+        if (funcName(t, i)) |n| {
+            try w.print("{s} '{s}'", .{ n.kind, n.name });
+        } else if (p != null and p.?.linedefined == 0) {
+            try w.writeAll("main chunk");
+        } else blk: {
+            var buf: [128]u8 = undefined;
+            if (globalFuncName(t.state, func, &buf)) |g| {
+                try w.print("function '{s}'", .{g});
+                break :blk;
+            }
+            if (p) |q| {
+                try w.writeAll("function <");
+                try Thread.writeChunkId(w, src);
+                try w.print(":{d}>", .{q.linedefined});
+            } else try w.writeAll("?");
+        }
+        if (f.flags.tail) try w.writeAll("\n\t(...tail calls...)");
+    }
+}
+
+/// Raises a message prefixed with the position of the Lua function that
+/// called the running native, as `luaL_error` does.
+pub fn raise(th: *Thread, comptime fmt: []const u8, args: anytype) Value.Error {
+    var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
+    defer aw.deinit();
+    where(th, 1, &aw.writer) catch return error.OutOfMemory;
+    aw.writer.print(fmt, args) catch return error.OutOfMemory;
+    return th.throw(.string(try th.state.newString(aw.written())));
+}
+
+/// "bad argument #arg to 'name' (msg)" about the running native, as
+/// `luaL_argerror` writes it. The name is the one the call site gives
+/// ("f" after `local f = string.rep`), else the function's name among the
+/// loaded modules, else `fallback`. A method call does not count `self`,
+/// and a bad `self` is "calling 'name' on bad self".
+pub fn argError(th: *Thread, arg: u32, fallback: []const u8, msg: []const u8) Value.Error {
+    const n = funcName(th, th.frames.items.len - 1);
+    var namebuf: [128]u8 = undefined;
+    const name = if (n) |v| v.name else globalFuncName(th.state, th.stack[th.frame().func], &namebuf) orelse fallback;
+    if (n != null and std.mem.eql(u8, n.?.kind, "method")) {
+        if (arg == 1) return raise(th, "calling '{s}' on bad self ({s})", .{ name, msg });
+        return raise(th, "bad argument #{d} to '{s}' ({s})", .{ arg - 1, name, msg });
+    }
+    return raise(th, "bad argument #{d} to '{s}' ({s})", .{ arg, name, msg });
+}
+
 /// The name of function `f` among the loaded modules, as
 /// `pushglobalfuncname` finds it: "module.field" from
 /// `registry._LOADED`, or the bare field for `_G`. Written to `buf`.
@@ -252,7 +334,8 @@ pub fn globalFuncName(state: *State, f: Value, buf: []u8) ?[]const u8 {
     var it = loaded.asTable().next(.nil) catch return null;
     while (it) |mod| : (it = loaded.asTable().next(mod.key) catch return null) {
         if (!mod.key.isString()) continue;
-        if (Value.rawEquals(mod.value, f)) return std.fmt.bufPrint(buf, "{s}", .{mod.key.asString().bytes()}) catch null;
+        if (Value.rawEquals(mod.value, f))
+            return std.fmt.bufPrint(buf, "{s}", .{mod.key.asString().bytes()}) catch null;
         if (!mod.value.isTable()) continue;
         var jt = mod.value.asTable().next(.nil) catch continue;
         while (jt) |field| : (jt = mod.value.asTable().next(field.key) catch null) {

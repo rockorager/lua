@@ -18,6 +18,7 @@ const Thread = @import("../Thread.zig");
 const Parser = @import("../Parser.zig");
 const undump = @import("../undump.zig");
 const vm = @import("../vm.zig");
+const debuginfo = @import("../debuginfo.zig");
 const gc = @import("../gc.zig");
 const number = @import("../number.zig");
 const root = @import("../root.zig");
@@ -85,42 +86,17 @@ pub fn getHost(th: *Thread) *Host {
 // Auxiliary functions: errors and argument checks (lauxlib.c)
 // ---------------------------------------------------------------------------
 
-/// The line a Lua frame is running, from its saved `pc`.
-fn currentLine(th: *Thread, f: *const Thread.Frame) ?u32 {
-    if (!f.flags.lua) return null;
-    const p = th.stack[f.func].asLuaClosure().proto;
-    const pc = (@intFromPtr(f.pc) - @intFromPtr(p.code.ptr)) / @sizeOf(u32);
-    return p.lineAt(pc -| 1);
-}
-
 /// "chunk:line: " for the function `level` calls up from the running
 /// native function (1 is its caller), or nothing when that is not a Lua
 /// function; `luaL_where`.
-pub fn where(th: *Thread, level: usize, w: *Writer) Writer.Error!void {
-    const n = th.frames.items.len;
-    if (level >= n - 1) return;
-    const f = &th.frames.items[n - 1 - level];
-    const line = currentLine(th, f) orelse return;
-    const p = th.stack[f.func].asLuaClosure().proto;
-    try Thread.writeChunkId(w, if (p.source) |s| s.bytes() else "?");
-    try w.print(":{d}: ", .{line});
-}
+pub const where = debuginfo.where;
 
 /// Raises a formatted error with the caller's position, `luaL_error`.
-pub fn raise(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
-    var aw: Writer.Allocating = .init(th.heap().allocator());
-    defer aw.deinit();
-    where(th, 1, &aw.writer) catch return error.OutOfMemory;
-    aw.writer.print(fmt, args) catch return error.OutOfMemory;
-    return th.throw(.string(try th.state.newString(aw.written())));
-}
+pub const raise = debuginfo.raise;
 
-/// "bad argument #arg to 'fname' (msg)", `luaL_argerror`. The function's
-/// name is given; PUC-Rio finds it from the calling instruction, which
-/// needs the debug information work.
-pub fn argError(th: *Thread, arg: u32, fname: []const u8, msg: []const u8) Error {
-    return raise(th, "bad argument #{d} to '{s}' ({s})", .{ arg, fname, msg });
-}
+/// "bad argument #arg to 'fname' (msg)", `luaL_argerror`, with the name
+/// the call site gives the function; `fname` when there is none.
+pub const argError = debuginfo.argError;
 
 /// The argument, or null when the call passed fewer.
 pub inline fn opt(th: *Thread, base: u32, arg: u32) ?Value {
@@ -264,29 +240,7 @@ fn callValue(th: *Thread, f: Value, args: []const Value, nresults: i16) Error!u3
 }
 
 /// `t[k]` with `__index`, as `lua_gettable` from native code.
-pub fn index(th: *Thread, t_in: Value, k: Value) Error!Value {
-    var t = t_in;
-    for (0..2000) |_| {
-        var h: Value = undefined;
-        if (t.tag == .table) {
-            const tbl = t.asTable();
-            const v = tbl.get(k);
-            if (!v.isNil()) return v;
-            h = th.state.fastTm(tbl.metatable, .index) orelse return .nil;
-        } else {
-            h = th.state.tmOf(t, .index) orelse
-                return th.runError("attempt to index a {s} value", .{t.typeOf().name()});
-        }
-        if (h.isFunction()) {
-            const func = try callValue(th, h, &.{ t, k }, 1);
-            const r = th.stack[func];
-            th.top = func;
-            return r;
-        }
-        t = h;
-    }
-    return th.runError("'__index' chain too long; possible loop", .{});
-}
+pub const index = vm.get;
 
 /// A number as `tostring` writes it, as a new string.
 pub fn numberToString(state: *State, v: Value) error{OutOfMemory}!*String {
@@ -556,14 +510,9 @@ fn @"error"(th: *Thread, base: u32) Error!u32 {
             v = .string(try th.state.newString(aw.written()));
         }
     }
-    // A nil error object reaches xpcall's handler as nil; pcall and
-    // xpcall turn it into "<no error object>" after, as luaG_errormsg does.
+    // A nil error object reaches xpcall's handler as nil; `throw` turns it
+    // into "<no error object>" after, as luaG_errormsg does.
     return th.throw(v);
-}
-
-/// The error object `pcall` and `xpcall` return: nil becomes a message.
-fn errorObject(th: *Thread, v: Value) Error!Value {
-    return if (v.isNil()) .string(try th.state.newString("<no error object>")) else v;
 }
 
 fn getmetatable(th: *Thread, base: u32) Error!u32 {
@@ -832,6 +781,20 @@ fn select(th: *Thread, base: u32) Error!u32 {
     return @intCast(n - i);
 }
 
+/// What `pcall` and `xpcall` return once the call ends, directly or as the
+/// continuation after a yield inside it: the call's results after `true`,
+/// or `false` and the error object. `extra` is xpcall's handler slot below
+/// the results.
+fn finishPcall(th: *Thread, base: u32, status: Value.KStatus, extra: u32) Error!u32 {
+    if (status == .err) {
+        const e = th.stack[th.top - 1];
+        th.push(.false);
+        th.push(e);
+        return 2;
+    }
+    return th.top - base - extra;
+}
+
 fn pcall(th: *Thread, base: u32) Error!u32 {
     _ = try checkAny(th, base, 1, "pcall");
     // true, then the function and its arguments.
@@ -839,35 +802,24 @@ fn pcall(th: *Thread, base: u32) Error!u32 {
     @memmove(th.stack[base + 1 .. th.top + 1], th.stack[base..th.top]);
     th.stack[base] = .true;
     th.top += 1;
-    if (vm.pcall(th, base + 1, -1)) return th.top - base;
-    th.stack[base] = .false;
-    th.stack[base + 1] = try errorObject(th, th.stack[base + 1]);
-    return 2;
+    const ok = try vm.pcallk(th, base + 1, -1, 0, 0, &finishPcall);
+    return finishPcall(th, base, if (ok) .ok else .err, 0);
 }
 
 fn xpcall(th: *Thread, base: u32) Error!u32 {
     const n = th.top - base;
     const handler = get(th, base, 2);
     if (!handler.isFunction()) return typeError(th, base, 2, "xpcall", "function");
-    // handler, true, the function, its arguments.
+    // handler, true, the function, its arguments. The VM runs the handler
+    // where the error happens, before unwinding.
     try th.ensureStack(1);
     @memmove(th.stack[base + 3 .. th.top + 1], th.stack[base + 2 .. th.top]);
     th.stack[base + 2] = th.stack[base];
     th.stack[base] = handler;
     th.stack[base + 1] = .true;
     th.top = base + n + 1;
-    if (vm.pcall(th, base + 2, -1)) return th.top - base - 1;
-    // TODO(vm): PUC-Rio runs the handler where the error happened, before
-    // unwinding; here it runs after, with the error object.
-    const err = th.stack[base + 2];
-    th.top = base + 2;
-    th.push(handler);
-    th.push(err);
-    _ = vm.pcall(th, base + 2, 1);
-    th.stack[base + 1] = .false;
-    th.stack[base + 2] = try errorObject(th, th.stack[base + 2]);
-    th.top = base + 3;
-    return 2;
+    const ok = try vm.pcallk(th, base + 2, -1, base, 1, &finishPcall);
+    return finishPcall(th, base, if (ok) .ok else .err, 1);
 }
 
 fn tostring(th: *Thread, base: u32) Error!u32 {

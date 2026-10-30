@@ -32,29 +32,10 @@ pub fn open(state: *State) Error!void {
     try state.globals.setStr(&state.heap, try state.newString("coroutine"), .table(t));
 }
 
-/// "bad argument #n to 'name' (msg)", positioned at the caller, as
-/// `luaL_argerror` writes it.
 fn argError(th: *Thread, arg: u32, comptime fmt: []const u8, args: anytype) Error {
     var msgbuf: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&msgbuf, fmt, args) catch "?";
-    const n = debuginfo.funcName(th, th.frames.items.len - 1);
-    var namebuf: [64]u8 = undefined;
-    const name = if (n) |v| v.name else debuginfo.globalFuncName(th.state, th.stack[th.frame().func], &namebuf) orelse "?";
-    if (n != null and std.mem.eql(u8, n.?.kind, "method")) {
-        if (arg == 1) return whereError(th, "calling '{s}' on bad self ({s})", .{ name, msg });
-        return whereError(th, "bad argument #{d} to '{s}' ({s})", .{ arg - 1, name, msg });
-    }
-    return whereError(th, "bad argument #{d} to '{s}' ({s})", .{ arg, name, msg });
-}
-
-/// An error message prefixed with the calling Lua function's position,
-/// as `luaL_error` does.
-fn whereError(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
-    var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
-    defer aw.deinit();
-    debuginfo.where(th, 1, &aw.writer) catch return error.OutOfMemory;
-    aw.writer.print(fmt, args) catch return error.OutOfMemory;
-    return th.throw(.string(try th.state.newString(aw.written())));
+    return debuginfo.argError(th, arg, "?", msg);
 }
 
 fn typeNameAt(th: *Thread, base: u32, n: u32) []const u8 {
@@ -121,7 +102,7 @@ fn @"resume"(th: *Thread, base: u32) Error!u32 {
     };
     // true below the results.
     const first = th.top - n;
-    std.mem.copyBackwards(Value, th.stack[first + 1 .. th.top + 1], th.stack[first..th.top]);
+    @memmove(th.stack[first + 1 .. th.top + 1], th.stack[first..th.top]);
     th.stack[first] = .true;
     th.top += 1;
     return n + 1;
@@ -203,9 +184,9 @@ fn close(th: *Thread, base: u32) Error!u32 {
             co.top -= 1;
             return 2;
         },
-        .normal => return whereError(th, "cannot close a normal coroutine", .{}),
+        .normal => return debuginfo.raise(th, "cannot close a normal coroutine", .{}),
         .running => {
-            if (co == th.state.main) return whereError(th, "cannot close main thread", .{});
+            if (co == th.state.main) return debuginfo.raise(th, "cannot close main thread", .{});
             return vm.closeSelf(co);
         },
     }
