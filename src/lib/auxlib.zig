@@ -303,10 +303,15 @@ pub const Buffer = struct {
     writer: Writer,
     gpa: std.mem.Allocator,
     on_heap: bool,
+    /// Past `inline_len`: room for a `String` header, the bytes, and a
+    /// trailing zero, so a long result becomes its string in place.
+    block: []align(String.alignment.toByteUnits()) u8,
     small: [inline_len]u8,
 
     /// `LUAL_BUFFERSIZE` on a 64-bit build.
     pub const inline_len = 1024;
+
+    const header_len = @sizeOf(String);
 
     const vtable: Writer.VTable = .{ .drain = drain, .rebase = rebase };
 
@@ -317,7 +322,7 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(b: *Buffer) void {
-        if (b.on_heap) b.gpa.free(b.writer.buffer);
+        if (b.on_heap) b.gpa.free(b.block);
         b.* = undefined;
     }
 
@@ -325,24 +330,33 @@ pub const Buffer = struct {
         return b.writer.buffered();
     }
 
-    /// The contents as a Lua string. The buffer stays usable.
+    /// The contents as a Lua string. A long result on the heap becomes the
+    /// string without a copy (`luaL_pushresult` with an external string),
+    /// and the buffer starts over empty.
     pub fn toString(b: *Buffer, state: *State) error{OutOfMemory}!*String {
-        return state.newString(b.written());
+        const n = b.writer.end;
+        if (!b.on_heap or n <= String.max_short_len) return state.newString(b.written());
+        const block = try b.gpa.realloc(b.block, String.allocSize(n));
+        b.on_heap = false;
+        b.writer = .{ .vtable = &vtable, .buffer = &b.small };
+        return String.adoptLong(&state.heap, state.seed, block, n);
     }
 
     fn ensureUnused(b: *Buffer, n: usize) error{WriteFailed}!void {
         const w = &b.writer;
         if (w.buffer.len - w.end >= n) return;
         const need = std.math.add(usize, w.end, n) catch return error.WriteFailed;
-        const cap = @max(need, w.buffer.len * 2);
+        // Half again as much, as `luaL_Buffer` grows.
+        const cap = @max(need, w.buffer.len / 2 * 3);
+        const size = std.math.add(usize, cap, header_len + 1) catch return error.WriteFailed;
         if (b.on_heap) {
-            w.buffer = b.gpa.realloc(w.buffer, cap) catch return error.WriteFailed;
+            b.block = b.gpa.realloc(b.block, size) catch return error.WriteFailed;
         } else {
-            const mem = b.gpa.alloc(u8, cap) catch return error.WriteFailed;
-            @memcpy(mem[0..w.end], w.buffer[0..w.end]);
-            w.buffer = mem;
+            b.block = b.gpa.alignedAlloc(u8, String.alignment, size) catch return error.WriteFailed;
+            @memcpy(b.block[header_len..][0..w.end], w.buffer[0..w.end]);
             b.on_heap = true;
         }
+        w.buffer = b.block[header_len .. size - 1];
     }
 
     fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {

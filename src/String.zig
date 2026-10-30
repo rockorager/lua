@@ -22,7 +22,7 @@ hnext: ?*String = null,
 /// The longest short string, PUC-Rio's `LUAI_MAXSHORTLEN`.
 pub const max_short_len = 40;
 
-const alignment: std.mem.Alignment = .of(String);
+pub const alignment: std.mem.Alignment = .of(String);
 
 /// The bytes, without the trailing zero.
 pub inline fn bytes(s: *const String) []const u8 {
@@ -43,7 +43,7 @@ pub inline fn isShort(s: *const String) bool {
     return s.header.tag == .short_string;
 }
 
-inline fn allocSize(len: usize) usize {
+pub inline fn allocSize(len: usize) usize {
     return @sizeOf(String) + len + 1;
 }
 
@@ -85,6 +85,20 @@ pub fn createLong(heap: *gc.Heap, seed: u64, len: usize) error{OutOfMemory}!*Str
     std.debug.assert(len > max_short_len);
     const s = try alloc(heap, len);
     s.hash = @truncate(seed);
+    heap.link(&s.header, .long_string);
+    return s;
+}
+
+/// Makes a long string of the block `mem`, `allocSize(len)` bytes from
+/// the heap's allocator whose `len` bytes after the header are already the
+/// contents: a buffer becomes its string without a copy. `len` must exceed
+/// `max_short_len`.
+pub fn adoptLong(heap: *gc.Heap, seed: u64, mem: []align(alignment.toByteUnits()) u8, len: usize) *String {
+    std.debug.assert(len > max_short_len);
+    std.debug.assert(mem.len == allocSize(len));
+    const s: *String = @ptrCast(mem.ptr);
+    s.* = .{ .header = undefined, .hash = @truncate(seed), .len = len };
+    s.bytesPtr()[len] = 0;
     heap.link(&s.header, .long_string);
     return s;
 }
