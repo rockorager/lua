@@ -659,6 +659,14 @@ inline fn fetch(pc: *[*]const u32, i: *Instruction) opcodes.OpCode {
     return op(i.*);
 }
 
+/// `fetch` past the next instruction: an arithmetic fast path skipping its
+/// `MMBIN`.
+inline fn fetchSkip(pc: *[*]const u32, i: *Instruction) opcodes.OpCode {
+    i.* = pc.*[1];
+    pc.* += 2;
+    return op(i.*);
+}
+
 /// Runs Lua frames from the current one until a frame flagged `fresh`
 /// returns.
 fn execute(th: *Thread) Error!void {
@@ -781,9 +789,21 @@ fn execute(th: *Thread) Error!void {
                 if (t.tag == .table) {
                     const h = t.asTable();
                     const v = h.getShortStr(key.asString());
-                    if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
+                    if (!v.isNil()) {
                         base[getA(i)] = v;
                         continue :dispatch fetch(&pc, &i);
+                    }
+                    const tm = th.state.fastTm(h.metatable, .index) orelse {
+                        base[getA(i)] = .nil;
+                        continue :dispatch fetch(&pc, &i);
+                    };
+                    // A class table as `__index`, the usual method lookup.
+                    if (tm.tag == .table) {
+                        const v2 = tm.asTable().getShortStr(key.asString());
+                        if (!v2.isNil()) {
+                            base[getA(i)] = v2;
+                            continue :dispatch fetch(&pc, &i);
+                        }
                     }
                 }
                 ci.pc = pc;
@@ -846,9 +866,13 @@ fn execute(th: *Thread) Error!void {
                 const t = base[getA(i)];
                 const key = k[getB(i)];
                 const v = if (getK(i)) k[getC(i)] else base[getC(i)];
-                if (t.tag == .table and t.asTable().metatable == null) {
-                    try t.asTable().setShortStr(heap, key.asString(), v);
-                    continue :dispatch fetch(&pc, &i);
+                if (t.tag == .table) {
+                    const h = t.asTable();
+                    if (h.metatable == null) {
+                        try h.setShortStr(heap, key.asString(), v);
+                        continue :dispatch fetch(&pc, &i);
+                    }
+                    if (h.replaceShortStr(heap, key.asString(), v)) continue :dispatch fetch(&pc, &i);
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, t, key, v, .{ .slot = ci.base() + getA(i) });
@@ -910,10 +934,11 @@ fn execute(th: *Thread) Error!void {
                         },
                         else => unreachable,
                     }
-                    pc += 1;
-                } else if (rb.isNumber() and rc.isNumber()) {
+                    continue :dispatch fetchSkip(&pc, &i);
+                }
+                if (rb.isNumber() and rc.isNumber()) {
                     base[getA(i)] = .float(floatArith(ao, rb.asNumber(), rc.asNumber()));
-                    pc += 1;
+                    continue :dispatch fetchSkip(&pc, &i);
                 }
                 // Otherwise the next instruction, an MMBIN, handles it.
                 continue :dispatch fetch(&pc, &i);
@@ -940,7 +965,7 @@ fn execute(th: *Thread) Error!void {
                         .shli => number.shiftLeft(y, x),
                         else => unreachable,
                     });
-                    pc += 1;
+                    continue :dispatch fetchSkip(&pc, &i);
                 }
                 continue :dispatch fetch(&pc, &i);
             },
@@ -1675,24 +1700,27 @@ noinline fn concatValues(th: *Thread, comptime caller: Caller, total_in: u32) Er
             total -= 1;
             continue;
         }
-        // As many strings and numbers as there are below the top.
-        var numbuf: [number.max_len]u8 = undefined;
+        // As many strings and numbers as there are below the top. A short
+        // result is built in one pass, formatting each number once.
         var n: u32 = 1;
-        var len: usize = toStringBuf(b, &numbuf).len;
-        while (n < total and isConcatable(th.stack[top - n - 1])) : (n += 1) {
-            const l = toStringBuf(th.stack[top - n - 1], &numbuf).len;
-            if (l >= max_string_len - len) {
+        while (n < total and isConcatable(th.stack[top - n - 1])) : (n += 1) {}
+        const parts = th.stack[top - n .. top];
+        var numbuf: [number.max_len]u8 = undefined;
+        var short: [String.max_short_len]u8 = undefined;
+        var len: usize = 0;
+        var fits = true;
+        for (parts) |v| {
+            const piece = toStringBuf(v, &numbuf);
+            if (piece.len >= max_string_len - len) {
                 th.top = top - total;
                 return th.runError("string length overflow", .{});
             }
-            len += l;
+            if (fits and len + piece.len <= short.len) {
+                @memcpy(short[len..][0..piece.len], piece);
+            } else fits = false;
+            len += piece.len;
         }
-        const parts = th.stack[top - n .. top];
-        const s = if (len <= String.max_short_len) blk: {
-            var buf: [String.max_short_len]u8 = undefined;
-            copyParts(parts, &buf);
-            break :blk try th.state.newString(buf[0..len]);
-        } else blk: {
+        const s = if (fits) try th.state.newString(short[0..len]) else blk: {
             const out = try String.createLong(&th.state.heap, th.state.seed, len);
             copyParts(parts, out.mutableBytes());
             break :blk out;
@@ -1729,11 +1757,15 @@ inline fn toStringBuf(v: Value, buf: *[number.max_len]u8) []const u8 {
 // ---------------------------------------------------------------------------
 
 /// `t[key]` with `__index` (`lua_gettable`).
-pub fn get(th: *Thread, t: Value, key: Value) Error!Value {
+pub inline fn get(th: *Thread, t: Value, key: Value) Error!Value {
     if (t.tag == .table) {
         const v = t.asTable().get(key);
         if (!v.isNil() or th.state.fastTm(t.asTable().metatable, .index) == null) return v;
     }
+    return getNative(th, t, key);
+}
+
+noinline fn getNative(th: *Thread, t: Value, key: Value) Error!Value {
     try th.ensureStack(1);
     const dest = th.top;
     th.top += 1;
@@ -1875,7 +1907,7 @@ pub fn concat(th: *Thread, n: u32) Error!void {
 /// A number, or a string that converts to one by the manual's rules
 /// (§3.4.3), as a number; else null. `tonumber` and the string library's
 /// arithmetic metamethods use it.
-pub fn toNumber(v: Value) ?Value {
+pub inline fn toNumber(v: Value) ?Value {
     return switch (v.tag) {
         .int, .float => v,
         .short_string, .long_string => stringToNumber(v.asString().bytes()),
@@ -1893,7 +1925,7 @@ pub fn stringToNumber(s: []const u8) ?Value {
 
 /// A number or numeric string with an exact integer value, as an integer
 /// (`lua_tointeger`).
-pub fn toInteger(v: Value) ?i64 {
+pub inline fn toInteger(v: Value) ?i64 {
     return toIntStrict(toNumber(v) orelse return null);
 }
 

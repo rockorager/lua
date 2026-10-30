@@ -343,6 +343,16 @@ pub fn setShortStr(t: *Table, heap: *gc.Heap, s: *String, val: Value) error{OutO
     };
 }
 
+/// Replaces the value of short string key `s` when it is present and not
+/// nil, and returns whether it did (`luaV_fastset`'s case): such a store
+/// needs no `__newindex` check even when `t` has a metatable.
+pub inline fn replaceShortStr(t: *Table, heap: *gc.Heap, s: *String, val: Value) bool {
+    const n = t.getShortStrNode(s) orelse return false;
+    if (n.val_tag == .nil) return false;
+    t.writeNode(heap, n, val);
+    return true;
+}
+
 /// Raw `t[s] = val` for any string key.
 pub fn setStr(t: *Table, heap: *gc.Heap, s: *String, val: Value) error{OutOfMemory}!void {
     if (s.isShort()) return t.setShortStr(heap, s, val);
