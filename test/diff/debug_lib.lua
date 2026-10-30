@@ -100,3 +100,8 @@ print(pcall(load(d), nil))
 print(pcall(string.dump, print))
 local function vt(...t) return t.n end
 print(load(string.dump(vt))(1, 2, 3))
+
+-- Runtime errors in stripped functions are positioned "?:?:"
+print(pcall(load(string.dump(function(t) return t.x.y end, true)), {}))
+print(pcall(load(string.dump(function() error("boom") end, true))))
+print(pcall(load(string.dump(function() local a = {} return a + 1 end, true))))
