@@ -28,6 +28,11 @@ Each item names a starting choice. Items marked **measure** get an A/B write-up
 in `docs/slop/results/` once the VM runs the benchmarks, and the plan is
 updated with the winner.
 
+Wave 1's core implements the starting choices of 1 through 9 and 11.
+`docs/slop/core.md` records the details these items left open, and
+`docs/slop/results/core-baseline-20261030.md` the first numbers against the
+reference.
+
 1. **Value.** Start with a 16-byte tagged value: an 8-byte payload (i64, f64,
    pointer, bool, light userdata) and a 1-byte tag, the shape PUC-Rio uses.
    Every access goes through `Value`'s inline functions so the representation
@@ -39,7 +44,8 @@ updated with the winner.
    including the specialized forms (`ADDI`, `ADDK`, `GETFIELD`, `GETI`,
    `EQK`, `FORPREP`/`FORLOOP` for numeric loops, `TFORCALL`). Specialized
    opcodes are where most of PUC-Rio's speed comes from; copy the design, not
-   the code.
+   the code. Landed: the set, numbering, and encoding are 5.5.1's exactly, so
+   `luac -l -l` output is the compiler's reference (`src/opcodes.zig`).
 3. **Dispatch.** A labeled `switch` with `continue :dispatch`, which Zig
    compiles to threaded dispatch: one indirect jump per opcode, each with its
    own branch history. Keep the hot registers (pc, base, the constant array)
@@ -102,8 +108,8 @@ updated with the winner.
     next token is a name, `<`, `*`, or `function`. `Lexer.zig` does the same
     (`global_is_reserved = false`); the parser owns the lookahead check.
 12. **Native functions** take the thread and the index of their first argument
-    and return how many results they pushed: `fn (*Thread, base: u32) Error!u32`
-    shape, decided with the VM.
+    and return how many results they pushed. Landed:
+    `fn (*Thread, base: u32) Error!u32`, `Value.NativeFn`.
 13. **Embedding API.** A Zig API, not the C API, designed once the standard
     library has exercised the internal one. Nothing outside `src/` depends on
     internals until then.
