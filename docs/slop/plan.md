@@ -133,7 +133,7 @@ for the change instead of editing it.
 
 Wave 1, in parallel, with no shared files:
 
-- **Core** (this thread): `Value.zig`, `gc.zig`, `String.zig`, `Table.zig`,
+- **Core**: `Value.zig`, `gc.zig`, `String.zig`, `Table.zig`,
   `State.zig` and `Thread.zig`, `opcodes.zig`, `Proto.zig`, and the skeleton of
   `vm.zig`.
 - **Lexer and numbers**: `Lexer.zig` (every token, long brackets, all string
