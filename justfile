@@ -58,6 +58,37 @@ suite BIN="ours" *FILES:
     done
     exit $failed
 
+[doc("Compare our compiler's bytecode with the reference luac's: `luac -l -l -p` listings, addresses masked, for every suite and bench file, or only FILES")]
+[group("test")]
+bytecode *FILES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    zig build listing -Doptimize=ReleaseSafe
+    files=({{ FILES }})
+    if [ ${#files[@]} -eq 0 ]; then
+        files=(test/lua-5.5.1-tests/*.lua bench/*.lua)
+    fi
+    out=zig-out/bytecode
+    rm -rf "$out" && mkdir -p "$out"
+    same=0
+    differ=()
+    for f in "${files[@]}"; do
+        base=$out/$(echo "$f" | tr / _)
+        luac -l -l -p "$f" 2>&1 | sed -E 's/ at 0x[0-9a-f]+\)$/ at 0x0)/; s/ for 0x[0-9a-f]+:$/ for 0x0:/; s/^(.*CLOSURE.*; )0x[0-9a-f]+$/\10x0/' > "$base.ref"
+        zig-out/bin/listing "$f" > "$base.ours" 2>&1 || true
+        if cmp -s "$base.ref" "$base.ours"; then
+            same=$((same + 1))
+        else
+            differ+=("$f")
+            diff "$base.ref" "$base.ours" | head -n 10 || true
+        fi
+    done
+    echo "$same of ${#files[@]} files list the same bytecode as luac"
+    if [ ${#differ[@]} -ne 0 ]; then
+        printf 'differs: %s\n' "${differ[@]}"
+        exit 1
+    fi
+
 [doc("Time every bench/ program, or only PROGRAMS, on our zig-out/bin/lua (ReleaseFast) and the reference lua: interleaved rounds on one core, checksums checked, then benchstat. The numbers are not claims")]
 [group("bench")]
 bench-compare ROUNDS="10" *PROGRAMS:

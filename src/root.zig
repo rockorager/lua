@@ -14,6 +14,8 @@ pub const State = @import("State.zig");
 pub const Thread = @import("Thread.zig");
 pub const opcodes = @import("opcodes.zig");
 pub const vm = @import("vm.zig");
+pub const Parser = @import("Parser.zig");
+pub const Code = @import("Code.zig");
 
 /// The value of the global `_VERSION`, as the reference manual's §6.2 gives it.
 pub const version = "Lua 5.5";

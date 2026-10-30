@@ -1,6 +1,15 @@
 # Third-party code and data
 
-lua is MIT (`LICENSE`). No upstream code is adapted: the implementation is written for this repository from the reference manual. Two upstream artifacts define what it must do, and one ships here as test data.
+lua is MIT (`LICENSE`). Most of the implementation is written for this repository from the reference manual. Some files are adapted from the Lua 5.5.1 sources, so that their output matches the reference's exactly; the upstream artifacts define what the rest must do, and one ships here as test data.
+
+## Lua 5.5.1 sources
+
+- Upstream: https://www.lua.org/ftp/lua-5.5.1.tar.gz
+- Copyright (C) 1994-2026 Lua.org, PUC-Rio, under the MIT license below
+
+Adapted into Zig, function by function:
+
+- `src/Parser.zig` from `lparser.c`, and `src/Code.zig` from `lcode.c`, with its listing writer from `luac.c`'s `PrintFunction`.
 
 ## Lua 5.5 Reference Manual
 
