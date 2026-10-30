@@ -14,9 +14,10 @@ Zig 0.16 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
 
 ## Performance
 
-Performance is a requirement from the first commit, not a later pass. Reference C Lua 5.5.1 is the baseline, and the target is to match or beat it.
+Performance is a requirement from the first commit, not a later pass, and memory counts as much as speed. Reference C Lua 5.5.1 is the baseline, and the target is to match or beat it on both wall time and peak memory.
 
 - Decide the hot paths with measurements: value representation, instruction dispatch, table access, string interning, calls and returns, and the collector. Record each decision, the alternatives measured, and the numbers in `docs/slop/`.
+- A speed change that costs memory, or a memory change that costs speed, is measured both ways and the trade written up; neither wins by default.
 - A change to a hot path comes with an interleaved A/B benchmark, pinned to one core (`taskset`), compared with benchstat, and written up in `docs/slop/results/<topic>-<yyyymmdd>.md` with the raw output.
 - Allocate on an instruction's path only where the language allocates: tables, closures, strings, and coroutines.
 - Correctness is not traded for speed: a fast path must pass the same tests as the slow one.
