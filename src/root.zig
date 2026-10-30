@@ -37,4 +37,5 @@ test {
     _ = @import("lib/pattern.zig");
     _ = @import("lib/format.zig");
     _ = @import("lib/pack.zig");
+    _ = @import("lib/libm.zig");
 }
