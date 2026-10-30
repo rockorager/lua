@@ -91,11 +91,20 @@ updated with the winner.
 10. **Numbers.** i64 and f64, with the manual's conversions (§3.4.3): exact
     integer-float comparison, floor division and modulo with Lua's signs, shifts
     that saturate at 64, string coercion. Floats print in decimal with enough
-    digits to read back exactly (new in 5.5): shortest round trip.
-11. **Native functions** take the thread and the index of their first argument
+    digits to read back exactly (new in 5.5). Landed in `number.zig`: 5.5.1
+    does not print the shortest round trip but `%.15g`, then `%.17g` when that
+    does not read back (`0.1 + 0.7` is `0.79999999999999993`), so
+    `formatFloat` takes Ryu's shortest digits when they are 15 or fewer and
+    rounds exactly with a small bignum otherwise; subnormals always take the
+    exact path.
+11. **`global`.** The reference builds with `LUA_COMPAT_GLOBAL`, so `global`
+    lexes as a name and lparser.c treats it as a declaration only when the
+    next token is a name, `<`, `*`, or `function`. `Lexer.zig` does the same
+    (`global_is_reserved = false`); the parser owns the lookahead check.
+12. **Native functions** take the thread and the index of their first argument
     and return how many results they pushed: `fn (*Thread, base: u32) Error!u32`
     shape, decided with the VM.
-12. **Embedding API.** A Zig API, not the C API, designed once the standard
+13. **Embedding API.** A Zig API, not the C API, designed once the standard
     library has exercised the internal one. Nothing outside `src/` depends on
     internals until then.
 
