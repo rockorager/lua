@@ -13,6 +13,7 @@ const Table = @import("Table.zig");
 const Thread = @import("Thread.zig");
 const Proto = @import("Proto.zig");
 const Userdata = @import("Userdata.zig");
+const number = @import("number.zig");
 
 payload: Payload,
 tag: Tag,
@@ -32,6 +33,20 @@ pub const Error = error{ LuaError, OutOfMemory };
 /// argument (arguments run from `base` to `thread.top`), pushes its results
 /// on top, and returns how many it pushed (plan decision 11).
 pub const NativeFn = *const fn (thread: *Thread, base: u32) Error!u32;
+
+/// How a continuation is resumed: `.yield` after the coroutine was
+/// suspended inside the call and resumed, `.err` after an error in a
+/// yieldable protected call (the error object is on top), and `.ok` when
+/// the native calls it itself after the call returned normally.
+pub const KStatus = enum { ok, yield, err };
+
+/// A continuation, PUC-Rio's `lua_KFunction`: what remains of native
+/// function after a call it made through `vm.callk` or `vm.pcallk`
+/// returns, when a yield inside that call unwound the native's Zig frame.
+/// `base` is the native's first argument, and the stack above it is the
+/// native's, with the call's results on top. It returns as the native
+/// does: how many results it pushed.
+pub const KFn = *const fn (thread: *Thread, base: u32, status: KStatus, ctx: u32) Error!u32;
 
 /// The payload. An extern union so any member reads back the bits of any
 /// other; the tag says which member is meaningful.
@@ -275,13 +290,8 @@ pub inline fn typeOf(v: Value) Type {
 }
 
 /// The float `f` as an integer if it has an exact integer value.
-/// TODO(number.zig): use number.zig's conversion once it lands.
 pub inline fn floatToInt(f: f64) ?i64 {
-    // -2^63 is exact; 2^63 is the first float out of range.
-    if (!(f >= -9223372036854775808.0 and f < 9223372036854775808.0)) return null;
-    const i: i64 = @intFromFloat(f);
-    if (@as(f64, @floatFromInt(i)) != f) return null;
-    return i;
+    return number.floatToInt(f, .exact);
 }
 
 /// Primitive equality, without `__eq`: numbers by mathematical value, short

@@ -14,6 +14,7 @@ pub const State = @import("State.zig");
 pub const Thread = @import("Thread.zig");
 pub const opcodes = @import("opcodes.zig");
 pub const vm = @import("vm.zig");
+pub const debuginfo = @import("debuginfo.zig");
 pub const Parser = @import("Parser.zig");
 pub const Code = @import("Code.zig");
 /// `string.dump`'s binary chunks: writing and loading them.

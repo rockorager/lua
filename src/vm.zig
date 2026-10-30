@@ -1,5 +1,6 @@
-//! The interpreter: one loop runs a thread's Lua frames (plan decisions 3,
-//! 4, and 5).
+//! The interpreter: one loop runs a thread's Lua frames (plan decisions 3
+//! through 6), plus calls, coroutines, to-be-closed variables, and the
+//! operations with metamethods that native code calls.
 //!
 //! Dispatch is a labeled `switch` with `continue :dispatch`, which Zig
 //! compiles to one indirect jump per opcode. The loop keeps `pc`, `base`
@@ -9,13 +10,20 @@
 //!
 //! A Lua-to-Lua call pushes a frame and continues the same loop, so Lua
 //! recursion costs heap, not Zig stack. A metamethod written in Lua that an
-//! instruction calls (`__index`, arithmetic, comparisons) gets a frame
-//! flagged `finish_op`; when it returns, `finishOp` completes the
+//! instruction calls (`__index`, arithmetic, comparisons, `__concat`) gets
+//! a frame flagged `finish_op`; when it returns, `finishOp` completes the
 //! interrupted instruction, as PUC-Rio's `luaV_finishOp` does. Native
 //! metamethods run directly and the instruction completes inline.
 //!
 //! Errors are `error.LuaError` with the error object in `Thread.err`; they
-//! unwind through ordinary Zig error returns to the nearest `pcall`.
+//! unwind through ordinary Zig error returns to the nearest protected call.
+//! A yield is `error.LuaError` too, with the thread's status `.yield`: it
+//! unwinds every Zig frame up to `resumeThread` and leaves the Lua frames
+//! in place. Resuming runs the rest from the frames alone (`unroll`): a
+//! Lua frame continues at its saved `pc` after `finishOp`, and a native
+//! frame that called through `callk` or `pcallk` runs its continuation.
+//! A native that called through `call` cannot be continued, so `call`
+//! marks the thread non-yieldable while it runs.
 
 const std = @import("std");
 const Value = @import("Value.zig");
@@ -25,12 +33,17 @@ const Proto = @import("Proto.zig");
 const Thread = @import("Thread.zig");
 const State = @import("State.zig");
 const opcodes = @import("opcodes.zig");
+const number = @import("number.zig");
+const debuginfo = @import("debuginfo.zig");
 
 const Error = Value.Error;
+const KFn = Value.KFn;
+const KStatus = Value.KStatus;
 const Frame = Thread.Frame;
 const Tm = State.Tm;
 const LuaClosure = Proto.LuaClosure;
 const Instruction = opcodes.Instruction;
+const Origin = debuginfo.Origin;
 
 const op = opcodes.op;
 const getK = opcodes.k;
@@ -48,13 +61,94 @@ inline fn getC(i: Instruction) u32 {
 
 /// Longest `__index`/`__newindex` chain, `MAXTAGLOOP`.
 const max_tag_loop = 2000;
+/// Longest `__call` chain, `MAX_CCMT`.
+const max_call_chain = 15;
+
+// ---------------------------------------------------------------------------
+// Calls
+// ---------------------------------------------------------------------------
 
 /// Calls the value at stack slot `func` with the arguments above it, up to
 /// `top`. The results replace the function and arguments: `nresults` of
 /// them, or all of them with `top` after the last when `nresults` is -1.
+/// The call cannot yield (`lua_call`); see `callk` for one that can.
 pub fn call(th: *Thread, func: u32, nresults: i16) Error!void {
-    if (th.native_calls >= Thread.max_native_calls) return th.runError("C stack overflow", .{});
-    th.native_calls += 1;
+    th.nny += 1;
+    defer th.nny -= 1;
+    return callYieldable(th, func, nresults);
+}
+
+/// `call` from a native function that can be suspended inside the call
+/// (`lua_callk`). If the coroutine yields inside it, the native's Zig frame
+/// is gone when it resumes: once the call returns, `k` runs with status
+/// `.yield` and `ctx`, and its result is the native's. When the call
+/// returns without yielding, `callk` returns and the native goes on (it
+/// usually calls `k` itself with `.ok`). Outside a coroutine, or under a
+/// native that used `call`, this is `call`.
+pub fn callk(th: *Thread, func: u32, nresults: i16, ctx: u32, k: KFn) Error!void {
+    if (th.nny > 0) return call(th, func, nresults);
+    th.frame().setK(k, ctx);
+    return callYieldable(th, func, nresults);
+}
+
+/// `call` in protected mode. On an error the stack is unwound to `func`,
+/// pending to-be-closed variables are closed, the error object is left at
+/// `func`, `top` is `func + 1`, and the result is false. Allocation failure
+/// leaves the "not enough memory" string.
+pub fn pcall(th: *Thread, func: u32, nresults: i16) bool {
+    return pcallMsgh(th, func, nresults, 0);
+}
+
+/// `pcall` with a message handler (`lua_pcall`): `msgh` is the stack index
+/// of a function, or 0 for none. An error raised inside the call (but not
+/// a memory error) is passed to the handler before the stack unwinds, and
+/// the handler's result becomes the error object.
+pub fn pcallMsgh(th: *Thread, func: u32, nresults: i16, msgh: u32) bool {
+    const frames = th.frames.items.len;
+    const old_errfunc = th.errfunc;
+    th.errfunc = msgh;
+    defer th.errfunc = old_errfunc;
+    call(th, func, nresults) catch |e| {
+        const err = errorObject(th, e);
+        th.frames.items.len = frames;
+        th.stack[func] = closeProtected(th, func, err) orelse err;
+        th.top = func + 1;
+        th.shrinkStack();
+        return false;
+    };
+    return true;
+}
+
+/// `pcallMsgh` from a native function that can be suspended inside the
+/// call (`lua_pcallk`). Returns true when the call succeeded and false
+/// after an error, which then sits at `func` as for `pcall`. Inside a
+/// coroutine it may instead return `error.LuaError`, for a yield or for an
+/// error; propagate it with `try`. The coroutine then finishes the call
+/// later, and calls `k` with `ctx` and status `.yield` (success) or `.err`
+/// (the error object on top) in place of the rest of the native.
+pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn) Error!bool {
+    if (th.nny > 0) return pcallMsgh(th, func, nresults, msgh);
+    const idx = th.frames.items.len - 1;
+    {
+        const f = &th.frames.items[idx];
+        f.setK(k, ctx);
+        f.aux = func;
+        f.old_errfunc = th.errfunc;
+        f.flags.ypcall = true;
+    }
+    th.errfunc = msgh;
+    // An error unwinds past here to `resumeThread`, which finds this frame
+    // by its `ypcall` flag and finishes the call there.
+    try callYieldable(th, func, nresults);
+    const f = &th.frames.items[idx];
+    f.flags.ypcall = false;
+    th.errfunc = f.old_errfunc;
+    return true;
+}
+
+/// `luaD_call`: a call from Zig that may yield if the thread can.
+fn callYieldable(th: *Thread, func: u32, nresults: i16) Error!void {
+    try enterNative(th);
     defer th.native_calls -= 1;
     if (try preCall(th, func, nresults)) {
         th.frame().flags.fresh = true;
@@ -62,22 +156,60 @@ pub fn call(th: *Thread, func: u32, nresults: i16) Error!void {
     }
 }
 
-/// `call` in protected mode. On an error the stack is unwound to `func`,
-/// the error object is left at `func`, `top` is `func + 1`, and the result
-/// is false. Allocation failure leaves the "not enough memory" string.
-pub fn pcall(th: *Thread, func: u32, nresults: i16) bool {
-    const frames = th.frames.items.len;
-    call(th, func, nresults) catch |e| {
-        const err: Value = switch (e) {
-            error.LuaError => th.err,
-            error.OutOfMemory => .string(th.state.memerr),
-        };
-        th.closeUpvals(func);
-        th.frames.shrinkRetainingCapacity(frames);
-        th.err = .nil;
-        th.stack[func] = err;
-        th.top = func + 1;
-        return false;
+/// Counts one more entry into the interpreter from Zig, `ccall`'s check:
+/// "C stack overflow" at the limit, and "error in error handling" when
+/// handling that error keeps nesting.
+inline fn enterNative(th: *Thread) Error!void {
+    th.native_calls += 1;
+    if (th.native_calls >= Thread.max_native_calls) try nativeOverflow(th);
+}
+
+fn nativeOverflow(th: *Thread) Error!void {
+    if (th.native_calls == Thread.max_native_calls) {
+        // The count stays at the limit while a message handler runs.
+        const e = th.runError("C stack overflow", .{});
+        th.native_calls -= 1;
+        return e;
+    }
+    if (th.native_calls >= Thread.max_native_calls / 10 * 11) {
+        th.native_calls -= 1;
+        return th.errorInErrorHandling();
+    }
+}
+
+/// The error object a failed call left: `Thread.err`, or the memory error
+/// message. Clears `Thread.err`.
+fn errorObject(th: *Thread, e: Error) Value {
+    const v: Value = switch (e) {
+        error.LuaError => th.err,
+        error.OutOfMemory => .string(th.state.memerr),
+    };
+    th.err = .nil;
+    return v;
+}
+
+/// Calls the running protected call's message handler on `Thread.err`
+/// and makes its result the error object (`luaG_errormsg`).
+pub fn callMessageHandler(th: *Thread) Error!void {
+    const f = th.frame();
+    if (f.flags.lua and th.top < f.top) th.top = f.top;
+    try th.ensureStack(2);
+    const func = th.top;
+    th.push(th.stack[th.errfunc]);
+    th.push(th.err);
+    try call(th, func, 1);
+    th.err = th.stack[func];
+    th.top = func;
+}
+
+/// Whether `n` more slots fit on the stack without passing its limit
+/// (`lua_checkstack`); grows it when they do.
+pub fn checkStack(th: *Thread, n: u32) error{OutOfMemory}!bool {
+    if (th.stack.len - th.top >= @as(usize, n) + Thread.extra_stack) return true;
+    if (@as(usize, th.top) + n > Thread.max_stack) return false;
+    th.growStack(@as(usize, th.top) + n) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.LuaError => return false,
     };
     return true;
 }
@@ -94,9 +226,9 @@ pub fn mainClosure(state: *State, p: *Proto) error{OutOfMemory}!*LuaClosure {
 /// Starts a call of the value at `func`. For a Lua function, pushes its
 /// frame and returns true; the caller runs it. A native function runs to
 /// completion here, its results placed, and the result is false.
-fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
-    var loops: u32 = 0;
-    while (true) : (loops += 1) {
+noinline fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
+    var chain: u32 = 0;
+    while (true) {
         const f = th.stack[func];
         switch (f.tag) {
             .lua_closure => {
@@ -111,18 +243,22 @@ fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
                 try callNative(th, func, nresults, f.asNativeClosure().f);
                 return false;
             },
-            else => {
-                // `__call`: the handler becomes the function and the called
-                // value its first argument.
-                const h = th.state.tmOf(f, .call) orelse return typeError(th, f, "call");
-                if (loops >= max_tag_loop) return th.runError("'__call' chain too long; possible loop", .{});
-                try th.ensureStack(1);
-                @memmove(th.stack[func + 1 .. th.top + 1], th.stack[func..th.top]);
-                th.top += 1;
-                th.stack[func] = h;
-            },
+            else => try insertCallTm(th, func, &chain),
         }
     }
+}
+
+/// Replaces a called value that is not a function with its `__call`
+/// handler, shifting the value up to be the first argument (`tryfuncTM`).
+noinline fn insertCallTm(th: *Thread, func: u32, chain: *u32) Error!void {
+    const f = th.stack[func];
+    const h = th.state.tmOf(f, .call) orelse return callError(th, func);
+    try th.ensureStack(1);
+    @memmove(th.stack[func + 1 .. th.top + 1], th.stack[func..th.top]);
+    th.top += 1;
+    th.stack[func] = h;
+    if (chain.* == max_call_chain) return th.runError("'__call' chain too long", .{});
+    chain.* += 1;
 }
 
 /// Pushes the frame for a call of Lua function `p` at `func`, with its
@@ -145,7 +281,7 @@ inline fn pushLuaFrame(th: *Thread, func: u32, p: *const Proto, nresults: i16) E
     });
 }
 
-fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn) Error!void {
+noinline fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn) Error!void {
     try th.ensureStack(Thread.min_stack);
     try th.frames.append(th.heap().allocator(), .{
         .func = func,
@@ -156,6 +292,14 @@ fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn) Error!vo
     const n = try f(th, func + 1);
     std.debug.assert(n <= th.top - func - 1);
     moveResults(th, func, th.top - n, n, nresults);
+    th.frames.items.len -= 1;
+}
+
+/// Finishes the running frame, a native one, with `n` results on top
+/// (`luaD_poscall`).
+fn posCall(th: *Thread, n: u32) void {
+    const f = th.frame();
+    moveResults(th, f.func, th.top - n, n, f.nresults);
     th.frames.items.len -= 1;
 }
 
@@ -182,6 +326,312 @@ inline fn moveResults(th: *Thread, dest: u32, first: u32, n: u32, wanted: i16) v
         },
     }
 }
+
+// ---------------------------------------------------------------------------
+// Coroutines
+// ---------------------------------------------------------------------------
+
+/// Whether the running code of `th` may yield (`lua_isyieldable`).
+pub fn isYieldable(th: *const Thread) bool {
+    return th.nny == 0;
+}
+
+/// Suspends the coroutine from a native function, passing the `nresults`
+/// values on top to the resumer (`lua_yield`). Return its result from the
+/// native: `return vm.yield(th, n)`. When the coroutine resumes, the
+/// native returns the values passed to `resume`.
+pub fn yield(th: *Thread, nresults: u32) Error {
+    return yieldk(th, nresults, 0, null);
+}
+
+/// `yield` with a continuation (`lua_yieldk`): when the coroutine resumes,
+/// `k` runs with status `.yield`, `ctx`, and the resume's values on top,
+/// and its result is the native's.
+pub fn yieldk(th: *Thread, nresults: u32, ctx: u32, k: ?KFn) Error {
+    if (th.nny > 0) {
+        if (th == th.state.main) return th.runError("attempt to yield from outside a coroutine", .{});
+        return th.runError("attempt to yield across a C-call boundary", .{});
+    }
+    const f = th.frame();
+    f.aux = nresults;
+    if (k) |kf| f.setK(kf, ctx) else f.flags.has_k = false;
+    th.status = .yield;
+    return error.LuaError;
+}
+
+pub const ResumeStatus = enum { ok, yield, err };
+
+pub const Resumed = struct {
+    status: ResumeStatus,
+    /// Values on top of the coroutine's stack: the body's results, the
+    /// yielded values, or 1, the error object.
+    nres: u32,
+};
+
+/// Starts or continues coroutine `co` with the `nargs` values on top of
+/// its stack (`lua_resume`); `from` is the resuming thread, whose nesting
+/// counts against the coroutine's. Returns when the body returns, yields,
+/// or fails with an error no protected call inside it catches; the last
+/// marks the coroutine dead, and its stack keeps the frames and a second
+/// copy of the error object below the one returned, for `closeThread`.
+/// Resuming a coroutine that is running, normal, or dead returns `.err`
+/// with a message and changes nothing.
+pub fn resumeThread(co: *Thread, from: ?*Thread, nargs: u32) Error!Resumed {
+    switch (co.status) {
+        .ok => {
+            if (co.frames.items.len > 1) return resumeError(co, "cannot resume non-suspended coroutine", nargs);
+            if (co.top - 1 == nargs) return resumeError(co, "cannot resume dead coroutine", nargs);
+        },
+        .yield => {},
+        .dead => return resumeError(co, "cannot resume dead coroutine", nargs),
+    }
+    co.native_calls = if (from) |f| f.native_calls else 0;
+    if (co.native_calls >= Thread.max_native_calls) return resumeError(co, "C stack overflow", nargs);
+    co.native_calls += 1;
+    const base_calls = co.native_calls;
+    co.nny = 0;
+    var outcome = outcomeOf(co, resumeBody(co, nargs));
+    // Errors inside a yieldable protected call unwound to here; finish
+    // each such call and go on (`precover`).
+    while (outcome == .err and !co.closed_self) {
+        const level = findPcall(co) orelse break;
+        recoverAt(co, level, outcome.err);
+        co.native_calls = base_calls;
+        co.nny = 0;
+        outcome = outcomeOf(co, unroll(co));
+    }
+    if (co.closed_self) {
+        co.closed_self = false;
+        outcome = if (co.top == 2) .{ .err = co.stack[1] } else .ok;
+    }
+    switch (outcome) {
+        .ok => return .{ .status = .ok, .nres = co.top - 1 },
+        .yield => return .{ .status = .yield, .nres = co.frame().aux },
+        .err => |e| {
+            co.status = .dead;
+            const f = co.frame();
+            if (f.flags.lua and co.top < f.top) co.top = f.top;
+            try co.ensureStack(2);
+            co.push(e);
+            co.push(e);
+            f.top = co.top;
+            return .{ .status = .err, .nres = 1 };
+        },
+    }
+}
+
+const Outcome = union(enum) { ok, yield, err: Value };
+
+fn outcomeOf(co: *Thread, r: Error!void) Outcome {
+    r catch |e| {
+        if (e == error.LuaError and co.status == .yield) return .yield;
+        return .{ .err = errorObject(co, e) };
+    };
+    return .ok;
+}
+
+fn resumeError(co: *Thread, msg: []const u8, nargs: u32) Error!Resumed {
+    co.top -= nargs;
+    co.push(.string(try co.state.newString(msg)));
+    return .{ .status = .err, .nres = 1 };
+}
+
+fn resumeBody(co: *Thread, nargs: u32) Error!void {
+    if (co.status == .ok) {
+        if (try preCall(co, co.top - nargs - 1, -1)) {
+            co.frame().flags.fresh = true;
+            try execute(co);
+        }
+        return;
+    }
+    // The innermost frame is the native that yielded: its results are the
+    // resume's values, or what its continuation makes of them.
+    co.status = .ok;
+    var n = nargs;
+    const f = co.frame();
+    if (f.k()) |k| n = try k(co, f.base(), .yield, f.extra_args);
+    posCall(co, n);
+    try unroll(co);
+}
+
+/// Runs the rest of a resumed coroutine from its frames, down to the base
+/// frame (`unroll`).
+fn unroll(th: *Thread) Error!void {
+    while (th.frames.items.len > 1) {
+        const f = th.frame();
+        if (f.flags.lua) {
+            try finishOp(th, f);
+            try execute(th);
+        } else {
+            try finishNative(th);
+        }
+    }
+}
+
+/// Finishes a native frame whose call through `callk` or `pcallk`
+/// returned: its continuation completes it (`finishCcall`).
+fn finishNative(th: *Thread) Error!void {
+    const idx = th.frames.items.len - 1;
+    var status: KStatus = .yield;
+    if (th.frames.items[idx].flags.ypcall) status = try finishPcallk(th, idx);
+    const f = &th.frames.items[idx];
+    if (f.top < th.top) f.top = th.top;
+    const k = f.k() orelse unreachable;
+    const n = try k(th, f.base(), status, f.extra_args);
+    posCall(th, n);
+}
+
+/// Completes the protected call of the native frame at `idx` after it was
+/// interrupted by a yield or an error (`finishpcallk`). After an error,
+/// closes the call's pending to-be-closed variables (which may yield or
+/// fail again; then this runs again with what is left) and leaves the
+/// error object at the call's function slot.
+fn finishPcallk(th: *Thread, idx: usize) Error!KStatus {
+    var status: KStatus = .yield;
+    if (th.frames.items[idx].recover) {
+        const func = th.frames.items[idx].aux;
+        // The error object is on top, where `recoverAt` put it and where
+        // each `__close` call leaves it.
+        try closeLevel(th, func, .{ .err = th.stack[th.top - 1] }, true);
+        th.stack[func] = th.stack[th.top - 1];
+        th.top = func + 1;
+        th.shrinkStack();
+        th.frames.items[idx].recover = false;
+        status = .err;
+    }
+    const f = &th.frames.items[idx];
+    f.flags.ypcall = false;
+    th.errfunc = f.old_errfunc;
+    return status;
+}
+
+/// The innermost native frame in a yieldable protected call, `findpcall`.
+fn findPcall(th: *Thread) ?usize {
+    var i = th.frames.items.len;
+    while (i > 1) {
+        i -= 1;
+        if (th.frames.items[i].flags.ypcall) return i;
+    }
+    return null;
+}
+
+/// Unwinds to the protected call at frame `level` after error `err`, with
+/// the error object on top above every slot the unwound frames used.
+fn recoverAt(th: *Thread, level: usize, err: Value) void {
+    var top = th.top;
+    for (th.frames.items[level..]) |f| top = @max(top, f.top);
+    th.frames.items.len = level + 1;
+    th.top = top;
+    th.push(err);
+    th.frames.items[level].recover = true;
+}
+
+/// Closes coroutine `co`: unwinds its frames, closes its pending
+/// to-be-closed variables, and empties its stack (`lua_closethread`).
+/// A dead coroutine passes its error object to the `__close` handlers.
+/// Returns true when it ends without an error; otherwise the error (the
+/// coroutine's or one a handler raised) is on top of `co`'s stack.
+pub fn closeThread(co: *Thread, from: ?*Thread) bool {
+    co.native_calls = if (from) |f| f.native_calls else 0;
+    const err: ?Value = if (co.status == .dead) co.stack[co.top - 1] else null;
+    co.resetFrames();
+    const result = closeProtected(co, 1, err);
+    if (result) |e| {
+        co.stack[1] = e;
+        co.top = 2;
+    } else {
+        co.top = 1;
+    }
+    co.shrinkStack();
+    return result == null;
+}
+
+/// `coroutine.close` on the running coroutine: closes it and ends the
+/// resume that runs it, which returns what closing it returned.
+pub fn closeSelf(th: *Thread) Error {
+    // Unwinding to the resume skips Zig frames; only yieldable ones may
+    // be skipped.
+    if (th.nny > 0) return th.runError("attempt to yield across a C-call boundary", .{});
+    _ = closeThread(th, th);
+    th.closed_self = true;
+    return error.LuaError;
+}
+
+// ---------------------------------------------------------------------------
+// To-be-closed variables
+// ---------------------------------------------------------------------------
+
+/// Makes the variable at stack slot `level` to-be-closed (`luaF_newtbcupval`).
+/// False and nil need no closing; any other value needs a `__close`.
+noinline fn newTbc(th: *Thread, level: u32) Error!void {
+    const v = th.stack[level];
+    if (v.isFalsy()) return;
+    if (th.state.tmOf(v, .close) == null) {
+        const f = th.frame();
+        const p = th.stack[f.func].asLuaClosure().proto;
+        const name = debuginfo.localName(p, level - f.func, Thread.currentPc(p, f)) orelse "?";
+        return th.runError("variable '{s}' got a non-closable value", .{name});
+    }
+    try th.tbc.append(th.heap().allocator(), level);
+}
+
+const CloseMode = union(enum) {
+    /// `CLOSE`: each `__close` call goes right above its variable.
+    normal,
+    /// `RETURN`: the calls go on top, above the results.
+    ktop,
+    /// Unwinding an error: each call gets the error object.
+    err: Value,
+};
+
+/// Closes the upvalues and to-be-closed variables at stack slot `level`
+/// and above, innermost first (`luaF_close`). Each `__close` handler gets
+/// the variable's value and, with `.err`, the error object.
+noinline fn closeLevel(th: *Thread, level: u32, mode: CloseMode, comptime yieldable: bool) Error!void {
+    th.closeUpvals(level);
+    while (th.tbc.items.len > 0) {
+        const tbc = th.tbc.items[th.tbc.items.len - 1];
+        if (tbc < level) break;
+        th.tbc.items.len -= 1;
+        const obj = th.stack[tbc];
+        switch (mode) {
+            .normal => th.top = tbc + 1,
+            .ktop => {},
+            // The error object stays in the stack, rooted, below the call.
+            .err => |e| {
+                th.stack[tbc + 1] = e;
+                th.top = tbc + 2;
+            },
+        }
+        try th.ensureStack(3);
+        const func = th.top;
+        th.push(th.state.tmOf(obj, .close) orelse .nil);
+        th.push(obj);
+        if (mode == .err) th.push(mode.err);
+        if (yieldable) try callYieldable(th, func, 0) else try call(th, func, 0);
+    }
+}
+
+/// Closes from `level` in protected mode after an error, `luaD_closeprotected`:
+/// an error in a `__close` handler replaces the error object and closing
+/// goes on. Returns the final error object, or null when there was none.
+fn closeProtected(th: *Thread, level: u32, err_in: ?Value) ?Value {
+    var err = err_in;
+    const frames = th.frames.items.len;
+    while (true) {
+        const mode: CloseMode = if (err) |e| .{ .err = e } else .normal;
+        closeLevel(th, level, mode, false) catch |e| {
+            err = errorObject(th, e);
+            th.frames.items.len = frames;
+            continue;
+        };
+        return err;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The interpreter loop
+// ---------------------------------------------------------------------------
 
 inline fn fetch(pc: *[*]const u32, i: *Instruction) opcodes.OpCode {
     i.* = pc.*[0];
@@ -262,10 +712,9 @@ fn execute(th: *Thread) Error!void {
                     }
                 }
                 ci.pc = pc;
-                if (try getSlow(th, ci, t, key, ci.base() + getA(i))) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try getSlow(th, .vm, ci, t, key, .{ .upval = getB(i) }, ci.base() + getA(i));
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -281,10 +730,9 @@ fn execute(th: *Thread) Error!void {
                     }
                 }
                 ci.pc = pc;
-                if (try getSlow(th, ci, t, key, ci.base() + getA(i))) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try getSlow(th, .vm, ci, t, key, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -299,10 +747,9 @@ fn execute(th: *Thread) Error!void {
                     }
                 }
                 ci.pc = pc;
-                if (try getSlow(th, ci, t, .int(getC(i)), ci.base() + getA(i))) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try getSlow(th, .vm, ci, t, .int(getC(i)), .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -319,10 +766,9 @@ fn execute(th: *Thread) Error!void {
                     }
                 }
                 ci.pc = pc;
-                if (try getSlow(th, ci, t, key, ci.base() + getA(i))) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try getSlow(th, .vm, ci, t, key, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -335,10 +781,9 @@ fn execute(th: *Thread) Error!void {
                     continue :dispatch fetch(&pc, &i);
                 }
                 ci.pc = pc;
-                if (try setSlow(th, ci, t, key, v)) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try setSlow(th, .vm, ci, t, key, v, .{ .upval = getA(i) });
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -356,10 +801,9 @@ fn execute(th: *Thread) Error!void {
                     continue :dispatch fetch(&pc, &i);
                 }
                 ci.pc = pc;
-                if (try setSlow(th, ci, t, key, v)) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try setSlow(th, .vm, ci, t, key, v, .{ .slot = ci.base() + getA(i) });
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -371,10 +815,9 @@ fn execute(th: *Thread) Error!void {
                     continue :dispatch fetch(&pc, &i);
                 }
                 ci.pc = pc;
-                if (try setSlow(th, ci, t, .int(getB(i)), v)) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try setSlow(th, .vm, ci, t, .int(getB(i)), v, .{ .slot = ci.base() + getA(i) });
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -387,10 +830,9 @@ fn execute(th: *Thread) Error!void {
                     continue :dispatch fetch(&pc, &i);
                 }
                 ci.pc = pc;
-                if (try setSlow(th, ci, t, key, v)) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try setSlow(th, .vm, ci, t, key, v, .{ .slot = ci.base() + getA(i) });
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -427,27 +869,29 @@ fn execute(th: *Thread) Error!void {
                     .addk, .subk, .mulk, .modk, .powk, .divk, .idivk => k[getC(i)],
                     else => base[getC(i)],
                 };
-                const arith: Arith = comptime arithOf(o);
-                if (rb.tag == .int and rc.tag == .int and arith.intOp()) {
+                const ao: ArithOp = comptime arithOf(o);
+                if (rb.tag == .int and rc.tag == .int and ao.intOp()) {
                     const x = rb.payload.int;
                     const y = rc.payload.int;
-                    switch (arith) {
+                    switch (ao) {
                         .add => base[getA(i)] = .int(x +% y),
                         .sub => base[getA(i)] = .int(x -% y),
                         .mul => base[getA(i)] = .int(x *% y),
                         .mod, .idiv => {
                             if (y == 0) {
                                 ci.pc = pc;
-                                if (arith == .mod) return th.runError("attempt to perform 'n%%0'", .{});
-                                return th.runError("attempt to perform 'n//0'", .{});
+                                return zeroDivision(th, ao);
                             }
-                            base[getA(i)] = .int(if (arith == .mod) intMod(x, y) else intFloorDiv(x, y));
+                            base[getA(i)] = .int(if (ao == .mod)
+                                number.modInt(x, y) catch unreachable
+                            else
+                                number.divFloorInt(x, y) catch unreachable);
                         },
                         else => unreachable,
                     }
                     pc += 1;
                 } else if (rb.isNumber() and rc.isNumber()) {
-                    base[getA(i)] = .float(floatArith(arith, rb.asNumber(), rc.asNumber()));
+                    base[getA(i)] = .float(floatArith(ao, rb.asNumber(), rc.asNumber()));
                     pc += 1;
                 }
                 // Otherwise the next instruction, an MMBIN, handles it.
@@ -469,9 +913,10 @@ fn execute(th: *Thread) Error!void {
                         .band, .bandk => x & y,
                         .bor, .bork => x | y,
                         .bxor, .bxork => x ^ y,
-                        .shl => shiftLeft(x, y),
-                        .shr, .shri => shiftLeft(x, 0 -% y),
-                        .shli => shiftLeft(y, x),
+                        .shl => number.shiftLeft(x, y),
+                        .shr, .shri => number.shiftRight(x, y),
+                        // R[A] := sC << R[B]
+                        .shli => number.shiftLeft(y, x),
                         else => unreachable,
                     });
                     pc += 1;
@@ -486,17 +931,20 @@ fn execute(th: *Thread) Error!void {
                     else => k[getB(i)],
                 };
                 var first = ra;
+                var o1: Origin = .{ .slot = ci.base() + getA(i) };
+                var o2: Origin = if (op(i) == .mmbin) .{ .slot = ci.base() + getB(i) } else .none;
                 if (op(i) != .mmbin and getK(i)) {
                     first = rb;
                     rb = ra;
+                    o2 = o1;
+                    o1 = .none;
                 }
                 const event: Tm = @enumFromInt(getC(i));
                 const dest = ci.base() + getA((pc - 2)[0]);
                 ci.pc = pc;
-                if (try arithSlow(th, ci, first, rb, event, dest)) {
-                    ci = th.frame();
-                    continue :newframe;
-                }
+                const done = try arithSlow(th, .vm, ci, first, rb, event, o1, o2, dest);
+                ci = th.frame();
+                if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -508,10 +956,10 @@ fn execute(th: *Thread) Error!void {
                     base[getA(i)] = .float(-rb.payload.float);
                 } else {
                     ci.pc = pc;
-                    if (try arithSlow(th, ci, rb, rb, .unm, ci.base() + getA(i))) {
-                        ci = th.frame();
-                        continue :newframe;
-                    }
+                    const o: Origin = .{ .slot = ci.base() + getB(i) };
+                    const done = try arithSlow(th, .vm, ci, rb, rb, .unm, o, o, ci.base() + getA(i));
+                    ci = th.frame();
+                    if (!done) continue :newframe;
                     base = th.stack.ptr + ci.base();
                 }
                 continue :dispatch fetch(&pc, &i);
@@ -522,10 +970,10 @@ fn execute(th: *Thread) Error!void {
                     base[getA(i)] = .int(~x);
                 } else {
                     ci.pc = pc;
-                    if (try arithSlow(th, ci, rb, rb, .bnot, ci.base() + getA(i))) {
-                        ci = th.frame();
-                        continue :newframe;
-                    }
+                    const o: Origin = .{ .slot = ci.base() + getB(i) };
+                    const done = try arithSlow(th, .vm, ci, rb, rb, .bnot, o, o, ci.base() + getA(i));
+                    ci = th.frame();
+                    if (!done) continue :newframe;
                     base = th.stack.ptr + ci.base();
                 }
                 continue :dispatch fetch(&pc, &i);
@@ -540,40 +988,49 @@ fn execute(th: *Thread) Error!void {
                     .short_string, .long_string => base[getA(i)] = .int(@intCast(rb.asString().len)),
                     .table => if (th.state.fastTm(rb.asTable().metatable, .len) == null) {
                         base[getA(i)] = .int(@bitCast(rb.asTable().length()));
-                        continue :dispatch fetch(&pc, &i);
                     } else {
                         ci.pc = pc;
-                        if (try lenSlow(th, ci, rb, ci.base() + getA(i))) {
-                            ci = th.frame();
-                            continue :newframe;
-                        }
+                        const done = try lenSlow(th, .vm, ci, rb, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                        ci = th.frame();
+                        if (!done) continue :newframe;
                         base = th.stack.ptr + ci.base();
                     },
                     else => {
                         ci.pc = pc;
-                        if (try lenSlow(th, ci, rb, ci.base() + getA(i))) {
-                            ci = th.frame();
-                            continue :newframe;
-                        }
+                        const done = try lenSlow(th, .vm, ci, rb, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                        ci = th.frame();
+                        if (!done) continue :newframe;
                         base = th.stack.ptr + ci.base();
                     },
                 }
                 continue :dispatch fetch(&pc, &i);
             },
             .concat => {
+                th.top = ci.base() + getA(i) + getB(i);
                 ci.pc = pc;
-                try concat(th, ci.base() + getA(i), getB(i));
+                const done = try concatValues(th, .vm, getB(i));
+                ci = th.frame();
+                if (!done) continue :newframe;
                 th.state.checkGc();
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
             .close => {
-                th.closeUpvals(ci.base() + getA(i));
+                const level = ci.base() + getA(i);
+                if (th.tbc.items.len == 0 or th.tbc.items[th.tbc.items.len - 1] < level) {
+                    th.closeUpvals(level);
+                    continue :dispatch fetch(&pc, &i);
+                }
+                ci.pc = pc;
+                try closeLevel(th, level, .normal, true);
+                ci = th.frame();
+                base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
             .tbc => {
                 ci.pc = pc;
-                return th.runError("to-be-closed variables are not implemented yet", .{});
+                try newTbc(th, ci.base() + getA(i));
+                continue :dispatch fetch(&pc, &i);
             },
             .jmp => {
                 pc += @as(usize, @bitCast(@as(isize, opcodes.sj(i))));
@@ -598,14 +1055,12 @@ fn execute(th: *Thread) Error!void {
                 } else {
                     ci.pc = pc;
                     const r = switch (o) {
-                        .eq => try equalSlow(th, ci, ra, rb),
-                        .lt => try orderSlow(th, ci, ra, rb, .lt),
-                        else => try orderSlow(th, ci, ra, rb, .le),
+                        .eq => try equalSlow(th, .vm, ci, ra, rb),
+                        .lt => try orderSlow(th, .vm, ci, ra, rb, .lt),
+                        else => try orderSlow(th, .vm, ci, ra, rb, .le),
                     };
-                    cond = r orelse {
-                        ci = th.frame();
-                        continue :newframe;
-                    };
+                    ci = th.frame();
+                    cond = r orelse continue :newframe;
                     base = th.stack.ptr + ci.base();
                 }
                 if (cond != getK(i)) pc += 1 else pc += jumpOffset(pc[0]);
@@ -645,15 +1100,13 @@ fn execute(th: *Thread) Error!void {
                     ci.pc = pc;
                     const imv: Value = if (getC(i) != 0) .float(@floatFromInt(im)) else .int(im);
                     const r = switch (o) {
-                        .lti => try orderSlow(th, ci, ra, imv, .lt),
-                        .lei => try orderSlow(th, ci, ra, imv, .le),
-                        .gti => try orderSlow(th, ci, imv, ra, .lt),
-                        else => try orderSlow(th, ci, imv, ra, .le),
+                        .lti => try orderSlow(th, .vm, ci, ra, imv, .lt),
+                        .lei => try orderSlow(th, .vm, ci, ra, imv, .le),
+                        .gti => try orderSlow(th, .vm, ci, imv, ra, .lt),
+                        else => try orderSlow(th, .vm, ci, imv, ra, .le),
                     };
-                    cond = r orelse {
-                        ci = th.frame();
-                        continue :newframe;
-                    };
+                    ci = th.frame();
+                    cond = r orelse continue :newframe;
                     base = th.stack.ptr + ci.base();
                 }
                 if (cond != getK(i)) pc += 1 else pc += jumpOffset(pc[0]);
@@ -701,14 +1154,9 @@ fn execute(th: *Thread) Error!void {
                 ci.pc = pc;
                 if (getK(i)) th.closeUpvals(ci.base());
                 // Resolve `__call` in place, before moving down.
-                while (!th.stack[func].isFunction()) {
-                    const f = th.stack[func];
-                    const h = th.state.tmOf(f, .call) orelse return typeError(th, f, "call");
-                    try th.ensureStack(1);
-                    @memmove(th.stack[func + 1 .. th.top + 1], th.stack[func..th.top]);
-                    th.top += 1;
-                    th.stack[func] = h;
-                }
+                var chain: u32 = 0;
+                while (!th.stack[func].isFunction()) try insertCallTm(th, func, &chain);
+                ci = th.frame();
                 if (th.stack[func].tag == .lua_closure) {
                     const p = th.stack[func].asLuaClosure().proto;
                     const nargs = th.top - func - 1;
@@ -723,6 +1171,7 @@ fn execute(th: *Thread) Error!void {
                     ci.top = dest + 1 + fsize;
                     ci.pc = p.code.ptr;
                     ci.extra_args = 0;
+                    ci.flags.tail = true;
                     continue :newframe;
                 }
                 // A native function: call it where it is, then return its
@@ -740,7 +1189,12 @@ fn execute(th: *Thread) Error!void {
                 const first = ci.base() + getA(i);
                 const n: u32 = if (getB(i) != 0) getB(i) - 1 else th.top - first;
                 ci.pc = pc;
-                if (getK(i)) th.closeUpvals(ci.base());
+                if (getK(i)) {
+                    ci.aux = n;
+                    if (th.top < ci.top) th.top = ci.top;
+                    try closeLevel(th, ci.base(), .ktop, true);
+                    ci = th.frame();
+                }
                 if (getC(i) != 0) ci.func -= ci.extra_args + getC(i);
                 if (try doReturn(th, first, n)) return;
                 ci = th.frame();
@@ -788,7 +1242,7 @@ fn execute(th: *Thread) Error!void {
                 base[a + 2] = closing;
                 if (!closing.isFalsy()) {
                     ci.pc = pc;
-                    return th.runError("to-be-closed variables are not implemented yet", .{});
+                    try newTbc(th, ci.base() + a + 2);
                 }
                 pc += opcodes.bx(i);
                 continue :dispatch fetch(&pc, &i);
@@ -843,19 +1297,8 @@ fn execute(th: *Thread) Error!void {
             },
             .vararg => {
                 ci.pc = pc;
-                if (getK(i)) return th.runError("vararg tables are not implemented yet", .{});
-                const dest = ci.base() + getA(i);
-                const nargs = ci.extra_args;
-                var wanted: i32 = @as(i32, @intCast(getC(i))) - 1;
-                if (wanted < 0) {
-                    wanted = @intCast(nargs);
-                    try th.growStack(@as(usize, dest) + nargs);
-                    th.top = dest + nargs;
-                }
-                const w: u32 = @intCast(wanted);
-                const use = @min(w, nargs);
-                for (0..use) |j| th.stack[dest + j] = th.stack[ci.func - nargs + j];
-                for (use..w) |j| th.stack[dest + j] = .nil;
+                const vatab: ?u32 = if (getK(i)) getB(i) else null;
+                try getVarargs(th, ci, ci.base() + getA(i), @as(i32, @intCast(getC(i))) - 1, vatab);
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -863,12 +1306,7 @@ fn execute(th: *Thread) Error!void {
                 const rc = base[getC(i)];
                 const nextra = ci.extra_args;
                 var result: Value = .nil;
-                const key: ?i64 = switch (rc.tag) {
-                    .int => rc.payload.int,
-                    .float => Value.floatToInt(rc.payload.float),
-                    else => null,
-                };
-                if (key) |n| {
+                if (toIntStrict(rc)) |n| {
                     const u: u64 = @bitCast(n -% 1);
                     if (u < nextra) result = th.stack[ci.func - nextra + @as(u32, @intCast(u))];
                 } else if (rc.isString() and std.mem.eql(u8, rc.asString().bytes(), "n")) {
@@ -889,6 +1327,7 @@ fn execute(th: *Thread) Error!void {
             .varargprep => {
                 ci.pc = pc;
                 try adjustVarargs(th, ci, cl.proto);
+                if (cl.proto.flags.vararg_table) th.state.checkGc();
                 base = th.stack.ptr + ci.base();
                 continue :dispatch fetch(&pc, &i);
             },
@@ -915,20 +1354,23 @@ inline fn doReturn(th: *Thread, first: u32, n: u32) Error!bool {
     return false;
 }
 
-/// Completes the instruction of Lua frame `ci` that a Lua metamethod
-/// interrupted, with the metamethod's one result at `top - 1`. The
-/// interrupted instruction is the one before `ci.pc`.
-fn finishOp(th: *Thread, ci: *Frame) Error!void {
+/// Completes the instruction of Lua frame `ci` that a metamethod or a
+/// yield interrupted, `luaV_finishOp`. The interrupted instruction is the
+/// one before `ci.pc`; a metamethod's one result is at `top - 1`. It may
+/// push a new metamethod frame (`__concat` with more to concatenate).
+noinline fn finishOp(th: *Thread, ci: *Frame) Error!void {
     const inst = (ci.pc - 1)[0];
     const base = ci.base();
     switch (op(inst)) {
         .mmbin, .mmbini, .mmbink => {
             th.top -= 1;
             th.stack[base + getA((ci.pc - 2)[0])] = th.stack[th.top];
+            th.top = ci.top;
         },
         .unm, .bnot, .len, .gettabup, .gettable, .geti, .getfield, .self => {
             th.top -= 1;
             th.stack[base + getA(inst)] = th.stack[th.top];
+            th.top = ci.top;
         },
         .eq, .lt, .le, .lti, .lei, .gti, .gei => {
             th.top -= 1;
@@ -936,40 +1378,73 @@ fn finishOp(th: *Thread, ci: *Frame) Error!void {
             // The next instruction is the jump; skip it when the condition
             // failed.
             if (res != getK(inst)) ci.pc += 1;
+            th.top = ci.top;
         },
-        .settabup, .settable, .seti, .setfield => {},
-        else => unreachable,
+        .concat => {
+            // The handler was called with `top` one past the operands, and
+            // its result sits there.
+            const top = th.top - 1;
+            const total = top - 1 - (base + getA(inst));
+            th.stack[top - 2] = th.stack[top];
+            th.top = top - 1;
+            _ = try concatValues(th, .vm, total);
+        },
+        // Yielded while closing variables: run the instruction again to
+        // close the rest (and, for RETURN, to return).
+        .close => ci.pc -= 1,
+        .@"return" => {
+            th.top = base + getA(inst) + ci.aux;
+            ci.pc -= 1;
+        },
+        // Calls, and stores through `__newindex`, have nothing to finish.
+        else => {},
     }
-    th.top = ci.top;
 }
 
-/// Calls metamethod `f` with two arguments for one result, above the Lua
-/// frame `ci`. A native handler runs now and its result is returned. A Lua
-/// handler gets a frame flagged `finish_op` and the result is null.
-fn callTm(th: *Thread, ci: *Frame, f: Value, a1: Value, a2: Value) Error!?Value {
-    return callTm3(th, ci, f, a1, a2, null, 1);
-}
+// ---------------------------------------------------------------------------
+// Metamethods
+//
+// Each slow path serves an instruction of the running Lua frame `ci`
+// (`.vm`) or native code through the API below (`.native`). For an
+// instruction, a handler written in Lua gets its own frame flagged
+// `finish_op` and the slow path returns false: the interpreter runs the
+// handler, and `finishOp` completes the instruction. For native code the
+// handler runs to completion through `call`.
+// ---------------------------------------------------------------------------
 
-fn callTm3(th: *Thread, ci: *Frame, f: Value, a1: Value, a2: Value, a3: ?Value, nresults: i16) Error!?Value {
-    th.top = ci.top;
+/// Who asks for a metamethod: an instruction of a Lua frame, or native
+/// code through the API below.
+const Caller = enum { vm, native };
+
+/// Calls metamethod `f` with two or three arguments for `nresults` (0 or 1)
+/// results; see above for `caller`. `ci` is the running Lua frame for
+/// `.vm`.
+inline fn callTm(th: *Thread, comptime caller: Caller, ci: *Frame, f: Value, a1: Value, a2: Value, a3: ?Value, nresults: i16) Error!?Value {
+    if (caller == .vm) th.top = ci.top else try th.ensureStack(4);
     const func = th.top;
     th.push(f);
     th.push(a1);
     th.push(a2);
     if (a3) |v| th.push(v);
-    if (try preCall(th, func, nresults)) {
-        th.frame().flags.finish_op = true;
-        return null;
+    if (caller == .vm) {
+        if (try preCall(th, func, nresults)) {
+            th.frame().flags.finish_op = true;
+            return null;
+        }
+    } else {
+        try call(th, func, nresults);
     }
     const r = if (nresults > 0) th.stack[func] else Value.nil;
-    th.top = th.frame().top;
+    th.top = if (caller == .vm) th.frame().top else func;
     return r;
 }
 
-/// `t[key]` with `__index`, into stack slot `dest`. True when a Lua
-/// metamethod frame was pushed.
-fn getSlow(th: *Thread, ci: *Frame, t_in: Value, key: Value, dest: u32) Error!bool {
+/// `t[key]` with `__index` (`luaV_finishget`) into stack slot `dest`.
+/// False when a Lua metamethod frame was pushed. `origin` names `t` in a
+/// type error.
+noinline fn getSlow(th: *Thread, comptime caller: Caller, ci: *Frame, t_in: Value, key: Value, origin: Origin, dest: u32) Error!bool {
     var t = t_in;
+    var org = origin;
     for (0..max_tag_loop) |_| {
         var h: Value = undefined;
         if (t.tag == .table) {
@@ -977,50 +1452,51 @@ fn getSlow(th: *Thread, ci: *Frame, t_in: Value, key: Value, dest: u32) Error!bo
             const v = tbl.get(key);
             if (!v.isNil()) {
                 th.stack[dest] = v;
-                return false;
+                return true;
             }
             h = th.state.fastTm(tbl.metatable, .index) orelse {
                 th.stack[dest] = .nil;
-                return false;
+                return true;
             };
         } else {
-            h = th.state.tmOf(t, .index) orelse return typeError(th, t, "index");
+            h = th.state.tmOf(t, .index) orelse return typeError(th, t, "index", org);
         }
         if (h.isFunction()) {
-            const r = try callTm(th, ci, h, t, key) orelse return true;
-            th.stack[dest] = r;
-            return false;
+            th.stack[dest] = try callTm(th, caller, ci, h, t, key, null, 1) orelse return false;
+            return true;
         }
         t = h;
+        org = .none;
     }
     return th.runError("'__index' chain too long; possible loop", .{});
 }
 
-/// `t[key] = v` with `__newindex`. True when a Lua metamethod frame was
-/// pushed.
-fn setSlow(th: *Thread, ci: *Frame, t_in: Value, key: Value, v: Value) Error!bool {
+/// `t[key] = v` with `__newindex` (`luaV_finishset`). False when a Lua
+/// metamethod frame was pushed.
+noinline fn setSlow(th: *Thread, comptime caller: Caller, ci: *Frame, t_in: Value, key: Value, v: Value, origin: Origin) Error!bool {
     var t = t_in;
+    var org = origin;
     for (0..max_tag_loop) |_| {
         var h: Value = undefined;
         if (t.tag == .table) {
             const tbl = t.asTable();
-            const present = !tbl.get(key).isNil();
-            if (present) {
+            if (!tbl.get(key).isNil()) {
                 tbl.set(th.heap(), key, v) catch |e| return setError(th, e);
-                return false;
+                return true;
             }
             h = th.state.fastTm(tbl.metatable, .newindex) orelse {
                 tbl.set(th.heap(), key, v) catch |e| return setError(th, e);
-                return false;
+                return true;
             };
         } else {
-            h = th.state.tmOf(t, .newindex) orelse return typeError(th, t, "index");
+            h = th.state.tmOf(t, .newindex) orelse return typeError(th, t, "index", org);
         }
         if (h.isFunction()) {
-            _ = try callTm3(th, ci, h, t, key, v, 0) orelse return true;
-            return false;
+            _ = try callTm(th, caller, ci, h, t, key, v, 0) orelse return false;
+            return true;
         }
         t = h;
+        org = .none;
     }
     return th.runError("'__newindex' chain too long; possible loop", .{});
 }
@@ -1028,122 +1504,407 @@ fn setSlow(th: *Thread, ci: *Frame, t_in: Value, key: Value, v: Value) Error!boo
 fn setError(th: *Thread, e: Table.SetError) Error {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
-        error.IndexIsNil => th.runError("index is nil", .{}),
-        error.IndexIsNaN => th.runError("index is NaN", .{}),
+        error.IndexIsNil => th.runError("table index is nil", .{}),
+        error.IndexIsNaN => th.runError("table index is NaN", .{}),
     };
 }
 
-/// A binary or unary metamethod for `event` over `a` and `b`, into `dest`,
-/// or the error the manual gives when neither operand has one.
-fn arithSlow(th: *Thread, ci: *Frame, a: Value, b: Value, event: Tm, dest: u32) Error!bool {
+/// A binary or unary metamethod for `event` over `a` and `b` into stack
+/// slot `dest`, or the error the manual gives when neither operand has one
+/// (`luaT_trybinTM`). False when a Lua metamethod frame was pushed.
+noinline fn arithSlow(th: *Thread, comptime caller: Caller, ci: *Frame, a: Value, b: Value, event: Tm, oa: Origin, ob: Origin, dest: u32) Error!bool {
     const h = th.state.tmOf(a, event) orelse th.state.tmOf(b, event) orelse {
         switch (event) {
             .band, .bor, .bxor, .shl, .shr, .bnot => {
-                if (a.isNumber() and b.isNumber()) return th.runError("number has no integer representation", .{});
-                return typeError(th, if (a.isNumber()) b else a, "perform bitwise operation on");
+                if (a.isNumber() and b.isNumber()) {
+                    var buf: [128]u8 = undefined;
+                    const o = if (toIntStrict(a) == null) oa else ob;
+                    return th.runError("number{s} has no integer representation", .{debuginfo.varInfo(th, o, &buf)});
+                }
+                if (!a.isNumber()) return typeError(th, a, "perform bitwise operation on", oa);
+                return typeError(th, b, "perform bitwise operation on", ob);
             },
-            .concat => return typeError(th, if (a.isString() or a.isNumber()) b else a, "concatenate"),
-            else => return typeError(th, if (a.isNumber()) b else a, "perform arithmetic on"),
+            else => {
+                if (!a.isNumber()) return typeError(th, a, "perform arithmetic on", oa);
+                return typeError(th, b, "perform arithmetic on", ob);
+            },
         }
     };
-    const r = try callTm(th, ci, h, a, b) orelse return true;
-    th.stack[dest] = r;
-    return false;
+    th.stack[dest] = try callTm(th, caller, ci, h, a, b, null, 1) orelse return false;
+    return true;
 }
 
-fn lenSlow(th: *Thread, ci: *Frame, v: Value, dest: u32) Error!bool {
+noinline fn lenSlow(th: *Thread, comptime caller: Caller, ci: *Frame, v: Value, origin: Origin, dest: u32) Error!bool {
     const h = th.state.tmOf(v, .len) orelse {
         if (v.tag == .table) {
             th.stack[dest] = .int(@bitCast(v.asTable().length()));
-            return false;
+            return true;
         }
-        return typeError(th, v, "get length of");
+        return typeError(th, v, "get length of", origin);
     };
-    const r = try callTm(th, ci, h, v, v) orelse return true;
-    th.stack[dest] = r;
-    return false;
+    th.stack[dest] = try callTm(th, caller, ci, h, v, v, null, 1) orelse return false;
+    return true;
 }
 
 /// `a == b` for operands not both numbers; null when a Lua `__eq` frame
 /// was pushed.
-fn equalSlow(th: *Thread, ci: *Frame, a: Value, b: Value) Error!?bool {
+noinline fn equalSlow(th: *Thread, comptime caller: Caller, ci: *Frame, a: Value, b: Value) Error!?bool {
     if (Value.rawEquals(a, b)) return true;
     if (a.tag != b.tag or (a.tag != .table and a.tag != .userdata)) return false;
     const h = th.state.fastTm(th.state.metatableOf(a), .eq) orelse
         th.state.fastTm(th.state.metatableOf(b), .eq) orelse return false;
-    const r = try callTm(th, ci, h, a, b) orelse return null;
+    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return null;
     return !r.isFalsy();
 }
 
 /// `a < b` or `a <= b` for operands not both numbers; null when a Lua
 /// metamethod frame was pushed.
-fn orderSlow(th: *Thread, ci: *Frame, a: Value, b: Value, event: Tm) Error!?bool {
+noinline fn orderSlow(th: *Thread, comptime caller: Caller, ci: *Frame, a: Value, b: Value, event: Tm) Error!?bool {
     if (a.isNumber() and b.isNumber()) return if (event == .lt) lessThanNum(a, b) else lessEqualNum(a, b);
     if (a.isString() and b.isString()) {
         const ord = std.mem.order(u8, a.asString().bytes(), b.asString().bytes());
         return if (event == .lt) ord == .lt else ord != .gt;
     }
     const h = th.state.tmOf(a, event) orelse th.state.tmOf(b, event) orelse {
-        const ta = a.typeOf().name();
-        const tb = b.typeOf().name();
+        const ta = th.state.typeName(a);
+        const tb = th.state.typeName(b);
         if (std.mem.eql(u8, ta, tb)) return th.runError("attempt to compare two {s} values", .{ta});
         return th.runError("attempt to compare {s} with {s}", .{ ta, tb });
     };
-    const r = try callTm(th, ci, h, a, b) orelse return null;
+    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return null;
     return !r.isFalsy();
 }
 
-fn typeError(th: *Thread, v: Value, comptime what: []const u8) Error {
-    // TODO(wave 2): name the variable, as PUC-Rio's varinfo does.
-    return th.runError("attempt to " ++ what ++ " a {s} value", .{v.typeOf().name()});
+/// Longest string a concatenation may build, PUC-Rio's `MAX_SIZE` less the
+/// header.
+const max_string_len: usize = std.math.maxInt(i64) - 64;
+
+inline fn isConcatable(v: Value) bool {
+    return v.isString() or v.isNumber();
 }
 
-/// R[a] := R[a] .. ... .. R[a+n-1], for strings and numbers.
-/// TODO(wave 2): `__concat`, finished through `finishOp`.
-fn concat(th: *Thread, first: u32, n: u32) Error!void {
-    const vals = th.stack[first .. first + n];
-    var total: usize = 0;
-    var numbuf: [64]u8 = undefined;
-    for (vals) |v| {
-        if (v.isString()) {
-            total += v.asString().len;
-        } else if (v.isNumber()) {
-            total += numberToString(v, &numbuf).len;
-        } else {
-            for (vals) |w| if (!w.isString() and !w.isNumber()) return typeError(th, w, "concatenate");
+/// Concatenates the `total` values below `top` into one at `top - total`
+/// (`luaV_concat`), strings and numbers directly and anything else through
+/// `__concat`, right to left. False when a Lua `__concat` frame was pushed
+/// (only for `.vm`); `finishOp` continues from there.
+noinline fn concatValues(th: *Thread, comptime caller: Caller, total_in: u32) Error!bool {
+    var total = total_in;
+    while (total > 1) {
+        const top = th.top;
+        const a = th.stack[top - 2];
+        const b = th.stack[top - 1];
+        if (!isConcatable(a) or !isConcatable(b)) {
+            const h = th.state.tmOf(a, .concat) orelse th.state.tmOf(b, .concat) orelse {
+                if (isConcatable(a)) return typeError(th, b, "concatenate", .{ .slot = top - 1 });
+                return typeError(th, a, "concatenate", .{ .slot = top - 2 });
+            };
+            // The handler goes on top, so `top` still marks the operands.
+            try th.ensureStack(3);
+            th.push(h);
+            th.push(a);
+            th.push(b);
+            if (caller == .vm) {
+                if (try preCall(th, top, 1)) {
+                    th.frame().flags.finish_op = true;
+                    return false;
+                }
+            } else {
+                try call(th, top, 1);
+            }
+            th.stack[top - 2] = th.stack[top];
+            th.top = top - 1;
+            total -= 1;
+            continue;
         }
-    }
-    const state = th.state;
-    if (total <= String.max_short_len) {
-        var buf: [String.max_short_len]u8 = undefined;
-        var len: usize = 0;
-        for (vals) |v| {
-            const s = if (v.isString()) v.asString().bytes() else numberToString(v, &numbuf);
-            @memcpy(buf[len..][0..s.len], s);
-            len += s.len;
+        // As many strings and numbers as there are below the top.
+        var numbuf: [number.max_len]u8 = undefined;
+        var n: u32 = 1;
+        var len: usize = toStringBuf(b, &numbuf).len;
+        while (n < total and isConcatable(th.stack[top - n - 1])) : (n += 1) {
+            const l = toStringBuf(th.stack[top - n - 1], &numbuf).len;
+            if (l >= max_string_len - len) {
+                th.top = top - total;
+                return th.runError("string length overflow", .{});
+            }
+            len += l;
         }
-        th.stack[first] = .string(try state.newString(buf[0..len]));
-        return;
+        const parts = th.stack[top - n .. top];
+        const s = if (len <= String.max_short_len) blk: {
+            var buf: [String.max_short_len]u8 = undefined;
+            copyParts(parts, &buf);
+            break :blk try th.state.newString(buf[0..len]);
+        } else blk: {
+            const out = try String.createLong(&th.state.heap, th.state.seed, len);
+            copyParts(parts, out.mutableBytes());
+            break :blk out;
+        };
+        th.stack[top - n] = .string(s);
+        total -= n - 1;
+        th.top -= n - 1;
     }
-    const out = try String.createLong(&state.heap, state.seed, total);
-    const bytes = out.mutableBytes();
+    return true;
+}
+
+fn copyParts(parts: []const Value, out: []u8) void {
+    var numbuf: [number.max_len]u8 = undefined;
     var len: usize = 0;
-    for (vals) |v| {
-        const s = if (v.isString()) v.asString().bytes() else numberToString(v, &numbuf);
-        @memcpy(bytes[len..][0..s.len], s);
+    for (parts) |v| {
+        const s = toStringBuf(v, &numbuf);
+        @memcpy(out[len..][0..s.len], s);
         len += s.len;
     }
-    th.stack[first] = .string(out);
 }
 
-/// Adjusts a vararg call (`VARARGPREP`): copies the function and fixed
-/// parameters above the extra arguments, so the extra arguments sit below
-/// the frame, and nils the vararg parameter.
-fn adjustVarargs(th: *Thread, ci: *Frame, p: *const Proto) Error!void {
-    if (p.flags.vararg_table) return th.runError("vararg tables are not implemented yet", .{});
+/// A string's bytes, or a number formatted into `buf`.
+inline fn toStringBuf(v: Value, buf: *[number.max_len]u8) []const u8 {
+    return switch (v.tag) {
+        .int => number.formatInt(buf, v.payload.int),
+        .float => number.formatFloat(buf, v.payload.float),
+        else => v.asString().bytes(),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Operations for native code. Each may call metamethods, through `call`,
+// so none can yield.
+// ---------------------------------------------------------------------------
+
+/// `t[key]` with `__index` (`lua_gettable`).
+pub fn get(th: *Thread, t: Value, key: Value) Error!Value {
+    if (t.tag == .table) {
+        const v = t.asTable().get(key);
+        if (!v.isNil() or th.state.fastTm(t.asTable().metatable, .index) == null) return v;
+    }
+    try th.ensureStack(1);
+    const dest = th.top;
+    th.top += 1;
+    _ = try getSlow(th, .native, th.frame(), t, key, .none, dest);
+    th.top = dest;
+    return th.stack[dest];
+}
+
+/// `t[key] = v` with `__newindex` (`lua_settable`).
+pub fn set(th: *Thread, t: Value, key: Value, v: Value) Error!void {
+    _ = try setSlow(th, .native, th.frame(), t, key, v, .none);
+}
+
+/// The arithmetic and bitwise operators, in `lua_arith`'s order.
+pub const ArithOp = enum(u8) {
+    add,
+    sub,
+    mul,
+    mod,
+    pow,
+    div,
+    idiv,
+    band,
+    bor,
+    bxor,
+    shl,
+    shr,
+    unm,
+    bnot,
+
+    fn intOp(a: ArithOp) bool {
+        return a != .pow and a != .div;
+    }
+
+    fn event(a: ArithOp) Tm {
+        return @enumFromInt(@intFromEnum(Tm.add) + @intFromEnum(a));
+    }
+};
+
+comptime {
+    std.debug.assert(ArithOp.bnot.event() == .bnot);
+    std.debug.assert(ArithOp.shr.event() == .shr);
+}
+
+/// `a op b` with Lua's semantics and metamethods (`lua_arith`); for the
+/// unary operators `b` is ignored. Numbers only: strings convert through
+/// their metatable's handlers, as in Lua 5.5.
+pub fn arith(th: *Thread, o: ArithOp, a: Value, b_in: Value) Error!Value {
+    const b = if (o == .unm or o == .bnot) a else b_in;
+    if (try rawArith(th, o, a, b)) |v| return v;
+    try th.ensureStack(1);
+    const dest = th.top;
+    th.top += 1;
+    _ = try arithSlow(th, .native, th.frame(), a, b, o.event(), .none, .none, dest);
+    th.top = dest;
+    return th.stack[dest];
+}
+
+/// `a op b` when both are numbers (and integers, for the bitwise
+/// operators), else null (`luaO_rawarith`).
+pub fn rawArith(th: *Thread, o: ArithOp, a: Value, b: Value) Error!?Value {
+    switch (o) {
+        .band, .bor, .bxor, .shl, .shr, .bnot => {
+            const x = toIntStrict(a) orelse return null;
+            const y = toIntStrict(b) orelse return null;
+            return .int(switch (o) {
+                .band => x & y,
+                .bor => x | y,
+                .bxor => x ^ y,
+                .shl => number.shiftLeft(x, y),
+                .shr => number.shiftRight(x, y),
+                .bnot => ~x,
+                else => unreachable,
+            });
+        },
+        else => {
+            if (a.tag == .int and b.tag == .int and o.intOp()) {
+                const x = a.payload.int;
+                const y = b.payload.int;
+                return .int(switch (o) {
+                    .add => x +% y,
+                    .sub => x -% y,
+                    .mul => x *% y,
+                    .unm => 0 -% x,
+                    .mod => number.modInt(x, y) catch return zeroDivision(th, o),
+                    .idiv => number.divFloorInt(x, y) catch return zeroDivision(th, o),
+                    else => unreachable,
+                });
+            }
+            if (!a.isNumber() or !b.isNumber()) return null;
+            if (o == .unm) return .float(-a.asNumber());
+            return .float(floatArith(o, a.asNumber(), b.asNumber()));
+        },
+    }
+}
+
+/// `a == b` with `__eq` (`lua_compare` with `LUA_OPEQ`).
+pub fn equal(th: *Thread, a: Value, b: Value) Error!bool {
+    if (a.isNumber() and b.isNumber()) return Value.rawEquals(a, b);
+    return (try equalSlow(th, .native, th.frame(), a, b)).?;
+}
+
+/// `a < b` with `__lt` (`lua_compare` with `LUA_OPLT`).
+pub fn lessThan(th: *Thread, a: Value, b: Value) Error!bool {
+    return (try orderSlow(th, .native, th.frame(), a, b, .lt)).?;
+}
+
+/// `a <= b` with `__le` (`lua_compare` with `LUA_OPLE`).
+pub fn lessEqual(th: *Thread, a: Value, b: Value) Error!bool {
+    return (try orderSlow(th, .native, th.frame(), a, b, .le)).?;
+}
+
+/// `#v` with `__len` (`lua_len`).
+pub fn length(th: *Thread, v: Value) Error!Value {
+    switch (v.tag) {
+        .short_string, .long_string => return .int(@intCast(v.asString().len)),
+        else => {
+            try th.ensureStack(1);
+            const dest = th.top;
+            th.top += 1;
+            _ = try lenSlow(th, .native, th.frame(), v, .none, dest);
+            th.top = dest;
+            return th.stack[dest];
+        },
+    }
+}
+
+/// Replaces the `n` values on top with their concatenation, with
+/// `__concat` (`lua_concat`); for `n` 0 pushes the empty string.
+pub fn concat(th: *Thread, n: u32) Error!void {
+    if (n == 0) {
+        try th.ensureStack(1);
+        th.push(.string(try th.state.newString("")));
+        return;
+    }
+    _ = try concatValues(th, .native, n);
+}
+
+/// A number, or a string that converts to one by the manual's rules
+/// (§3.4.3), as a number; else null. `tonumber` and the string library's
+/// arithmetic metamethods use it.
+pub fn toNumber(v: Value) ?Value {
+    return switch (v.tag) {
+        .int, .float => v,
+        .short_string, .long_string => stringToNumber(v.asString().bytes()),
+        else => null,
+    };
+}
+
+/// A numeral as a number, or null (`luaO_str2num`).
+pub fn stringToNumber(s: []const u8) ?Value {
+    return switch (number.parse(s) orelse return null) {
+        .int => |x| .int(x),
+        .float => |x| .float(x),
+    };
+}
+
+/// A number or numeric string with an exact integer value, as an integer
+/// (`lua_tointeger`).
+pub fn toInteger(v: Value) ?i64 {
+    return toIntStrict(toNumber(v) orelse return null);
+}
+
+/// A number as `tostring` writes it, into `buf` (`luaO_tostringbuff`).
+pub fn formatNumber(v: Value, buf: *[number.max_len]u8) []const u8 {
+    return if (v.tag == .int) number.formatInt(buf, v.payload.int) else number.formatFloat(buf, v.asFloat());
+}
+
+/// A number converted to a string (`luaO_tostring`).
+pub fn numberToString(state: *State, v: Value) error{OutOfMemory}!*String {
+    var buf: [number.max_len]u8 = undefined;
+    return state.newString(formatNumber(v, &buf));
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// "attempt to <what> a <type> value", with the variable's name when
+/// `origin` has one, as `luaG_typeerror` does.
+noinline fn typeError(th: *Thread, v: Value, comptime what: []const u8, origin: Origin) Error {
+    var buf: [128]u8 = undefined;
+    return th.runError("attempt to " ++ what ++ " a {s} value{s}", .{
+        th.state.typeName(v),
+        debuginfo.varInfo(th, origin, &buf),
+    });
+}
+
+/// Calling a value with no `__call`: named by the calling instruction when
+/// a Lua frame called it, else by its variable (`luaG_callerror`).
+noinline fn callError(th: *Thread, func: u32) Error {
+    var buf: [128]u8 = undefined;
+    const info = if (debuginfo.callerName(th, th.frames.items.len - 1)) |n|
+        debuginfo.format(n, &buf)
+    else
+        debuginfo.varInfo(th, .{ .slot = func }, &buf);
+    return th.runError("attempt to call a {s} value{s}", .{ th.state.typeName(th.stack[func]), info });
+}
+
+noinline fn zeroDivision(th: *Thread, o: ArithOp) Error {
+    if (o == .mod) return th.runError("attempt to perform 'n%0'", .{});
+    return th.runError("attempt to divide by zero", .{});
+}
+
+fn forError(th: *Thread, v: Value, comptime what: []const u8) Error {
+    return th.runError("bad 'for' " ++ what ++ " (number expected, got {s})", .{th.state.typeName(v)});
+}
+
+// ---------------------------------------------------------------------------
+// Varargs and loops
+// ---------------------------------------------------------------------------
+
+/// Adjusts a vararg call (`VARARGPREP`, `luaT_adjustvarargs`). Without a
+/// vararg table, copies the function and fixed parameters above the extra
+/// arguments, so the extra arguments sit below the frame, and nils the
+/// vararg parameter. With one, packs the extra arguments into a table
+/// with their count in `n`, in the vararg parameter.
+noinline fn adjustVarargs(th: *Thread, ci: *Frame, p: *const Proto) Error!void {
     const nfix = p.numparams;
     const total = th.top - ci.func - 1;
     const nextra = total - nfix;
+    if (p.flags.vararg_table) {
+        const heap = th.heap();
+        const t = try Table.create(heap, nextra, 1);
+        try t.setShortStr(heap, th.state.n_key, .int(nextra));
+        const first = ci.func + 1 + nfix;
+        for (0..nextra) |j| try t.setInt(heap, @intCast(j + 1), th.stack[first + j]);
+        th.stack[first] = .table(t);
+        return;
+    }
     ci.extra_args = nextra;
     try th.growStack(@as(usize, th.top) + p.maxstacksize + 1);
     th.push(th.stack[ci.func]);
@@ -1156,9 +1917,44 @@ fn adjustVarargs(th: *Thread, ci: *Frame, p: *const Proto) Error!void {
     th.stack[ci.func + nfix + 1] = .nil;
 }
 
-/// Prepares a numeric for loop at `ra` (`FORPREP`). True when the loop
-/// runs zero times.
-fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
+/// Copies `wanted` extra arguments (all of them for -1, setting `top`) to
+/// stack slot `where` (`VARARG`, `luaT_getvarargs`), from below the frame
+/// or, when `vatab` names its register, from the vararg table.
+noinline fn getVarargs(th: *Thread, ci: *Frame, where: u32, wanted_in: i32, vatab: ?u32) Error!void {
+    var h: ?*Table = null;
+    var nargs: u32 = ci.extra_args;
+    if (vatab) |r| {
+        const tv = th.stack[ci.base() + r];
+        const nv: Value = if (tv.tag == .table) tv.asTable().getShortStr(th.state.n_key) else .nil;
+        if (nv.tag != .int or @as(u64, @bitCast(nv.payload.int)) > std.math.maxInt(i32) / 2)
+            return th.runError("vararg table has no proper 'n'", .{});
+        h = tv.asTable();
+        nargs = @intCast(nv.payload.int);
+    }
+    var wanted: u32 = undefined;
+    var touse: u32 = undefined;
+    if (wanted_in < 0) {
+        wanted = nargs;
+        touse = nargs;
+        try th.growStack(@as(usize, where) + nargs);
+        th.top = where + nargs;
+    } else {
+        wanted = @intCast(wanted_in);
+        touse = @min(nargs, wanted);
+    }
+    if (h) |t| {
+        for (0..touse) |j| th.stack[where + j] = t.getInt(@intCast(j + 1));
+    } else {
+        const first = ci.func - nargs;
+        for (0..touse) |j| th.stack[where + j] = th.stack[first + j];
+    }
+    for (touse..wanted) |j| th.stack[where + j] = .nil;
+}
+
+/// Prepares a numeric for loop at `ra` (`FORPREP`, `forprep`). True when
+/// the loop runs zero times. Strings convert, as everywhere a number is
+/// expected.
+noinline fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
     const init = ra[0];
     const limit = ra[1];
     const step = ra[2];
@@ -1167,23 +1963,18 @@ fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
         const s = step.payload.int;
         if (s == 0) return th.runError("'for' step is zero", .{});
         var lim: i64 = undefined;
-        if (limit.tag == .int) {
-            lim = limit.payload.int;
-        } else if (limit.tag == .float) {
-            const f = limit.payload.float;
-            if (floatToIntMode(f, if (s < 0) .ceil else .floor)) |l| {
-                lim = l;
-            } else if (std.math.isNan(f)) {
-                return true;
-            } else if (f > 0) {
+        if (toIntegerRounded(limit, if (s < 0) .ceil else .floor)) |l| {
+            lim = l;
+        } else {
+            const f = toFloatCoerce(limit) orelse return forError(th, limit, "limit");
+            // A float out of the integer range, or NaN.
+            if (f > 0) {
                 if (s < 0) return true;
                 lim = std.math.maxInt(i64);
             } else {
                 if (s > 0) return true;
                 lim = std.math.minInt(i64);
             }
-        } else {
-            return forError(th, limit, "limit");
         }
         if (if (s > 0) start > lim else start < lim) return true;
         var count: u64 = undefined;
@@ -1199,12 +1990,9 @@ fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
         ra[2] = .int(start);
         return false;
     }
-    if (!limit.isNumber()) return forError(th, limit, "limit");
-    if (!step.isNumber()) return forError(th, step, "step");
-    if (!init.isNumber()) return forError(th, init, "initial value");
-    const fl = limit.asNumber();
-    const fs = step.asNumber();
-    const fi = init.asNumber();
+    const fl = toFloatCoerce(limit) orelse return forError(th, limit, "limit");
+    const fs = toFloatCoerce(step) orelse return forError(th, step, "step");
+    const fi = toFloatCoerce(init) orelse return forError(th, init, "initial value");
     if (fs == 0) return th.runError("'for' step is zero", .{});
     if (if (0 < fs) fl < fi else fi < fl) return true;
     ra[0] = .float(fl);
@@ -1213,28 +2001,11 @@ fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
     return false;
 }
 
-fn forError(th: *Thread, v: Value, comptime what: []const u8) Error {
-    return th.runError("bad 'for' " ++ what ++ " (number expected, got {s})", .{v.typeOf().name()});
-}
+// ---------------------------------------------------------------------------
+// Numbers
+// ---------------------------------------------------------------------------
 
-// Numbers. TODO(number.zig): replace these with number.zig's helpers once
-// that lands; they follow the manual's §3.4 but are minimal.
-
-const Arith = enum {
-    add,
-    sub,
-    mul,
-    mod,
-    pow,
-    div,
-    idiv,
-
-    fn intOp(a: Arith) bool {
-        return a != .pow and a != .div;
-    }
-};
-
-fn arithOf(comptime o: opcodes.OpCode) Arith {
+fn arithOf(comptime o: opcodes.OpCode) ArithOp {
     return switch (o) {
         .addi, .addk, .add => .add,
         .subk, .sub => .sub,
@@ -1247,122 +2018,58 @@ fn arithOf(comptime o: opcodes.OpCode) Arith {
     };
 }
 
-inline fn floatArith(a: Arith, x: f64, y: f64) f64 {
+inline fn floatArith(a: ArithOp, x: f64, y: f64) f64 {
     return switch (a) {
         .add => x + y,
         .sub => x - y,
         .mul => x * y,
         .div => x / y,
         .pow => if (y == 2) x * x else std.math.pow(f64, x, y),
-        .idiv => @floor(x / y),
-        .mod => floatMod(x, y),
+        .idiv => number.divFloorFloat(x, y),
+        .mod => number.modFloat(x, y),
+        else => unreachable,
     };
 }
 
-/// Lua's float modulo: the result has the divisor's sign.
-fn floatMod(x: f64, y: f64) f64 {
-    const m = @rem(x, y);
-    if (if (m > 0) y < 0 else (m < 0 and y != m)) return m + y;
-    return m;
-}
-
-/// Floor division; `y` is not zero.
-fn intFloorDiv(x: i64, y: i64) i64 {
-    if (y == -1) return 0 -% x;
-    var q = @divTrunc(x, y);
-    if (@rem(x, y) != 0 and (x ^ y) < 0) q -= 1;
-    return q;
-}
-
-/// Modulo with the divisor's sign; `y` is not zero.
-fn intMod(x: i64, y: i64) i64 {
-    if (y == -1) return 0;
-    const r = @rem(x, y);
-    return if (r != 0 and (r ^ y) < 0) r + y else r;
-}
-
-/// `x << y`, logical, with negative `y` shifting right; 64 or more shifts
-/// everything out.
-fn shiftLeft(x: i64, y: i64) i64 {
-    const ux: u64 = @bitCast(x);
-    if (y <= -64 or y >= 64) return 0;
-    if (y >= 0) return @bitCast(ux << @intCast(y));
-    return @bitCast(ux >> @intCast(-y));
-}
-
-/// An integer, or a float with an exact integer value, as an integer.
+/// An integer, or a float with an exact integer value, as an integer; no
+/// string conversion (`tointegerns`).
 inline fn toIntStrict(v: Value) ?i64 {
     return switch (v.tag) {
         .int => v.payload.int,
-        .float => Value.floatToInt(v.payload.float),
+        .float => number.floatToInt(v.payload.float, .exact),
         else => null,
     };
 }
 
-const Rounding = enum { floor, ceil };
-
-fn floatToIntMode(f: f64, mode: Rounding) ?i64 {
-    return Value.floatToInt(switch (mode) {
-        .floor => @floor(f),
-        .ceil => @ceil(f),
-    });
+/// A number or numeric string as an integer, rounding a float as `mode`
+/// says (`luaV_tointeger`).
+fn toIntegerRounded(v: Value, mode: number.Rounding) ?i64 {
+    const n = toNumber(v) orelse return null;
+    return if (n.tag == .int) n.payload.int else number.floatToInt(n.payload.float, mode);
 }
 
-/// Whether an integer converts to a float exactly (|i| <= 2^53).
-inline fn intFitsFloat(i: i64) bool {
-    const m: u64 = 1 << 53;
-    return @as(u64, @bitCast(i)) +% m <= 2 * m;
+/// A number or numeric string as a float (`luaV_tonumber_`).
+fn toFloatCoerce(v: Value) ?f64 {
+    const n = toNumber(v) orelse return null;
+    return n.asNumber();
 }
 
 fn lessThanNum(a: Value, b: Value) bool {
-    if (a.tag == .int and b.tag == .int) return a.payload.int < b.payload.int;
-    if (a.tag == .float and b.tag == .float) return a.payload.float < b.payload.float;
     if (a.tag == .int) {
-        const i = a.payload.int;
-        const f = b.payload.float;
-        if (intFitsFloat(i)) return @as(f64, @floatFromInt(i)) < f;
-        if (floatToIntMode(f, .ceil)) |c| return i < c;
-        return f > 0;
+        if (b.tag == .int) return a.payload.int < b.payload.int;
+        return number.ltIntFloat(a.payload.int, b.payload.float);
     }
-    const f = a.payload.float;
-    const i = b.payload.int;
-    if (intFitsFloat(i)) return f < @as(f64, @floatFromInt(i));
-    if (floatToIntMode(f, .floor)) |fl| return fl < i;
-    return f < 0;
+    if (b.tag == .float) return a.payload.float < b.payload.float;
+    return number.ltFloatInt(a.payload.float, b.payload.int);
 }
 
 fn lessEqualNum(a: Value, b: Value) bool {
-    if (a.tag == .int and b.tag == .int) return a.payload.int <= b.payload.int;
-    if (a.tag == .float and b.tag == .float) return a.payload.float <= b.payload.float;
     if (a.tag == .int) {
-        const i = a.payload.int;
-        const f = b.payload.float;
-        if (intFitsFloat(i)) return @as(f64, @floatFromInt(i)) <= f;
-        if (floatToIntMode(f, .floor)) |fl| return i <= fl;
-        return f > 0;
+        if (b.tag == .int) return a.payload.int <= b.payload.int;
+        return number.leIntFloat(a.payload.int, b.payload.float);
     }
-    const f = a.payload.float;
-    const i = b.payload.int;
-    if (intFitsFloat(i)) return f <= @as(f64, @floatFromInt(i));
-    if (floatToIntMode(f, .ceil)) |c| return c <= i;
-    return f < 0;
-}
-
-/// A number as `tostring` writes it. Floats use the shortest form that
-/// reads back exactly, with ".0" on integral values; PUC-Rio's exponent
-/// formatting differs ("1e+100").
-fn numberToString(v: Value, buf: *[64]u8) []const u8 {
-    if (v.tag == .int) return std.fmt.bufPrint(buf, "{d}", .{v.payload.int}) catch unreachable;
-    const f = v.payload.float;
-    if (std.math.isNan(f)) return if (std.math.signbit(f)) "-nan" else "nan";
-    if (std.math.isInf(f)) return if (f > 0) "inf" else "-inf";
-    const s = std.fmt.bufPrint(buf, "{d}", .{f}) catch unreachable;
-    if (std.mem.findAny(u8, s, ".eEn") == null) {
-        buf[s.len] = '.';
-        buf[s.len + 1] = '0';
-        return buf[0 .. s.len + 2];
-    }
-    return s;
+    if (b.tag == .float) return a.payload.float <= b.payload.float;
+    return number.leFloatInt(a.payload.float, b.payload.int);
 }
 
 // Tests: hand-assembled programs, each transcribed from `luac -l -l` (Lua
@@ -1861,7 +2568,8 @@ test "runtime errors carry position and unwind to pcall" {
     try testing.expectEqual(func + 1, th.top);
     try testing.expectEqual(@as(usize, 1), th.frames.items.len);
 
-    // 1 // 0 and 1 % 0 raise; 1.0 // 0 is a float infinity.
+    // 1 // 0 raises. Without a source name the position is "?:?:", as for
+    // a stripped chunk.
     const q = try makeProto(state, .{
         .maxstack = 3,
         .code = &.{
@@ -1875,9 +2583,9 @@ test "runtime errors carry position and unwind to pcall" {
     th.top = func;
     th.push(.luaClosure(try mainClosure(state, q)));
     try testing.expect(!pcall(th, func, -1));
-    try testing.expectEqualStrings("attempt to perform 'n//0'", th.stack[func].asString().bytes());
+    try testing.expectEqualStrings("?:?: attempt to divide by zero", th.stack[func].asString().bytes());
 
-    // Calling nil, and arithmetic on a table.
+    // Calling nil.
     const r = try makeProto(state, .{
         .maxstack = 2,
         .code = &.{ abc(.loadnil, 0, 0, 0), abc(.call, 0, 1, 1), abc(.return0, 0, 0, 0) },
@@ -1885,7 +2593,7 @@ test "runtime errors carry position and unwind to pcall" {
     th.top = func;
     th.push(.luaClosure(try mainClosure(state, r)));
     try testing.expect(!pcall(th, func, -1));
-    try testing.expectEqualStrings("attempt to call a nil value", th.stack[func].asString().bytes());
+    try testing.expectEqualStrings("?:?: attempt to call a nil value", th.stack[func].asString().bytes());
 }
 
 test "Lua metamethods finish their instructions: __index, __add, __lt" {
@@ -1991,7 +2699,7 @@ test "deep Lua recursion uses heap, and overflow is a catchable error" {
     const func = th.top;
     th.push(.luaClosure(try mainClosure(state, main)));
     try testing.expect(!pcall(th, func, -1));
-    try testing.expectEqualStrings("stack overflow", th.stack[func].asString().bytes());
+    try testing.expectEqualStrings("?:?: stack overflow", th.stack[func].asString().bytes());
 }
 
 test "concatenation of strings and numbers, short and long results" {

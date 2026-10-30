@@ -2,7 +2,7 @@
 //!
 //! The stack is one growable array of values. Frames refer to it by index,
 //! never by pointer, because it moves when it grows; open upvalues are the
-//! one exception, and `growStack` repoints them. The interpreter caches a
+//! one exception, and `reallocStack` repoints them. The interpreter caches a
 //! pointer to the running frame's registers and reloads it after anything
 //! that can grow the stack.
 
@@ -13,6 +13,7 @@ const gc = @import("gc.zig");
 const Value = @import("Value.zig");
 const Proto = @import("Proto.zig");
 const State = @import("State.zig");
+const vm = @import("vm.zig");
 
 const Error = Value.Error;
 const Upval = Proto.Upval;
@@ -28,13 +29,25 @@ top: u32,
 frames: std.ArrayList(Frame) = .empty,
 /// Open upvalues, highest stack level first.
 open_upvals: ?*Upval = null,
+/// Stack levels of the pending to-be-closed variables, lowest first.
+tbc: std.ArrayList(u32) = .empty,
 /// The error object while an `error.LuaError` unwinds.
 err: Value = .nil,
+/// `.yield` while the coroutine is suspended, and while a yield unwinds
+/// as `error.LuaError`; `.dead` once an error ended it.
 status: Status = .ok,
 /// Nested entries into the interpreter from native code, which each use
-/// Zig stack: `vm.call` from a native function, metamethods called from
-/// native code.
+/// Zig stack (PUC-Rio's C calls): `vm.call` from a native function, and a
+/// coroutine resumed from this one counts its resumer's.
 native_calls: u16 = 0,
+/// Calls in progress that cannot be suspended: a yield inside one raises
+/// "attempt to yield across a C-call boundary". The main thread always
+/// has one.
+nny: u16 = 0,
+/// Stack index of the running protected call's message handler, or 0.
+errfunc: u32 = 0,
+/// Set by `vm.closeSelf` while the error it raises unwinds to the resume.
+closed_self: bool = false,
 
 pub const Status = enum(u8) { ok, yield, dead };
 
@@ -42,6 +55,9 @@ pub const Status = enum(u8) { ok, yield, dead };
 pub const min_stack = 20;
 /// Largest stack in slots, `LUAI_MAXSTACK`.
 pub const max_stack = 1_000_000;
+/// Slots past `max_stack` kept for handling a stack overflow,
+/// `STACKERRSPACE`.
+const error_space = 200;
 /// Slots kept free above every frame's top, so a metamethod call (the
 /// function and up to three arguments) needs no stack check.
 pub const extra_stack = 5;
@@ -59,13 +75,25 @@ pub const Frame = struct {
     top: u32,
     /// Lua frames: the next instruction. Saved here while the frame calls
     /// out, and before anything that can raise an error, so line numbers
-    /// and `finishOp` see it.
+    /// and `finishOp` see it. Native frames with `has_k`: the continuation,
+    /// a `Value.KFn`.
     pc: [*]const u32 = undefined,
     /// Results the caller wants, or -1 for all of them.
     nresults: i16,
-    /// Vararg Lua functions: how many extra arguments sit below `func`.
-    extra_args: u32 = 0,
     flags: Flags,
+    /// Native frames in a yieldable protected call: set when a resume
+    /// unwound an error to this frame, so its continuation sees it.
+    recover: bool = false,
+    /// Lua vararg frames: how many extra arguments sit below `func`.
+    /// Native frames: the continuation's context.
+    extra_args: u32 = 0,
+    /// Lua frames: the result count a `RETURN` saved while closing
+    /// variables (PUC-Rio's `nres`). Native frames: the values a yield
+    /// passes (`nyield`), or the protected call's function slot.
+    aux: u32 = 0,
+    /// Native frames in a yieldable protected call: the message handler to
+    /// restore.
+    old_errfunc: u32 = 0,
 
     pub const Flags = packed struct(u8) {
         /// A Lua function, run by the interpreter.
@@ -76,11 +104,32 @@ pub const Frame = struct {
         /// A metamethod called from an instruction of the frame below; its
         /// return finishes that instruction (`vm.finishOp`).
         finish_op: bool = false,
-        _: u5 = 0,
+        /// A native frame inside `vm.pcallk` that may be suspended.
+        ypcall: bool = false,
+        /// A native frame with a continuation in `pc`.
+        has_k: bool = false,
+        /// Reused by a tail call.
+        tail: bool = false,
+        _: u2 = 0,
     };
 
     pub inline fn base(f: *const Frame) u32 {
         return f.func + 1;
+    }
+
+    /// The continuation of a native frame, if it has one. Native frames
+    /// keep it in the storage of `pc`, which only Lua frames use.
+    pub inline fn k(f: *const Frame) ?Value.KFn {
+        if (!f.flags.has_k) return null;
+        const slot: *const Value.KFn = @ptrCast(&f.pc);
+        return slot.*;
+    }
+
+    pub inline fn setK(f: *Frame, kf: Value.KFn, ctx: u32) void {
+        const slot: *Value.KFn = @ptrCast(&f.pc);
+        slot.* = kf;
+        f.flags.has_k = true;
+        f.extra_args = ctx;
     }
 };
 
@@ -91,7 +140,7 @@ pub fn create(state: *State) error{OutOfMemory}!*Thread {
     errdefer gpa.free(stack);
     @memset(stack, Value.nil);
     var frames: std.ArrayList(Frame) = .empty;
-    try frames.append(gpa, .{ .func = 0, .top = 1 + min_stack, .nresults = 0, .flags = .{} });
+    try frames.append(gpa, baseFrame());
     errdefer frames.deinit(gpa);
     const th = try gpa.create(Thread);
     th.* = .{ .header = undefined, .state = state, .stack = stack, .top = 1, .frames = frames };
@@ -99,11 +148,16 @@ pub fn create(state: *State) error{OutOfMemory}!*Thread {
     return th;
 }
 
+fn baseFrame() Frame {
+    return .{ .func = 0, .top = 1 + min_stack, .nresults = 0, .flags = .{} };
+}
+
 pub fn destroy(h: *gc.Heap, th: *Thread) void {
     closeAllUpvals(th);
     const gpa = h.allocator();
     gpa.free(th.stack);
     th.frames.deinit(gpa);
+    th.tbc.deinit(gpa);
     gpa.destroy(th);
 }
 
@@ -132,16 +186,32 @@ pub inline fn ensureStack(th: *Thread, n: u32) Error!void {
 }
 
 /// Grows the stack so slots below `needed` exist, plus `extra_stack`.
-/// Raises "stack overflow" past `max_stack`.
+/// Past `max_stack` it raises "stack overflow", leaving `error_space` slots
+/// to handle it; asking for more while handling one raises "error in error
+/// handling".
 pub fn growStack(th: *Thread, needed: usize) Error!void {
     if (needed + extra_stack <= th.stack.len) return;
+    if (th.stack.len > max_stack + extra_stack) return th.errorInErrorHandling();
     if (needed > max_stack) {
-        // Leave room to build and handle the error, as PUC-Rio does.
-        if (th.stack.len < max_stack + 200) try th.reallocStack(max_stack + 200 + extra_stack);
+        try th.reallocStack(max_stack + error_space + extra_stack);
         return th.runError("stack overflow", .{});
     }
     const want = @max(th.stack.len * 2, needed + extra_stack);
     try th.reallocStack(@min(want, max_stack + extra_stack));
+}
+
+/// Shrinks a stack that is much larger than its use, as after a stack
+/// overflow, `luaD_shrinkstack`.
+pub fn shrinkStack(th: *Thread) void {
+    var inuse: usize = th.top;
+    for (th.frames.items) |f| inuse = @max(inuse, f.top);
+    inuse = @max(inuse + 1, min_stack);
+    const size = th.stack.len - extra_stack;
+    const max: usize = if (inuse > max_stack / 3) max_stack else inuse * 3;
+    if (inuse <= max_stack and size > max) {
+        const new_size: usize = if (inuse > max_stack / 2) max_stack else inuse * 2;
+        th.reallocStack(new_size + extra_stack) catch {};
+    }
 }
 
 fn reallocStack(th: *Thread, new_len: usize) error{OutOfMemory}!void {
@@ -182,9 +252,30 @@ pub fn closeUpvals(th: *Thread, level: u32) void {
     }
 }
 
-/// Raises `v` as the error object.
+/// Puts the thread back to its base frame with an empty stack, for
+/// `coroutine.close` and errors that escape every protected call.
+pub fn resetFrames(th: *Thread) void {
+    th.frames.items.len = 1;
+    th.frames.items[0] = baseFrame();
+    th.stack[0] = .nil;
+    th.status = .ok;
+    th.errfunc = 0;
+}
+
+/// Raises `v` as the error object. A message handler set by the running
+/// protected call sees it first and its result is raised instead; a nil
+/// object becomes "<no error object>", as `luaG_errormsg` does.
 pub fn throw(th: *Thread, v: Value) Error {
     th.err = v;
+    if (th.errfunc != 0) try vm.callMessageHandler(th);
+    if (th.err.isNil()) th.err = .string(try th.state.newString("<no error object>"));
+    return error.LuaError;
+}
+
+/// Raises "error in error handling", without the message handler: a
+/// stack overflow while handling one, or runaway nesting of handlers.
+pub fn errorInErrorHandling(th: *Thread) Error {
+    th.err = .string(try th.state.newString("error in error handling"));
     return error.LuaError;
 }
 
@@ -195,17 +286,28 @@ pub fn runError(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
     defer aw.deinit();
     const w = &aw.writer;
     const f = th.frame();
-    if (f.flags.lua) {
-        const p = th.stack[f.func].asLuaClosure().proto;
-        const pc = @intFromPtr(f.pc) - @intFromPtr(p.code.ptr);
-        if (p.lineAt(pc / 4 -| 1)) |line| {
-            writeChunkId(w, if (p.source) |s| s.bytes() else "?") catch return error.OutOfMemory;
-            w.print(":{d}: ", .{line}) catch return error.OutOfMemory;
-        }
-    }
+    if (f.flags.lua) writePosition(w, th, f) catch return error.OutOfMemory;
     w.print(fmt, args) catch return error.OutOfMemory;
     const s = try th.state.newString(aw.written());
     return th.throw(.string(s));
+}
+
+/// "chunk:line: " for the instruction Lua frame `f` is running, as
+/// `luaG_addinfo` writes it.
+pub fn writePosition(w: *std.Io.Writer, th: *Thread, f: *const Frame) std.Io.Writer.Error!void {
+    const p = th.stack[f.func].asLuaClosure().proto;
+    const src = p.source orelse return w.writeAll("?:?: ");
+    try writeChunkId(w, src.bytes());
+    if (p.lineAt(currentPc(p, f))) |line| {
+        try w.print(":{d}: ", .{line});
+    } else {
+        try w.writeAll(":-1: ");
+    }
+}
+
+/// The index of the instruction Lua frame `f` is running.
+pub fn currentPc(p: *const Proto, f: *const Frame) usize {
+    return ((@intFromPtr(f.pc) - @intFromPtr(p.code.ptr)) / 4) -| 1;
 }
 
 /// The chunk name as messages show it, PUC-Rio's `luaO_chunkid`: "=name"

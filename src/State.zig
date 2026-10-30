@@ -29,6 +29,10 @@ metatables: [Value.Type.count]?*Table = @splat(null),
 tm_names: [Tm.count]*String,
 /// The error object for allocation failures, fixed.
 memerr: *String,
+/// "__name", the metafield `typeName` reads, and "n", the count field of
+/// vararg tables; fixed.
+name_key: *String,
+n_key: *String,
 
 /// Metamethod events, in PUC-Rio's order (`ltm.h`). The first six are the
 /// ones `Table.flags` caches the absence of.
@@ -94,6 +98,8 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
         .globals = undefined,
         .tm_names = undefined,
         .memerr = undefined,
+        .name_key = undefined,
+        .n_key = undefined,
     };
     state.strings = try .init(&state.heap, seed);
     errdefer {
@@ -102,11 +108,17 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
     }
     state.memerr = try state.strings.create(&state.heap, "not enough memory");
     state.memerr.header.marked |= gc.mark.fixed;
+    state.name_key = try state.strings.create(&state.heap, "__name");
+    state.name_key.header.marked |= gc.mark.fixed;
+    state.n_key = try state.strings.create(&state.heap, "n");
+    state.n_key.header.marked |= gc.mark.fixed;
     for (&state.tm_names, 0..) |*n, i| {
         n.* = try state.strings.create(&state.heap, @as(Tm, @enumFromInt(i)).name());
         n.*.header.marked |= gc.mark.fixed;
     }
     state.main = try Thread.create(state);
+    // The main thread can never yield.
+    state.main.nny = 1;
     state.registry = try Table.create(&state.heap, 2, 0);
     state.globals = try Table.create(&state.heap, 0, 0);
     try state.registry.setInt(&state.heap, 1, .thread(state.main));
@@ -154,6 +166,22 @@ pub inline fn fastTm(state: *const State, mt: ?*Table, tm: Tm) ?Value {
         return null;
     }
     return v;
+}
+
+/// The type name error messages use, `luaT_objtypename`: a string
+/// `__name` field in the metatable of a table or full userdata, else the
+/// basic type's name.
+pub fn typeName(state: *const State, v: Value) []const u8 {
+    const mt = switch (v.tag) {
+        .table => v.asTable().metatable,
+        .userdata => v.asUserdata().metatable,
+        else => null,
+    };
+    if (mt) |t| {
+        const n = t.getShortStr(state.name_key);
+        if (n.isString()) return n.asString().bytes();
+    }
+    return v.typeOf().name();
 }
 
 /// The handler for any event `tm` of value `v`, or null.
