@@ -10,6 +10,7 @@ pub const base = @import("base.zig");
 pub const package = @import("package.zig");
 pub const io = @import("io.zig");
 pub const os = @import("os.zig");
+pub const coroutine = @import("coroutine.zig");
 pub const string = @import("string.zig");
 pub const table = @import("table.zig");
 pub const math = @import("math.zig");
@@ -20,6 +21,7 @@ pub const utf8 = @import("utf8.zig");
 const libs = [_]struct { []const u8, *const fn (*Thread) Value.Error!void }{
     .{ "_G", base.open },
     .{ "package", package.open },
+    .{ "coroutine", onState(coroutine.open) },
     .{ "io", io.open },
     .{ "math", onState(math.open) },
     .{ "os", os.open },
