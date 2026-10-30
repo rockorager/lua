@@ -1,0 +1,38 @@
+# Third-party code and data
+
+lua is MIT (`LICENSE`). No upstream code is adapted: the implementation is written for this repository from the reference manual. Two upstream artifacts define what it must do, and one ships here as test data.
+
+## Lua 5.5 Reference Manual
+
+- Upstream: https://www.lua.org/manual/5.5/
+- Copyright (C) 1994-2026 Lua.org, PUC-Rio, under the MIT license below
+
+## Lua 5.5.1 test suite
+
+- Upstream: https://www.lua.org/tests/lua-5.5.1-tests.tar.gz, released 2026-07-24
+- SHA-256 of the tarball: `da07b543872dc0bb2ff12aabd0c248578d78df3eb6b67efdc537a46d455c7f31`
+- Copyright (C) 1994-2026 Lua.org, PUC-Rio, under the MIT license below
+
+`test/lua-5.5.1-tests/` holds the suite, extracted unmodified, as test data. It is not compiled into the library and is not listed in `build.zig.zon`'s `paths`, so a `zig fetch` tarball does not carry it.
+
+```
+Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```

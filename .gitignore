@@ -1,0 +1,6 @@
+.direnv/
+.envrc.local
+.zig-cache/
+zig-out/
+zig-pkg/
+.amp/portals/*
