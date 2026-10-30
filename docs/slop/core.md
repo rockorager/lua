@@ -57,8 +57,9 @@ the plan left open and what was measured. Numbers are in
 - Sizing follows 5.5: an array size n is chosen when n ≤ 3 × (integer keys
   in 1..n); the array keeps its size when no new key is an array candidate;
   a table with deleted entries gets 25% extra hash room.
-- `#t` is 5.5's hint-based border search. `hash_search` doubles without
-  5.5's random increments.
+- `#t` is 5.5's hint-based border search. `hash_search` takes 5.5's random
+  steps (2j or 2j + 1), with bits from the table's address instead of the
+  state's seed, so `nextvar.lua`'s attack on the length stays fast.
 - There is no slot-pointer API. The VM's store fast path is "table without
   a metatable: raw set". A table with a metatable does a raw get, then
   checks `__newindex`'s cached absence. Wave 2 added an in-place store for

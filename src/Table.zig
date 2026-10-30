@@ -668,11 +668,21 @@ fn binarySearch(t: *const Table, i_in: u32, j_in: u32) u32 {
 fn hashSearch(t: *const Table, asize: u32) u64 {
     const max: u64 = std.math.maxInt(i64);
     var i: u64 = @as(u64, asize) + 1;
-    var j: u64 = i + 1;
+    // 5.5's random steps (2j or 2j + 1, and a first step within the width
+    // of `asize`), so no key layout makes the doubling walk to a huge
+    // border. The bits come from the table's address, not the state's seed.
+    var rnd: u64 = @intFromPtr(t) >> 4;
+    rnd ^= rnd >> 17;
+    const n: u6 = if (asize > 0) @intCast(64 - @clz(@as(u64, asize) - 1)) else 0;
+    const width_mask: u64 = (@as(u64, 1) << n) - 1;
+    const incr = (rnd & width_mask) + 1;
+    var j: u64 = if (incr <= max - i) i + incr else i + 1;
+    rnd >>= n;
     while (!t.getInt(@intCast(j)).isNil()) {
         i = j;
-        if (j <= max / 2) {
-            j *= 2;
+        if (j <= max / 2 - 1) {
+            j = j * 2 + (rnd & 1);
+            rnd >>= 1;
         } else {
             j = max;
             if (t.getInt(@intCast(j)).isNil()) break;
