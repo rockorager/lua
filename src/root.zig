@@ -4,6 +4,17 @@
 const std = @import("std");
 const testing = std.testing;
 
+pub const Value = @import("Value.zig");
+pub const gc = @import("gc.zig");
+pub const String = @import("String.zig");
+pub const Table = @import("Table.zig");
+pub const Proto = @import("Proto.zig");
+pub const Userdata = @import("Userdata.zig");
+pub const State = @import("State.zig");
+pub const Thread = @import("Thread.zig");
+pub const opcodes = @import("opcodes.zig");
+pub const vm = @import("vm.zig");
+
 /// The value of the global `_VERSION`, as the reference manual's §6.2 gives it.
 pub const version = "Lua 5.5";
 
@@ -20,6 +31,7 @@ test "version is the one the vendored test suite requires" {
 }
 
 test {
+    testing.refAllDecls(@This());
     _ = @import("Lexer.zig");
     _ = @import("number.zig");
     _ = @import("lib/pattern.zig");
