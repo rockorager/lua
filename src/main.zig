@@ -412,7 +412,12 @@ fn pmain(it: *Interp, args: []const [:0]const u8) Value.Error!bool {
         return false;
     }
     if (flags & Flags.has_v != 0) writeVersion(it.host);
-    if (flags & Flags.has_upper_e != 0) it.use_env = false;
+    const state = it.th.state;
+    if (flags & Flags.has_upper_e != 0) {
+        it.use_env = false;
+        try state.registry.setStr(&state.heap, try state.newString("LUA_NOENV"), .true);
+    }
+    try lua.lib.os.setEnviron(it.th, it.environ);
     try lua.lib.openLibs(it.th, it.host);
     try createArgTable(it.th, args, script);
     it.host.gc_mode = .generational;
@@ -460,6 +465,8 @@ pub fn main(init: std.process.Init) u8 {
         });
         break :blk false;
     };
+    // Open files flush at exit, as C's `exit` flushes every stream.
+    lua.lib.io.flushAll(it.th);
     host.flushStdout();
     return if (ok) 0 else 1;
 }
