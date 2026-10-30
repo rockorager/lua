@@ -1623,23 +1623,47 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 continue :newframe;
             },
             .return0 => {
-                if (hooked) ci.pc = pc;
-                switch (try doReturn(th, hooked, ci.base() + getA(i), 0)) {
-                    .exit => return false,
-                    .next => {},
-                    .finished => if (hookSwitch(hooked, th)) return true,
+                if (hooked) {
+                    ci.pc = pc;
+                    switch (try doReturn(th, true, ci.base() + getA(i), 0)) {
+                        .exit => return false,
+                        .next => {},
+                        .finished => if (hookSwitch(true, th)) return true,
+                    }
+                    ci = th.frame();
+                    continue :newframe;
                 }
-                ci = th.frame();
+                switch (try popFrame(th, ci, ci.base() + getA(i), 0)) {
+                    .exit => return false,
+                    // The caller's frame is the one below.
+                    .next => ci = @ptrCast(@as([*]Frame, @ptrCast(ci)) - 1),
+                    .finished => {
+                        if (hookSwitch(false, th)) return true;
+                        ci = th.frame();
+                    },
+                }
                 continue :newframe;
             },
             .return1 => {
-                if (hooked) ci.pc = pc;
-                switch (try doReturn(th, hooked, ci.base() + getA(i), 1)) {
-                    .exit => return false,
-                    .next => {},
-                    .finished => if (hookSwitch(hooked, th)) return true,
+                if (hooked) {
+                    ci.pc = pc;
+                    switch (try doReturn(th, true, ci.base() + getA(i), 1)) {
+                        .exit => return false,
+                        .next => {},
+                        .finished => if (hookSwitch(true, th)) return true,
+                    }
+                    ci = th.frame();
+                    continue :newframe;
                 }
-                ci = th.frame();
+                switch (try popFrame(th, ci, ci.base() + getA(i), 1)) {
+                    .exit => return false,
+                    // The caller's frame is the one below.
+                    .next => ci = @ptrCast(@as([*]Frame, @ptrCast(ci)) - 1),
+                    .finished => {
+                        if (hookSwitch(false, th)) return true;
+                        ci = th.frame();
+                    },
+                }
                 continue :newframe;
             },
             .forloop => {
@@ -1823,7 +1847,11 @@ inline fn doReturn(th: *Thread, comptime hooks: bool, first: u32, n: u32) Error!
         th.top = first + n;
         try retHook(th, first, n);
     }
-    const ret = th.frame();
+    return popFrame(th, th.frame(), first, n);
+}
+
+/// `doReturn` without hooks, for the running frame `ret`.
+inline fn popFrame(th: *Thread, ret: *Frame, first: u32, n: u32) Error!Returned {
     moveResults(th, ret.func, first, n, ret.nresults);
     const flags = ret.flags;
     th.frames.items.len -= 1;
