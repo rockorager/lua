@@ -89,6 +89,41 @@ bytecode *FILES:
         exit 1
     fi
 
+[doc("Differential tests: every test/diff/*.lua, or only FILES, on our zig-out/bin/lua and the reference lua; stdout, stderr, and exit status must match, with addresses masked")]
+[group("test")]
+diff *FILES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    zig build -Doptimize=ReleaseSafe
+    ref=$(command -v lua)
+    ours=$PWD/zig-out/bin/lua
+    files=({{ FILES }})
+    if [ ${#files[@]} -eq 0 ]; then
+        files=(test/diff/*.lua)
+    fi
+    out=$PWD/zig-out/diff
+    rm -rf "$out" && mkdir -p "$out"
+    failed=()
+    for f in "${files[@]}"; do
+        name=$(basename "$f" .lua)
+        for arm in ref ours; do
+            bin=$ref
+            [ $arm = ours ] && bin=$ours
+            status=0
+            (cd "$(dirname "$f")" && "$bin" "$name.lua") > "$out/$name.$arm" 2>&1 || status=$?
+            echo "exit status $status" >> "$out/$name.$arm"
+            sed -i -E 's/: 0x[0-9a-f]+/: ADDR/g; s#^'"$bin"':#lua:#' "$out/$name.$arm"
+        done
+        if cmp -s "$out/$name.ref" "$out/$name.ours"; then
+            echo "same     $f"
+        else
+            echo "DIFFERS  $f"
+            diff "$out/$name.ref" "$out/$name.ours" | head -n 20 || true
+            failed+=("$f")
+        fi
+    done
+    [ ${#failed[@]} -eq 0 ]
+
 [doc("Time every bench/ program, or only PROGRAMS, on our zig-out/bin/lua (ReleaseFast) and the reference lua: interleaved rounds on one core, checksums checked, then benchstat. The numbers are not claims")]
 [group("bench")]
 bench-compare ROUNDS="10" *PROGRAMS:

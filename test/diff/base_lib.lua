@@ -1,0 +1,42 @@
+-- The basic library.
+print(type(nil), type(true), type(1), type(1.5), type("s"), type({}), type(print), type(type))
+print(pcall(type))
+print(tostring(nil), tostring(false), tostring(12), tostring(1.5), tostring(1e100), tostring(-0.0), tostring(2^63), tostring(1/0), tostring(-1/0))
+print(tonumber("10"), tonumber("0x10"), tonumber("  12  "), tonumber("1e2"), tonumber(" 0x1p4 "), tonumber("1e"), tonumber(""), tonumber("abc"), tonumber({}), tonumber(nil))
+print(tonumber("z", 36), tonumber("10", 2), tonumber("ff", 16), tonumber("-ff", 16), tonumber("1.5", 10), tonumber("7fffffffffffffff", 16), tonumber("ffffffffffffffff", 16), tonumber("8", 8))
+print(pcall(tonumber), pcall(tonumber, "10", 99), pcall(tonumber, 10, 16), pcall(tonumber, "10", 1.5))
+print(select('#'), select('#', nil, nil), select(2, "a", "b", "c"), select(-1, "a", "b", "c"), select(5, 1, 2))
+print(pcall(select, 0, 1), pcall(select, -5, 1), pcall(select, "x"))
+print(rawget({x = 1}, "x"), rawset({}, "k", "v").k, pcall(rawset, {}, nil, 1), pcall(rawset, {}, 0/0, 1))
+print(pcall(rawget, 1), pcall(rawlen, 1), pcall(rawequal, 1))
+local t = {10, 20, 30, nil, 50}
+local n = 0
+for k, v in pairs({a = 1, b = 2, c = 3}) do n = n + v end
+print(n)
+for i, v in ipairs(t) do print(i, v) end
+print(next({}), next({7}), pcall(next, {}, "nope"), pcall(next, 1))
+local p = setmetatable({}, {__pairs = function(t) return function(_, k) if not k then return 1, "one" end end, t, nil end})
+for k, v in pairs(p) do print("pairs", k, v) end
+local ip = setmetatable({}, {__index = function(t, i) if i <= 3 then return i * i end end})
+for i, v in ipairs(ip) do print("ipairs", i, v) end
+print(pcall(error, "msg"), pcall(error, "msg", 0), pcall(error, {}), pcall(error))
+print(pcall(function() error("lvl1") end))
+print(pcall(function() error("lvl2", 2) end))
+print(pcall(function() local function f() error("in f", 2) end f() end))
+print(pcall(assert, true, 1, 2), pcall(assert, false), pcall(assert, nil, "m"), pcall(assert))
+print(pcall(function() assert(false) end))
+print(pcall(function() assert(1 == 2, "custom") end))
+print(xpcall(function(...) return ... end, print, 1, 2))
+print(xpcall(error, function(m) return "handled: " .. m end, "boom"))
+print(pcall(xpcall), pcall(xpcall, print))
+print(pcall(pcall), pcall(pcall, error, "x"))
+print(select('#', pcall(function() return 1, 2, 3 end)))
+print(_VERSION, _G._G == _G, _G.print == print)
+print(collectgarbage("count") > 0, collectgarbage(), collectgarbage("collect"), collectgarbage("isrunning"))
+print(collectgarbage("incremental"), collectgarbage("generational"), collectgarbage("incremental"))
+print(collectgarbage("step"), collectgarbage("stop"), collectgarbage("isrunning"), collectgarbage("restart"), collectgarbage("isrunning"))
+print(collectgarbage("param", "pause"), collectgarbage("param", "pause", 100), collectgarbage("param", "pause"), collectgarbage("param", "stepmul"))
+print(pcall(collectgarbage, "bogus"), pcall(collectgarbage, "param", "bogus"))
+print(getmetatable({}), getmetatable(setmetatable({}, {__metatable = false})))
+print(pcall(setmetatable, 1), pcall(setmetatable, {}, 1))
+print(pcall(error)); print(xpcall(error, function(m) return type(m) end)); print(xpcall(error, function() end))
