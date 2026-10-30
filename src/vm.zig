@@ -62,6 +62,22 @@ inline fn getC(i: Instruction) u32 {
     return opcodes.c(i);
 }
 
+/// Copies the value at `src` to `dst` field by field, as PUC-Rio's
+/// `setobj` does. A plain struct copy is one 16-byte load, and when the
+/// source was just written by two narrower stores (a payload and a tag, as
+/// every arithmetic result is), store forwarding cannot serve that load:
+/// it waits for both stores to retire.
+inline fn put(dst: *Value, src: *const Value) void {
+    dst.payload = src.payload;
+    dst.tag = src.tag;
+}
+
+/// Stores `v` at `dst` field by field; see `put`.
+inline fn setv(dst: *Value, v: Value) void {
+    dst.payload = v.payload;
+    dst.tag = v.tag;
+}
+
 /// Longest `__index`/`__newindex` chain, `MAXTAGLOOP`.
 const max_tag_loop = 2000;
 /// Longest `__call` chain, `MAX_CCMT`.
@@ -337,17 +353,17 @@ inline fn moveResults(th: *Thread, dest: u32, first: u32, n: u32, wanted: i16) v
     switch (wanted) {
         0 => th.top = dest,
         1 => {
-            s[dest] = if (n == 0) .nil else s[first];
+            if (n == 0) s[dest] = .nil else put(&s[dest], &s[first]);
             th.top = dest + 1;
         },
         -1 => {
-            for (0..n) |j| s[dest + j] = s[first + j];
+            for (0..n) |j| put(&s[dest + j], &s[first + j]);
             th.top = dest + n;
         },
         else => {
             const w: u32 = @intCast(wanted);
             const m = @min(n, w);
-            for (0..m) |j| s[dest + j] = s[first + j];
+            for (0..m) |j| put(&s[dest + j], &s[first + j]);
             for (m..w) |j| s[dest + j] = .nil;
             th.top = dest + w;
         },
@@ -907,7 +923,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             fetch(&pc, &i);
         dispatch: switch (first_op) {
             .move => {
-                base[getA(i)] = base[getB(i)];
+                put(&base[getA(i)], &base[getB(i)]);
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadi => {
@@ -946,7 +962,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .getupval => {
-                base[getA(i)] = cl.upvals()[getB(i)].v.*;
+                put(&base[getA(i)], cl.upvals()[getB(i)].v);
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .setupval => {
@@ -960,7 +976,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     const h = t.asTable();
                     const v = h.getShortStr(key.asString());
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
-                        base[getA(i)] = v;
+                        setv(&base[getA(i)], v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
@@ -988,7 +1004,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     const h = t.asTable();
                     const v = if (key.tag == .int) h.getInt(key.payload.int) else h.get(key);
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
-                        base[getA(i)] = v;
+                        setv(&base[getA(i)], v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
@@ -1014,7 +1030,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     const h = t.asTable();
                     const v = h.getInt(getC(i));
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
-                        base[getA(i)] = v;
+                        setv(&base[getA(i)], v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
@@ -1031,12 +1047,12 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const t = base[getB(i)];
                 const keyp = &k[getC(i)];
                 const key = keyp.*;
-                if (op(i) == .self) base[getA(i) + 1] = t;
+                if (op(i) == .self) setv(&base[getA(i) + 1], t);
                 if (t.tag == .table) {
                     const h = t.asTable();
                     const v = h.getShortStr(key.asString());
                     if (!v.isNil()) {
-                        base[getA(i)] = v;
+                        setv(&base[getA(i)], v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                     const tm = th.state.fastTm(h.metatable, .index) orelse {
@@ -1047,7 +1063,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     if (tm.tag == .table) {
                         const v2 = tm.asTable().getShortStr(key.asString());
                         if (!v2.isNil()) {
-                            base[getA(i)] = v2;
+                            setv(&base[getA(i)], v2);
                             continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                         }
                     }
@@ -1496,7 +1512,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 if (rb.isFalsy() == getK(i)) {
                     pc += 1;
                 } else {
-                    base[getA(i)] = rb;
+                    setv(&base[getA(i)], rb);
                     pc += jumpOffset(pc[0]);
                 }
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1538,7 +1554,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     const dest = ci.func - delta;
                     const fsize: u32 = p.maxstacksize;
                     try th.growStack(@as(usize, dest) + 1 + @max(fsize, nargs));
-                    for (0..nargs + 1) |j| th.stack[dest + j] = th.stack[func + j];
+                    for (0..nargs + 1) |j| put(&th.stack[dest + j], &th.stack[func + j]);
                     var n = nargs;
                     while (n < p.numparams) : (n += 1) th.stack[dest + 1 + n] = .nil;
                     th.top = dest + 1 + n;
