@@ -1000,9 +1000,11 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const t = base[getB(i)];
                 const keyp = &base[getC(i)];
                 const key = keyp.*;
-                if (t.tag == .table) {
+                // Integer and short string keys inline; any other key goes
+                // to `getSlow`, which takes it by pointer.
+                if (t.tag == .table and (key.tag == .int or key.tag == .short_string)) {
                     const h = t.asTable();
-                    const v = if (key.tag == .int) h.getInt(key.payload.int) else h.get(key);
+                    const v = if (key.tag == .int) h.getInt(key.payload.int) else h.getShortStr(key.asString());
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
                         setv(&base[getA(i)], v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1107,14 +1109,21 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const key = keyp.*;
                 const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
                 const v = vp.*;
-                if (t.tag == .table and t.asTable().metatable == null) {
-                    if (key.tag == .int) {
-                        try t.asTable().setInt(heap, key.payload.int, v);
+                if (t.tag == .table) {
+                    const h = t.asTable();
+                    if (key.tag == .short_string) {
+                        // A present key takes the value in place, metatable
+                        // or not (`luaV_fastset`).
+                        if (h.replaceShortStr(heap, key.asString(), v))
+                            continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
+                        if (h.metatable == null) {
+                            try h.setShortStr(heap, key.asString(), v);
+                            continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
+                        }
+                    } else if (key.tag == .int and h.metatable == null) {
+                        try h.setInt(heap, key.payload.int, v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
-                    ci.pc = pc;
-                    t.asTable().set(heap, key, v) catch |e| return setError(th, e);
-                    continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .{ .slot = ci.base() + getA(i) });
@@ -1156,12 +1165,14 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const v = vp.*;
                 if (t.tag == .table) {
                     const h = t.asTable();
+                    // A present key takes the value in place, metatable or
+                    // not (`luaV_fastset`); a new key goes through the table.
+                    if (h.replaceShortStr(heap, key.asString(), v))
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     if (h.metatable == null) {
                         try h.setShortStr(heap, key.asString(), v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
-                    if (h.replaceShortStr(heap, key.asString(), v))
-                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .{ .slot = ci.base() + getA(i) });
