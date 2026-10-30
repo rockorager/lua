@@ -110,7 +110,23 @@ reference.
 12. **Native functions** take the thread and the index of their first argument
     and return how many results they pushed. Landed:
     `fn (*Thread, base: u32) Error!u32`, `Value.NativeFn`.
-13. **Embedding API.** A Zig API, not the C API, designed once the standard
+13. **The compiler matches luac.** Landed: `Parser.zig` and `Code.zig`
+    translate lparser.c and lcode.c function by function, so the bytecode,
+    constants, upvalues, locals, line info, and `maxstacksize` are the
+    reference's, instruction for instruction. `just bytecode` diffs our
+    listing (`zig build listing`, `Code.writeListing`, luac's
+    `PrintFunction` format) with `luac -l -l -p` for every suite and bench
+    file, addresses masked: 49 of 49 identical. Keep it that way; a
+    deliberate divergence goes in the recipe with the reason. Line info is
+    one absolute line per instruction (`Proto.lineinfo`), not luac's
+    delta encoding, which only `string.dump` would need.
+14. **Library host.** The libraries reach I/O and state the core does not keep
+    (warning mode, the collector's mode and parameters) through
+    `lib.base.Host`, which the embedder owns and `lib.openLibs` stores in the
+    registry as a light userdata under `_LUA_HOST`. A field on `State` would
+    save the lookup; ask the core's owner when a library needs it on a hot
+    path.
+15. **Embedding API.** A Zig API, not the C API, designed once the standard
     library has exercised the internal one. Nothing outside `src/` depends on
     internals until then.
 
@@ -171,6 +187,13 @@ Landed: the string, table, math, and utf8 libraries, with `lib/auxlib.zig`
 (lauxlib's checks and messages) and `lib/libm.zig` (glibc's `exp`, `pow`, and
 logarithms, bit for bit); coverage, verification, and the helpers they need
 from the core are in `stdlib.md`.
+
+Landed from wave 2: the compiler (`Parser.zig`, `Code.zig`), the base
+library (`lib/base.zig`), `lib/init.zig`'s `openLibs`, and the standalone
+`lua` (`main.zig`, lua.c without the traceback). `just diff` runs
+`test/diff/*.lua` on both interpreters; `vm_errors.lua` there lists the VM's
+messages that still differ. Nothing owns `package`/`require` yet, and most
+suite files start with `require`.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.

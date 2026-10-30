@@ -50,43 +50,46 @@ Measured 2026-10-30 on reference C Lua 5.5.1 from nixpkgs
 ## Files
 
 `ref` is the reference alone (`just suite ref each`); `ours` is
-`just suite ours each` at the commit noted. `heavy.lua`, `bwcoercion.lua`, and
+`just suite ours each` at the commit noted. Ours: the wave-2 parser branch
+(`wave2-parser`, 2026-10-30), with the base library only. "With a stub" is
+a rerun with `require = function(n) return _G[n] or {} end` to find the next
+blocker; no failure so far is in the compiler or the base library. `heavy.lua`, `bwcoercion.lua`, and
 `tracegc.lua` are not in the list: all.lua does not run the first, and the
 other two are modules the files load.
 
-| File             | ref | ours | Notes |
-| ---------------- | --- | ---- | ----- |
-| `main.lua`       | ok  |      |       |
-| `gc.lua`         | ok  |      |       |
-| `db.lua`         | ok  |      |       |
-| `calls.lua`      | ok  |      |       |
-| `strings.lua`    | ok  |      |       |
-| `literals.lua`   | ok  |      |       |
-| `tpack.lua`      | ok  |      |       |
-| `attrib.lua`     | ok  |      |       |
-| `gengc.lua`      | ok  |      |       |
-| `locals.lua`     | ok  |      |       |
-| `constructs.lua` | ok  |      |       |
-| `code.lua`       | ok  |      |       |
-| `big.lua`        | ok  |      |       |
-| `cstack.lua`     | ok  |      |       |
-| `nextvar.lua`    | ok  |      |       |
-| `pm.lua`         | ok  |      |       |
-| `utf8.lua`       | ok  |      |       |
-| `api.lua`        | ok  |      |       |
-| `memerr.lua`     | ok  |      |       |
-| `events.lua`     | ok  |      |       |
-| `vararg.lua`     | ok  |      |       |
-| `closure.lua`    | ok  |      |       |
-| `coroutine.lua`  | ok  |      |       |
-| `goto.lua`       | ok  |      |       |
-| `errors.lua`     | ok  |      |       |
-| `math.lua`       | ok  |      |       |
-| `sort.lua`       | ok  |      |       |
-| `bitwise.lua`    | ok  |      |       |
-| `verybig.lua`    | ok  |      |       |
-| `files.lua`      | ok  |      |       |
-| `all.lua`        | ok  |      |       |
+| File             | ref | ours  | Notes                                                                   |
+| ---------------- | --- | ----- | ----------------------------------------------------------------------- |
+| `main.lua`       | ok  | ok    | returns at once (`_port`)                                               |
+| `gc.lua`         | ok  | FAIL  | `require`; with a stub, line 139 needs `string.gsub`                    |
+| `db.lua`         | ok  | FAIL  | `require`; then the debug library                                       |
+| `calls.lua`      | ok  | FAIL  | `require`; with a stub, line 168 needs `string.find`                    |
+| `strings.lua`    | ok  | FAIL  | line 10: the string library                                             |
+| `literals.lua`   | ok  | FAIL  | `require`; with a stub, line 14 needs the string library                |
+| `tpack.lua`      | ok  | FAIL  | line 4: `string.pack`                                                   |
+| `attrib.lua`     | ok  | FAIL  | `require`, the package library                                          |
+| `gengc.lua`      | ok  | FAIL  | `require`; with a stub, line 86 needs `coroutine`                       |
+| `locals.lua`     | ok  | FAIL  | `require`; with a stub, line 78 needs `debug.getupvalue`                |
+| `constructs.lua` | ok  | FAIL  | `require`; with a stub, line 73 needs `string.format`                   |
+| `code.lua`       | ok  | ok    | returns at once (no `T`)                                                |
+| `big.lua`        | ok  | ok    | returns at once (`_soft`)                                               |
+| `cstack.lua`     | ok  | FAIL  | `require"tracegc"`, the package library                                 |
+| `nextvar.lua`    | ok  | FAIL  | line 77: the string library                                             |
+| `pm.lua`         | ok  | FAIL  | line 22: the string library                                             |
+| `utf8.lua`       | ok  | FAIL  | `require`; then the utf8 library                                        |
+| `api.lua`        | ok  | ok    | returns at once (no `T`)                                                |
+| `memerr.lua`     | ok  | ok    | returns at once (no `T`)                                                |
+| `events.lua`     | ok  | FAIL  | `require`; with a stub, line 55 needs the string arithmetic metamethods |
+| `vararg.lua`     | ok  | FAIL  | line 23: named vararg tables in the VM                                  |
+| `closure.lua`    | ok  | hangs | line 38 waits for a weak table to be collected                          |
+| `coroutine.lua`  | ok  | FAIL  | `require`; then the coroutine library                                   |
+| `goto.lua`       | ok  | FAIL  | line 14: the string library                                             |
+| `errors.lua`     | ok  | FAIL  | `require`; with a stub, line 35 needs the string library                |
+| `math.lua`       | ok  | FAIL  | `require`; then the math library                                        |
+| `sort.lua`       | ok  | FAIL  | line 6: the table library                                               |
+| `bitwise.lua`    | ok  | FAIL  | `require"bwcoercion"`, the package library                              |
+| `verybig.lua`    | ok  | ok    |                                                                         |
+| `files.lua`      | ok  | FAIL  | `require`; then the io and os libraries                                 |
+| `all.lua`        | ok  | FAIL  | line 61: `math.randomseed`                                              |
 
 Under `_U`, five files return at once: `main.lua` (`_port`), `big.lua`
 (`_soft`), and `api.lua`, `code.lua`, and `memerr.lua` (`T`, the C test
