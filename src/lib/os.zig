@@ -6,7 +6,7 @@
 //! zone comes from `TZ` (a TZif file name, with or without ':', or a POSIX TZ
 //! string), else `/etc/localtime`, else UTC; `os.time` normalizes a table as
 //! `mktime` does; `os.date` formats as `strftime` does in the C locale, the
-//! only locale there is. The environment is the embedder's: `setEnviron`.
+//! only locale there is. The environment is the embedder's: `base.Host.environ`.
 
 const std = @import("std");
 const Value = @import("../Value.zig");
@@ -15,6 +15,7 @@ const Thread = @import("../Thread.zig");
 const aux = @import("auxlib.zig");
 const base = @import("base.zig");
 const iolib = @import("io.zig");
+const vm = @import("../vm.zig");
 const package = @import("package.zig");
 
 const Error = Value.Error;
@@ -25,22 +26,10 @@ const Writer = std.Io.Writer;
 // The environment
 // ---------------------------------------------------------------------------
 
-const environ_key = "_LUA_ENVIRON";
-
-/// Gives `os.getenv` and `package`'s paths the process environment. Call
-/// before `openLibs`; `map` must outlive the state. Without it the
-/// environment is empty.
-pub fn setEnviron(th: *Thread, map: *const std.process.Environ.Map) Error!void {
-    const state = th.state;
-    try state.registry.setStr(&state.heap, try state.newString(environ_key), .lightUserdata(@constCast(map)));
-}
-
-/// The environment variable `name`, `getenv`.
+/// The environment variable `name` from `base.Host.environ`, `getenv`.
 pub fn getenv(state: *State, name: []const u8) ?[]const u8 {
-    const key = state.newString(environ_key) catch return null;
-    const v = state.registry.getStr(key);
-    if (v.tag != .light_userdata) return null;
-    const map: *const std.process.Environ.Map = @ptrCast(@alignCast(v.asLightUserdata().?));
+    const host = base.hostOf(state) orelse return null;
+    const map = host.environ orelse return null;
     return map.get(name);
 }
 
@@ -172,10 +161,7 @@ fn exit(th: *Thread, b: u32) Error!u32 {
     };
     // C's `exit` flushes every stream. With `close`, the reference first
     // runs `lua_close`: pending to-be-closed variables and finalizers.
-    // TODO(core): that needs a close the running native can call; freeing
-    // the state here would free memory its callers still hold. Until then
-    // `close` only flushes, which is what finalizers of files would do.
-    _ = a.get(2);
+    if (!a.get(2).isFalsy()) vm.closeState(th.state);
     iolib.flushAll(th);
     base.getHost(th).flushStdout();
     std.process.exit(@truncate(@as(u64, @bitCast(status))));

@@ -564,6 +564,18 @@ pub fn closeThread(co: *Thread, from: ?*Thread) bool {
     return result == null;
 }
 
+/// What `lua_close` does before freeing the state, for a native that ends
+/// the program (`os.exit(code, true)`): closes the main thread's pending
+/// to-be-closed variables from the base frame up, in protected mode, with
+/// errors dropped. The memory stays for `State.destroy` or process exit,
+/// and the caller must not return into Lua afterwards.
+pub fn closeState(state: *State) void {
+    const th = state.main;
+    th.resetFrames();
+    th.native_calls = 0;
+    _ = closeProtected(th, 1, null);
+}
+
 /// `coroutine.close` on the running coroutine: closes it and ends the
 /// resume that runs it, which returns what closing it returned.
 pub fn closeSelf(th: *Thread) Error {

@@ -412,12 +412,11 @@ fn pmain(it: *Interp, args: []const [:0]const u8) Value.Error!bool {
         return false;
     }
     if (flags & Flags.has_v != 0) writeVersion(it.host);
-    const state = it.th.state;
     if (flags & Flags.has_upper_e != 0) {
         it.use_env = false;
-        try state.registry.setStr(&state.heap, try state.newString("LUA_NOENV"), .true);
+        it.host.noenv = true;
     }
-    try lua.lib.os.setEnviron(it.th, it.environ);
+    it.host.environ = it.environ;
     try lua.lib.openLibs(it.th, it.host);
     try createArgTable(it.th, args, script);
     it.host.gc_mode = .generational;

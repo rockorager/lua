@@ -33,6 +33,9 @@ memerr: *String,
 /// vararg tables; fixed.
 name_key: *String,
 n_key: *String,
+/// The embedder's data for the libraries (`lib.base.Host`), untyped so the
+/// core does not depend on them; null until `lib.openLibs` sets it.
+host: ?*anyopaque = null,
 
 /// Metamethod events, in PUC-Rio's order (`ltm.h`). The first six are the
 /// ones `Table.flags` caches the absence of.

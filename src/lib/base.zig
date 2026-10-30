@@ -43,6 +43,11 @@ pub const Host = struct {
     gc_params: [6]u8 = .{
         codeParam(20), codeParam(50), codeParam(70), codeParam(250), codeParam(200), codeParam(200 * 56),
     },
+    /// The process environment for `os.getenv` and `package`'s paths; none
+    /// when null. It must outlive the state.
+    environ: ?*const std.process.Environ.Map = null,
+    /// `lua -E`: `package` ignores `LUA_PATH` and `LUA_CPATH`.
+    noenv: bool = false,
 
     /// A host on the process's standard streams. Call `init` in place: the
     /// stdout writer points into the struct.
@@ -68,19 +73,19 @@ pub const Host = struct {
     }
 };
 
-const host_key = "_LUA_HOST";
-
-/// Stores `host` in the registry for the libraries.
+/// Gives the libraries `host` (`State.host`).
 pub fn setHost(th: *Thread, host: *Host) Error!void {
-    const state = th.state;
-    try state.registry.setStr(&state.heap, try state.newString(host_key), .lightUserdata(host));
+    th.state.host = host;
 }
 
-/// The host `setHost` stored.
+/// The host `setHost` gave the state.
 pub fn getHost(th: *Thread) *Host {
-    const state = th.state;
-    const s = state.newString(host_key) catch unreachable; // interned at setHost
-    return @ptrCast(@alignCast(state.registry.getStr(s).asLightUserdata().?));
+    return hostOf(th.state).?;
+}
+
+/// The host of `state`, or null before `setHost`.
+pub fn hostOf(state: *const State) ?*Host {
+    return @ptrCast(@alignCast(state.host orelse return null));
 }
 
 // ---------------------------------------------------------------------------

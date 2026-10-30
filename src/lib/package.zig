@@ -76,10 +76,10 @@ fn closure(state: *State, f: Value.NativeFn, pkg: *Table) error{OutOfMemory}!Val
 // Paths
 // ---------------------------------------------------------------------------
 
-/// `noenv`: `registry.LUA_NOENV`, which `lua -E` sets.
+/// `noenv`: `base.Host.noenv`, which `lua -E` sets.
 fn noEnv(state: *State) bool {
-    const key = state.newString("LUA_NOENV") catch return false;
-    return !state.registry.getStr(key).isFalsy();
+    const host = base.hostOf(state) orelse return false;
+    return host.noenv;
 }
 
 /// `setpath`: `package[field]` from the environment variable `envname`
@@ -412,7 +412,7 @@ pub const testing = struct {
         defer map.deinit();
         for (env) |kv| try map.put(kv[0], kv[1]);
         const th = state.main;
-        try os.setEnviron(th, &map);
+        host.environ = &map;
         try lib.openLibs(th, &host);
         const func = th.top;
         th.push(try base.loadChunk(th, src, "=test", "t"));
