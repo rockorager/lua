@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const lua = @import("lua");
+const build_options = @import("build_options");
 
 const Value = lua.Value;
 const State = lua.State;
@@ -456,7 +457,8 @@ fn pmain(it: *Interp, args: []const [:0]const u8) Value.Error!bool {
     it.host.environ = it.environ;
     try lua.lib.openLibs(it.th, it.host);
     try createArgTable(it.th, args, script);
-    it.host.gc_mode = .generational;
+    // lua.c's pmain runs the collector in generational mode.
+    lua.gc.changeMode(it.th, .gen_minor);
     if (!it.handleLuaInit()) return false;
     if (!runArgs(it, args, optlim)) return false;
     if (script > 0 and !it.handleScript(args, script)) return false;
@@ -500,7 +502,8 @@ pub fn main(init: std.process.Init) u8 {
     var host: base.Host = undefined;
     host.init(io);
     const progname: []const u8 = if (args.len > 0 and args[0].len > 0) args[0] else "lua";
-    const state = State.create(gpa, .{}) catch {
+    const stress = std.meta.stringToEnum(@FieldType(State.Options, "gc_stress"), build_options.gc_stress).?;
+    const state = State.create(gpa, .{ .gc_stress = stress }) catch {
         host.writeStderr(progname);
         host.writeStderr(": cannot create state: not enough memory\n");
         return 1;
@@ -525,7 +528,10 @@ pub fn main(init: std.process.Init) u8 {
         th.top -= 1;
         break :blk !th.stack[th.top].isFalsy();
     };
-    // Open files flush at exit, as C's `exit` flushes every stream.
+    // `lua_close`: pending to-be-closed variables and finalizers, which may
+    // still write. Then open files flush, as C's `exit` flushes every
+    // stream.
+    vm.closeState(state);
     lua.lib.io.flushAll(it.th);
     host.flushStdout();
     return if (ok) 0 else 1;

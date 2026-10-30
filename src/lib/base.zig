@@ -30,19 +30,12 @@ const Writer = std.Io.Writer;
 
 /// What the libraries need from the program around them: I/O and the
 /// standard streams, and state the reference keeps in its `global_State`
-/// that `State` does not have yet (warnings, the collector's mode and
-/// parameters). The embedder owns it; it must outlive the Lua state.
+/// that `State` does not have (the warning mode). The embedder owns it; it must outlive the Lua state.
 pub const Host = struct {
     io: std.Io,
     stdout: std.Io.File.Writer,
     stdout_buf: [4096]u8 = undefined,
     warn: enum { off, on, cont } = .off,
-    gc_mode: enum { incremental, generational } = .incremental,
-    gc_stopped: bool = false,
-    /// `collectgarbage("param")` values, PUC-Rio's encoded bytes.
-    gc_params: [6]u8 = .{
-        codeParam(20), codeParam(50), codeParam(70), codeParam(250), codeParam(200), codeParam(200 * 56),
-    },
     /// The process environment for `os.getenv` and `package`'s paths; none
     /// when null. It must outlive the state.
     environ: ?*const std.process.Environ.Map = null,
@@ -76,6 +69,12 @@ pub const Host = struct {
 /// Gives the libraries `host` (`State.host`).
 pub fn setHost(th: *Thread, host: *Host) Error!void {
     th.state.host = host;
+    th.state.warnf = &stateWarn;
+}
+
+/// The state's warning function: `warnf` on its host.
+fn stateWarn(state: *State, msg: []const u8, tocont: bool) void {
+    warnf(hostOf(state).?, msg, tocont);
 }
 
 /// The host `setHost` gave the state.
@@ -489,8 +488,7 @@ fn setmetatable(th: *Thread, base: u32) Error!u32 {
     if (mtv.tag != .nil and mtv.tag != .table) return typeError(th, base, 2, "setmetatable", "nil or table");
     if (getMetafield(th, .table(t), "__metatable") != null)
         return raise(th, "cannot change a protected metatable", .{});
-    t.metatable = if (mtv.isNil()) null else mtv.asTable();
-    gc.barrier(th.heap(), &t.header, mtv);
+    th.state.setMetatable(.table(t), if (mtv.isNil()) null else mtv.asTable());
     return ret1(th, .table(t));
 }
 
@@ -527,64 +525,66 @@ fn rawset(th: *Thread, base: u32) Error!u32 {
     return ret1(th, .table(t));
 }
 
-/// `luaO_codeparam`: a percentage as PUC-Rio's floating-point byte.
-fn codeParam(p_in: u32) u8 {
-    if (p_in >= (@as(u64, 0x1F) << (0xF - 7 - 1)) * 100) return 0xFF;
-    const p: u32 = @intCast((@as(u64, p_in) * 128 + 99) / 100);
-    if (p < 0x10) return @intCast(p);
-    const log: u5 = @intCast(32 - @clz(p) - 5);
-    return @intCast(((p >> log) - 0x10) | (@as(u32, log) + 1) << 4);
-}
-
-/// `luaO_applyparam(p, 100)`: the percentage a coded byte stands for.
-fn applyParam(p: u8) i64 {
-    var m: i64 = p & 0xF;
-    var e: i32 = p >> 4;
-    if (e > 0) {
-        e -= 1;
-        m += 0x10;
-    }
-    e -= 7;
-    return if (e >= 0) (100 * m) << @intCast(e) else (100 * m) >> @intCast(-e);
-}
-
 fn collectgarbage(th: *Thread, base: u32) Error!u32 {
     const opts = [_][]const u8{
         "stop", "restart", "collect", "count", "step", "isrunning", "generational", "incremental", "param",
     };
     const o = try checkOption(th, base, 1, "collectgarbage", "collect", &opts);
-    const host = getHost(th);
     const heap = th.heap();
+    // Inside a finalizer, or while the state closes, every option fails
+    // (`lua_gc` returns -1 and the library pushes fail, nil).
+    if (heap.stopped & (gc.stop.internal | gc.stop.closing) != 0) {
+        if (o == 4) _ = try optInteger(th, base, 2, "collectgarbage", 0);
+        if (o != 8) return ret1(th, .nil);
+    }
     switch (o) {
         0 => {
-            host.gc_stopped = true;
-            heap.threshold = std.math.maxInt(usize);
+            heap.stopped = gc.stop.user;
             return ret1(th, .int(0));
         },
         1 => {
-            host.gc_stopped = false;
-            heap.threshold = @max(heap.bytes, gc.Heap.initial_threshold);
+            heap.setDebt(0);
+            heap.stopped = 0;
             return ret1(th, .int(0));
         },
-        2, 4 => {
-            if (o == 4) _ = try optInteger(th, base, 2, "collectgarbage", 0);
-            th.state.collect();
-            if (host.gc_stopped) heap.threshold = std.math.maxInt(usize);
-            return ret1(th, if (o == 2) Value.int(0) else Value.true);
+        2 => {
+            gc.fullGc(th, false);
+            return ret1(th, .int(0));
         },
         3 => return ret1(th, .float(@as(f64, @floatFromInt(heap.bytes)) / 1024.0)),
-        5 => return ret1(th, .boolean(!host.gc_stopped)),
+        4 => {
+            const n = try optInteger(th, base, 2, "collectgarbage", 0);
+            const old_stopped = heap.stopped;
+            heap.stopped = 0;
+            // A step of `n` bytes' worth, or one basic step for n <= 0.
+            const max = std.math.maxInt(isize);
+            const new_debt: isize = if (n <= 0)
+                0
+            else if (heap.debt() >= n - max)
+                heap.debt() - @as(isize, @intCast(n))
+            else
+                -max;
+            heap.setDebt(new_debt);
+            const worked = th.state.gcDue();
+            if (worked) gc.basicStep(th);
+            heap.stopped = old_stopped;
+            return ret1(th, .boolean(worked and heap.phase == .pause));
+        },
+        5 => return ret1(th, .boolean(heap.running())),
         6, 7 => {
-            const old = host.gc_mode;
-            host.gc_mode = if (o == 6) .generational else .incremental;
-            return ret1(th, .string(try th.state.newString(@tagName(old))));
+            const old: []const u8 = if (heap.kind == .incremental) "incremental" else "generational";
+            gc.changeMode(th, if (o == 6) .gen_minor else .incremental);
+            return ret1(th, .string(try th.state.newString(old)));
         },
         else => {
             const params = [_][]const u8{ "minormul", "majorminor", "minormajor", "pause", "stepmul", "stepsize" };
             const p = try checkOption(th, base, 2, "collectgarbage", null, &params);
             const value = try optInteger(th, base, 3, "collectgarbage", -1);
-            const old = applyParam(host.gc_params[p]);
-            if (value >= 0) host.gc_params[p] = codeParam(@intCast(@min(value, std.math.maxInt(i32))));
+            if (heap.stopped & (gc.stop.internal | gc.stop.closing) != 0) return ret1(th, .int(-1));
+            const old = gc.applyParam(heap.params[p], 100);
+            // `lua_gc` takes the value as a C int.
+            const v: i32 = @truncate(value);
+            if (v >= 0) heap.params[p] = gc.codeParam(@intCast(v));
             return ret1(th, .int(old));
         },
     }

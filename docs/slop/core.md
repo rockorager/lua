@@ -70,22 +70,14 @@ the plan left open and what was measured. Numbers are in
 
 ### Collector
 
+Wave 3 replaced the stop-the-world collector with a port of lgc.c
+(`gc.md`). Still true from wave 1:
+
 - Gray objects are linked through a `gclist` field in each object with
-  children, so marking never allocates. Strings are leaves; marking an
-  upvalue marks its value directly (one level, since values are never
-  upvalues).
-- A thread is marked from slot 0 to the highest of `top` and every frame's
-  top, and slots above that are set to nil, as PUC-Rio's atomic phase does,
-  so a stale slot never points at a freed object.
+  children, so marking never allocates.
 - Open upvalues form a doubly linked list per thread (`prev` points at the
   link to the upvalue), so sweeping a dead upvalue unlinks it, and freeing a
   thread closes whatever is left; either sweep order is safe.
-- Collection runs only at safe points: after `NEWTABLE`, `CLOSURE`, and
-  `CONCAT`, and on `State.collect`. Pacing: the next collection when the
-  heap doubles, at least 256 KiB. `Heap.stress` collects at every safe
-  point; the VM tests run each program with it on as well.
-- `gc.barrier` and `gc.barrierBack` are inline no-ops called at every store
-  into a table, upvalue, closure, and userdata user value.
 - All memory goes through `Heap.allocator()`, a counting wrapper around the
   state's allocator, so `Heap.bytes` is every byte the state holds.
 
@@ -135,5 +127,4 @@ coroutines, variable names in messages, `number.zig` arithmetic, message
 handlers, and stack shrinking; `vm.md` records how and what is still open.
 Left from this list:
 
-- Weak tables, ephemerons, finalizers, incremental and generational modes.
 - A `GETTABUP` inline cache.

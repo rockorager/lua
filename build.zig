@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "lua", .module = mod }},
         }),
     });
+    // Collector stress for the suite: `full` collects at every safe point,
+    // `step` takes one incremental step at each.
+    const exe_options = b.addOptions();
+    const gc_stress = b.option([]const u8, "gc-stress", "Collector stress in the lua executable: off, full, or step");
+    exe_options.addOption([]const u8, "gc_stress", gc_stress orelse "off");
+    exe.root_module.addOptions("build_options", exe_options);
     b.installArtifact(exe);
     const run_exe = b.addRunArtifact(exe);
     if (b.args) |args| run_exe.addArgs(args);

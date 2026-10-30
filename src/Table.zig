@@ -120,6 +120,14 @@ fn arrayBlock(array: [*]align(8) u8, asize: u32) []align(8) u8 {
     return @alignCast((array - @as(usize, asize) * 8)[0..arrayBlockLen(asize)]);
 }
 
+/// The bytes the table holds, for the collector's pacing.
+pub fn byteSize(t: *const Table) usize {
+    var n: usize = @sizeOf(Table);
+    if (!t.isDummy()) n += @as(usize, t.nodeCount()) * @sizeOf(Node);
+    if (t.asize > 0) n += arrayBlockLen(t.asize);
+    return n;
+}
+
 pub inline fn isDummy(t: *const Table) bool {
     return t.node == @as([*]Node, &dummy_node);
 }
@@ -159,6 +167,11 @@ inline fn arraySet(t: *Table, i: u32, v: Value) void {
     std.debug.assert(i < t.asize);
     t.payloadPtr(i).* = v.payload;
     t.tagPtr(i).* = v.tag;
+}
+
+/// Empties array slot `i`, for the collector clearing a weak table.
+pub inline fn clearArraySlot(t: *Table, i: u32) void {
+    t.tagPtr(i).* = .nil;
 }
 
 inline fn arrayIsEmpty(t: *const Table, i: u32) bool {

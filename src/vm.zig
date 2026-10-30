@@ -32,6 +32,7 @@ const Table = @import("Table.zig");
 const Proto = @import("Proto.zig");
 const Thread = @import("Thread.zig");
 const State = @import("State.zig");
+const gc = @import("gc.zig");
 const opcodes = @import("opcodes.zig");
 const number = @import("number.zig");
 // The reference's `pow`, so results match it bit for bit.
@@ -308,11 +309,16 @@ noinline fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn)
         .flags = .{},
     });
     if (th.hookmask & Thread.HookMask.call != 0) try callHook(th, .call, -1, 1, th.top - func - 1);
+    const bytes = th.state.heap.bytes;
     const n = try f(th, func + 1);
     std.debug.assert(n <= th.top - func - 1);
     if (th.hookmask != 0) try retHook(th, th.top - n, n);
     moveResults(th, func, th.top - n, n, nresults);
     th.frames.items.len -= 1;
+    // Back between two instructions of a Lua function: a safe point for
+    // what the native allocated, as the reference's API functions that
+    // allocate check the collector and the others do not.
+    if (th.state.heap.bytes > bytes and th.frame().flags.lua) _ = th.state.checkGc(th);
 }
 
 /// Finishes the running frame, a native one, with `n` results on top
@@ -572,15 +578,18 @@ pub fn closeThread(co: *Thread, from: ?*Thread) bool {
 }
 
 /// What `lua_close` does before freeing the state, for a native that ends
-/// the program (`os.exit(code, true)`): closes the main thread's pending
-/// to-be-closed variables from the base frame up, in protected mode, with
-/// errors dropped. The memory stays for `State.destroy` or process exit,
-/// and the caller must not return into Lua afterwards.
+/// the program (`os.exit(code, true)`) and for `State.destroy`: closes the
+/// main thread's pending to-be-closed variables from the base frame up,
+/// in protected mode, with errors dropped, then calls every pending
+/// finalizer. The memory stays for `State.destroy` or process exit, and
+/// the caller must not return into Lua afterwards. Runs once.
 pub fn closeState(state: *State) void {
+    if (state.heap.stopped & gc.stop.closing != 0) return;
     const th = state.main;
     th.resetFrames();
     th.native_calls = 0;
     _ = closeProtected(th, 1, null);
+    gc.callAllFinalizers(state);
 }
 
 /// `coroutine.close` on the running coroutine: closes it and ends the
@@ -1114,7 +1123,13 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const nhash: u32 = if (vb > 0) @as(u32, 1) << @intCast(vb - 1) else 0;
                 base[getA(i)] = .table(try Table.create(heap, narray, nhash));
                 ci.pc = pc;
-                th.state.checkGc();
+                if (th.state.gcDue()) {
+                    // Registers above the new value are dead (`checkGC`).
+                    th.top = ci.base() + getA(i) + 1;
+                    gc.step(th);
+                    ci = th.frame();
+                    base = th.stack.ptr + ci.base();
+                }
                 if (hookSwitch(hooked, th)) return true;
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
@@ -1290,7 +1305,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const done = try concatValues(th, .vm, getB(i));
                 ci = th.frame();
                 if (!done) continue :newframe;
-                th.state.checkGc();
+                if (th.state.checkGc(th)) ci = th.frame();
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1598,7 +1613,13 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 }
                 base[getA(i)] = .luaClosure(ncl);
                 ci.pc = pc;
-                th.state.checkGc();
+                if (th.state.gcDue()) {
+                    // Registers above the new value are dead (`checkGC`).
+                    th.top = ci.base() + getA(i) + 1;
+                    gc.step(th);
+                    ci = th.frame();
+                    base = th.stack.ptr + ci.base();
+                }
                 if (hookSwitch(hooked, th)) return true;
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
@@ -1634,7 +1655,12 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             .varargprep => {
                 ci.pc = pc;
                 try adjustVarargs(th, ci, cl.proto);
-                if (cl.proto.flags.vararg_table) th.state.checkGc();
+                if (cl.proto.flags.vararg_table and th.state.gcDue()) {
+                    // The parameters and the vararg table above them.
+                    th.top = ci.base() + cl.proto.numparams + 1;
+                    gc.step(th);
+                    ci = th.frame();
+                }
                 if (hooked) {
                     try hookCall(th);
                     // The next instruction counts as a new line.

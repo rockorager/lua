@@ -95,7 +95,13 @@ reference.
    ephemerons, `__gc` finalizers, and `__close`; then incremental, with 5.5's
    incremental major collections; then generational mode. Allocation goes
    through the state's allocator with byte accounting, for
-   `collectgarbage("count")` and pacing.
+   `collectgarbage("count")` and pacing. Landed in wave 3: `gc.zig` ports lgc.c
+   function by function (weak tables and ephemerons, finalizers,
+   incremental steps with 5.5's parameters, real barriers, 5.5's
+   generational mode and its incremental major collections); `gc.md` has
+   the decisions and the divergences, and
+   `results/gc-wave3-20261030.md` the speed and peak memory against the
+   reference.
 10. **Numbers.** i64 and f64, with the manual's conversions (§3.4.3): exact
     integer-float comparison, floor division and modulo with Lua's signs, shifts
     that saturate at 64, string coercion. Floats print in decimal with enough
@@ -218,4 +224,4 @@ nothing per instruction (`vm.md`), and the standalone `lua` runs
 everything from a native frame with lua.c's traceback handler.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
-modes, then the measured decisions above.
+modes (landed, `gc.md`), then the measured decisions above.

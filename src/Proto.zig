@@ -86,6 +86,12 @@ pub fn destroy(heap: *gc.Heap, p: *Proto) void {
     a.destroy(p);
 }
 
+/// The bytes the prototype holds, for the collector's pacing.
+pub fn byteSize(p: *const Proto) usize {
+    return @sizeOf(Proto) + p.code.len * @sizeOf(u32) + p.k.len * @sizeOf(Value) + p.p.len * @sizeOf(*Proto) +
+        p.upvalues.len * @sizeOf(UpvalDesc) + p.lineinfo.len * @sizeOf(u32) + p.locvars.len * @sizeOf(LocVar);
+}
+
 /// The source line of the instruction at `pc`, or null without line info.
 pub fn lineAt(p: *const Proto, pc: usize) ?u32 {
     return if (pc < p.lineinfo.len) p.lineinfo[pc] else null;
@@ -98,7 +104,7 @@ pub const LuaClosure = struct {
     gclist: ?*gc.Header = null,
     proto: *Proto,
 
-    fn allocSize(n: usize) usize {
+    pub fn allocSize(n: usize) usize {
         return @sizeOf(LuaClosure) + n * @sizeOf(*Upval);
     }
 
@@ -137,7 +143,7 @@ pub const NativeClosure = struct {
     gclist: ?*gc.Header = null,
     f: Value.NativeFn,
 
-    fn allocSize(n: usize) usize {
+    pub fn allocSize(n: usize) usize {
         return @sizeOf(NativeClosure) + n * @sizeOf(Value);
     }
 

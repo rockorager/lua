@@ -134,8 +134,8 @@ pub const Interner = struct {
         var it = self.buckets[h & (self.buckets.len - 1)];
         while (it) |s| : (it = s.hnext) {
             if (s.hash == h and s.len == b.len and std.mem.eql(u8, s.bytes(), b)) {
-                // A string found dead in a collection's sweep would already
-                // be gone; no resurrection needed while collection is atomic.
+                // Dead but not swept yet: in use again.
+                if (heap.isDead(&s.header)) gc.Heap.resurrect(&s.header);
                 return s;
             }
         }
@@ -153,7 +153,18 @@ pub const Interner = struct {
 
     /// Doubles the buckets. Failure is harmless: chains get longer.
     fn grow(self: *Interner, heap: *gc.Heap) void {
-        const new = heap.allocator().alloc(?*String, self.buckets.len * 2) catch return;
+        self.resize(heap, self.buckets.len * 2);
+    }
+
+    /// Halves the buckets when a quarter or less is used (`checkSizes`).
+    pub fn shrink(self: *Interner, heap: *gc.Heap) void {
+        if (self.count < self.buckets.len / 4 and self.buckets.len > initial_buckets) {
+            self.resize(heap, self.buckets.len / 2);
+        }
+    }
+
+    fn resize(self: *Interner, heap: *gc.Heap, len: usize) void {
+        const new = heap.allocator().alloc(?*String, len) catch return;
         @memset(new, null);
         for (self.buckets) |head| {
             var it = head;
@@ -168,20 +179,12 @@ pub const Interner = struct {
         self.buckets = new;
     }
 
-    /// Drops strings the collector did not mark; it frees them next.
-    pub fn sweep(self: *Interner, heap: *gc.Heap) void {
-        _ = heap;
-        for (self.buckets) |*head| {
-            var link: *?*String = head;
-            while (link.*) |s| {
-                if (s.header.marked & (gc.mark.black | gc.mark.fixed) == 0) {
-                    link.* = s.hnext;
-                    self.count -= 1;
-                } else {
-                    link = &s.hnext;
-                }
-            }
-        }
+    /// Drops a short string the collector is about to free.
+    pub fn remove(self: *Interner, s: *String) void {
+        var link: *?*String = &self.buckets[s.hash & (self.buckets.len - 1)];
+        while (link.*.? != s) link = &link.*.?.hnext;
+        link.* = s.hnext;
+        self.count -= 1;
     }
 };
 

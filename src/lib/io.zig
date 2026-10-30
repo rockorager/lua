@@ -18,6 +18,7 @@ const Table = @import("../Table.zig");
 const State = @import("../State.zig");
 const Thread = @import("../Thread.zig");
 const Userdata = @import("../Userdata.zig");
+const gc = @import("../gc.zig");
 const Proto = @import("../Proto.zig");
 const number = @import("../number.zig");
 const aux = @import("auxlib.zig");
@@ -440,7 +441,9 @@ fn checkOpen(a: Args, n: u32) Error!*Stream {
 fn newHandle(th: *Thread) Error!*Stream {
     const state = th.state;
     const u = try Userdata.create(&state.heap, @sizeOf(Stream), 0);
-    u.metatable = fileMeta(state);
+    // Through `setMetatable`, so the handle's `__gc` closes it when it is
+    // collected.
+    state.setMetatable(.userdata(u), fileMeta(state));
     const s = streamOf(u);
     s.* = .{};
     th.push(.userdata(u));
@@ -523,13 +526,12 @@ fn closeStream(th: *Thread, s: *Stream) Error!u32 {
 
 /// Flushes every open file handle, as C's `exit` and `popen` flush every
 /// stream; nothing when the library was never opened. Handles the
-/// collector already freed are gone; the core's finalizers will close them
-/// instead.
+/// collector already freed were closed by their finalizer.
 pub fn flushAll(th: *Thread) void {
     const state = th.state;
     const mt = fileMeta(state) orelse return;
-    var it = state.heap.objects;
-    while (it) |h| : (it = h.next) {
+    var it = gc.objects(&state.heap);
+    while (it.next()) |h| {
         if (h.tag != .userdata) continue;
         const u: *Userdata = @fieldParentPtr("header", h);
         if (u.metatable != mt or u.len != @sizeOf(Stream)) continue;

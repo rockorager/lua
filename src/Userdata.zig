@@ -36,6 +36,11 @@ pub fn destroy(heap: *gc.Heap, u: *Userdata) void {
     heap.allocator().free(p[0..(bytesOffset(u.nuvalue) + u.len)]);
 }
 
+/// The bytes the userdata holds, for the collector's pacing.
+pub fn byteSize(u: *const Userdata) usize {
+    return bytesOffset(u.nuvalue) + u.len;
+}
+
 pub inline fn userValues(u: *Userdata) []Value {
     const p: [*]u8 = @ptrCast(u);
     const v: [*]Value = @ptrCast(@alignCast(p + @sizeOf(Userdata)));

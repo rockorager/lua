@@ -29,6 +29,9 @@ top: u32,
 frames: std.ArrayList(Frame) = .empty,
 /// Open upvalues, highest stack level first.
 open_upvals: ?*Upval = null,
+/// The next thread in the collector's list of threads with open upvalues
+/// (`gc.Heap.twups`); the thread itself when it is not on the list.
+twups: ?*Thread = null,
 /// Stack levels of the pending to-be-closed variables, lowest first.
 tbc: std.ArrayList(u32) = .empty,
 /// The error object while an `error.LuaError` unwinds.
@@ -154,7 +157,10 @@ pub const Frame = struct {
         /// called value as an extra first argument (`debug.getinfo`'s
         /// `extraargs`), at most `vm.max_call_chain`.
         ncallmt: u4 = 0,
-        _: u3 = 0,
+        /// Calling a finalizer (`CIST_FIN`), which the debug library then
+        /// names "__gc".
+        fin: bool = false,
+        _: u2 = 0,
     };
 
     pub inline fn base(f: *const Frame) u32 {
@@ -188,6 +194,7 @@ pub fn create(state: *State) error{OutOfMemory}!*Thread {
     errdefer frames.deinit(gpa);
     const th = try gpa.create(Thread);
     th.* = .{ .header = undefined, .state = state, .stack = stack, .top = 1, .frames = frames };
+    th.twups = th;
     state.heap.link(&th.header, .thread);
     return th;
 }
@@ -293,6 +300,7 @@ pub fn findUpval(th: *Thread, level: u32) error{OutOfMemory}!*Upval {
     if (link.*) |n| n.open.prev = &uv.open.next;
     link.* = uv;
     th.heap().link(&uv.header, .upval);
+    gc.linkTwups(th.heap(), th);
     return uv;
 }
 
@@ -303,6 +311,7 @@ pub fn closeUpvals(th: *Thread, level: u32) void {
         uv.unlink();
         uv.closed = uv.v.*;
         uv.v = &uv.closed;
+        gc.closeUpval(th.heap(), uv);
     }
 }
 

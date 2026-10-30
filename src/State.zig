@@ -10,6 +10,7 @@ const Value = @import("Value.zig");
 const String = @import("String.zig");
 const Table = @import("Table.zig");
 const Thread = @import("Thread.zig");
+const vm = @import("vm.zig");
 
 const Error = Value.Error;
 
@@ -36,6 +37,10 @@ n_key: *String,
 /// The embedder's data for the libraries (`lib.base.Host`), untyped so the
 /// core does not depend on them; null until `lib.openLibs` sets it.
 host: ?*anyopaque = null,
+/// The warning function (`lua_setwarnf`): the collector reports errors in
+/// finalizers through it, in pieces, `tocont` set on all but the last.
+/// None until the libraries set one.
+warnf: ?*const fn (state: *State, msg: []const u8, tocont: bool) void = null,
 
 /// Metamethod events, in PUC-Rio's order (`ltm.h`). The first six are the
 /// ones `Table.flags` caches the absence of.
@@ -80,6 +85,9 @@ pub const Options = struct {
     /// Fixes the hash seed, for reproducible runs. By default it mixes
     /// addresses that ASLR randomizes, as PUC-Rio's `luai_makeseed` does.
     seed: ?u64 = null,
+    /// Collector stress for testing: `full` collects at every safe point,
+    /// `step` takes one incremental step at each.
+    gc_stress: enum { off, full, step } = .off,
 };
 
 /// A new state with an empty registry and globals. Every byte it ever
@@ -93,7 +101,7 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
         std.mem.asBytes(&[_]usize{ @intFromPtr(&local), @intFromPtr(&create), @intFromPtr(&gpa) }),
     );
     state.* = .{
-        .heap = .{ .backing = gpa },
+        .heap = .{ .backing = gpa, .stress = options.gc_stress == .full, .stress_step = options.gc_stress == .step },
         .strings = undefined,
         .seed = seed,
         .main = undefined,
@@ -109,16 +117,10 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
         gc.freeAll(&state.heap);
         state.strings.deinit(&state.heap);
     }
-    state.memerr = try state.strings.create(&state.heap, "not enough memory");
-    state.memerr.header.marked |= gc.mark.fixed;
-    state.name_key = try state.strings.create(&state.heap, "__name");
-    state.name_key.header.marked |= gc.mark.fixed;
-    state.n_key = try state.strings.create(&state.heap, "n");
-    state.n_key.header.marked |= gc.mark.fixed;
-    for (&state.tm_names, 0..) |*n, i| {
-        n.* = try state.strings.create(&state.heap, @as(Tm, @enumFromInt(i)).name());
-        n.*.header.marked |= gc.mark.fixed;
-    }
+    state.memerr = try state.fixedString("not enough memory");
+    state.name_key = try state.fixedString("__name");
+    state.n_key = try state.fixedString("n");
+    for (&state.tm_names, 0..) |*n, i| n.* = try state.fixedString(@as(Tm, @enumFromInt(i)).name());
     state.main = try Thread.create(state);
     // The main thread can never yield.
     state.main.nny = 1;
@@ -129,8 +131,17 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
     return state;
 }
 
-/// Frees the state and every object in it.
+fn fixedString(state: *State, b: []const u8) error{OutOfMemory}!*String {
+    const s = try state.strings.create(&state.heap, b);
+    gc.fix(&state.heap, &s.header);
+    return s;
+}
+
+/// Frees the state and every object in it, after what `lua_close` runs
+/// first (`vm.closeState`): pending to-be-closed variables of the main
+/// thread and every pending finalizer.
 pub fn destroy(state: *State) void {
+    vm.closeState(state);
     const gpa = state.heap.backing;
     gc.freeAll(&state.heap);
     state.strings.deinit(&state.heap);
@@ -158,20 +169,19 @@ pub fn metatableOf(state: *const State, v: Value) ?*Table {
 }
 
 /// Sets the metatable of any value (`lua_setmetatable`): a table's or
-/// full userdata's own, else the one its basic type shares.
+/// full userdata's own, else the one its basic type shares. A table or
+/// userdata whose new metatable has `__gc` is marked for finalization.
 pub fn setMetatable(state: *State, v: Value, mt: ?*Table) void {
     const mtv: Value = if (mt) |t| .table(t) else .nil;
     switch (v.tag) {
-        .table => {
-            v.asTable().metatable = mt;
-            gc.barrier(&state.heap, &v.asTable().header, mtv);
+        .table => v.asTable().metatable = mt,
+        .userdata => v.asUserdata().metatable = mt,
+        else => return {
+            state.metatables[@intFromEnum(v.typeOf())] = mt;
         },
-        .userdata => {
-            v.asUserdata().metatable = mt;
-            gc.barrier(&state.heap, &v.asUserdata().header, mtv);
-        },
-        else => state.metatables[@intFromEnum(v.typeOf())] = mt,
     }
+    gc.barrier(&state.heap, v.payload.gc, mtv);
+    gc.checkFinalizer(state, v.payload.gc, mt);
 }
 
 /// The handler for event `tm` in metatable `mt`, or null. For the fast
@@ -211,16 +221,24 @@ pub fn tmOf(state: *const State, v: Value, tm: Tm) ?Value {
     return if (h.isNil()) null else h;
 }
 
-/// A full collection now.
+/// A full collection now; finalizers run on the main thread.
 pub fn collect(state: *State) void {
-    gc.fullCollect(state);
+    gc.fullGc(state.main, false);
 }
 
-/// Collects if the heap has grown past its threshold. Call only at safe
-/// points: every live value reachable from a root or below some frame's
-/// top.
-pub inline fn checkGc(state: *State) void {
-    if (state.heap.bytes >= state.heap.threshold) gc.fullCollect(state);
+/// Takes a collector step if enough was allocated since the last one, and
+/// returns whether it did. Call only at safe points: every live value
+/// reachable from a root or on a thread's stack below its `top`. A step can run
+/// finalizers on `th`, which can grow its stack and its frames.
+pub inline fn checkGc(state: *State, th: *Thread) bool {
+    if (state.heap.bytes < state.heap.threshold) return false;
+    gc.step(th);
+    return true;
+}
+
+/// Whether enough was allocated since the last step for another.
+pub inline fn gcDue(state: *const State) bool {
+    return state.heap.bytes >= state.heap.threshold;
 }
 
 const testing = std.testing;

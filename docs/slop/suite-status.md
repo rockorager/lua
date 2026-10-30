@@ -50,45 +50,47 @@ Measured 2026-10-30 on reference C Lua 5.5.1 from nixpkgs
 ## Files
 
 `ref` is the reference alone (`just suite ref each`); `ours` is
-`just suite ours each` on the `wave3-hooks` branch, 2026-10-30: wave 2's
-VM and libraries plus debug hooks. 24 of 30 pass; the rest wait on the
-collector's weak tables and finalizers (wave 3, another owner).
+`just suite ours each` on the `wave3-gc` branch, 2026-10-30: wave 2's VM
+and libraries, debug hooks, and the collector (`gc.md`). All 30 pass, and
+so does `all.lua` with `_U=true` ("final OK !!!"), also with the
+collector stressed (`zig build -Dgc-stress=step` and `=full`, in both
+modes).
 `heavy.lua`, `bwcoercion.lua`, and `tracegc.lua` are not in the list:
 all.lua does not run the first, and the other two are modules the files
 load.
 
-| File             | ref | ours  | Notes                                                           |
-| ---------------- | --- | ----- | --------------------------------------------------------------- |
-| `main.lua`       | ok  | ok    | returns at once (`_port`); without `_port`, see below           |
-| `gc.lua`         | ok  | FAIL  | line 249: the collector                                         |
-| `db.lua`         | ok  | hangs | line 926 waits for a `__gc`; with that case cut, it passes      |
-| `calls.lua`      | ok  | ok    |                                                                 |
-| `strings.lua`    | ok  | ok    |                                                                 |
-| `literals.lua`   | ok  | ok    |                                                                 |
-| `tpack.lua`      | ok  | ok    |                                                                 |
-| `attrib.lua`     | ok  | ok    |                                                                 |
-| `gengc.lua`      | ok  | FAIL  | line 122: the collector                                         |
-| `locals.lua`     | ok  | ok    |                                                                 |
-| `constructs.lua` | ok  | ok    |                                                                 |
-| `code.lua`       | ok  | ok    | returns at once (no `T`)                                        |
-| `big.lua`        | ok  | ok    | returns at once (`_soft`)                                       |
-| `cstack.lua`     | ok  | ok    |                                                                 |
-| `nextvar.lua`    | ok  | ok    |                                                                 |
-| `pm.lua`         | ok  | ok    |                                                                 |
-| `utf8.lua`       | ok  | ok    |                                                                 |
-| `api.lua`        | ok  | ok    | returns at once (no `T`)                                        |
-| `memerr.lua`     | ok  | ok    | returns at once (no `T`)                                        |
-| `events.lua`     | ok  | ok    |                                                                 |
-| `vararg.lua`     | ok  | ok    |                                                                 |
-| `closure.lua`    | ok  | hangs | line 38 waits for a weak table to be collected                  |
-| `coroutine.lua`  | ok  | FAIL  | line 478: a weak table; with that line cut, it passes           |
-| `goto.lua`       | ok  | ok    |                                                                 |
-| `errors.lua`     | ok  | ok    |                                                                 |
-| `math.lua`       | ok  | ok    |                                                                 |
-| `sort.lua`       | ok  | ok    |                                                                 |
-| `bitwise.lua`    | ok  | ok    |                                                                 |
-| `verybig.lua`    | ok  | ok    |                                                                 |
-| `files.lua`      | ok  | FAIL  | line 110: too many open files, since `__gc` does not close them |
+| File             | ref | ours | Notes                                                 |
+| ---------------- | --- | ---- | ----------------------------------------------------- |
+| `main.lua`       | ok  | ok   | returns at once (`_port`); without `_port`, see below |
+| `gc.lua`         | ok  | ok   | the `T` (C test library) cases skip                   |
+| `db.lua`         | ok  | ok   |                                                       |
+| `calls.lua`      | ok  | ok   |                                                       |
+| `strings.lua`    | ok  | ok   |                                                       |
+| `literals.lua`   | ok  | ok   |                                                       |
+| `tpack.lua`      | ok  | ok   |                                                       |
+| `attrib.lua`     | ok  | ok   |                                                       |
+| `gengc.lua`      | ok  | ok   | returns at line 130 without `T`                       |
+| `locals.lua`     | ok  | ok   |                                                       |
+| `constructs.lua` | ok  | ok   |                                                       |
+| `code.lua`       | ok  | ok   | returns at once (no `T`)                              |
+| `big.lua`        | ok  | ok   | returns at once (`_soft`)                             |
+| `cstack.lua`     | ok  | ok   |                                                       |
+| `nextvar.lua`    | ok  | ok   |                                                       |
+| `pm.lua`         | ok  | ok   |                                                       |
+| `utf8.lua`       | ok  | ok   |                                                       |
+| `api.lua`        | ok  | ok   | returns at once (no `T`)                              |
+| `memerr.lua`     | ok  | ok   | returns at once (no `T`)                              |
+| `events.lua`     | ok  | ok   |                                                       |
+| `vararg.lua`     | ok  | ok   |                                                       |
+| `closure.lua`    | ok  | ok   |                                                       |
+| `coroutine.lua`  | ok  | ok   |                                                       |
+| `goto.lua`       | ok  | ok   |                                                       |
+| `errors.lua`     | ok  | ok   |                                                       |
+| `math.lua`       | ok  | ok   |                                                       |
+| `sort.lua`       | ok  | ok   |                                                       |
+| `bitwise.lua`    | ok  | ok   |                                                       |
+| `verybig.lua`    | ok  | ok   |                                                       |
+| `files.lua`      | ok  | ok   |                                                       |
 
 Under `_U`, five files return at once: `main.lua` (`_port`), `big.lua`
 (`_soft`), and `api.lua`, `code.lua`, and `memerr.lua` (`T`, the C test
