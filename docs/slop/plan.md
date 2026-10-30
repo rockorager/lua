@@ -58,7 +58,12 @@ reference.
    Metamethods called from an instruction (`__index` functions, arithmetic,
    `__eq`, `__lt`, `__concat`, `__close`) push a frame and record how to finish
    the instruction when it returns, as PUC-Rio's `luaV_finishOp` does. That
-   keeps them yieldable and off the Zig stack.
+   keeps them yieldable and off the Zig stack. Landed in wave 3: `CALL` and
+   `TFORCALL` call a native function directly (`results/vm-native-calls-20261030.md`),
+   and `RETURN0`/`RETURN1` take the caller's frame as the one below without
+   reloading the frame list (`results/vm-returns-20261030.md`, fib −10%).
+   Setting the callee's `cl`/`k` in `CALL` instead of going through
+   `newframe` was slower: they become loop-wide variables and spill.
 5. **Errors.** A Lua error is the Zig error `error.LuaError`, with the error
    object held in the thread. It unwinds through Zig with ordinary error
    returns and stops at the nearest protected boundary (`pcall`, `xpcall`,
@@ -77,8 +82,18 @@ reference.
 7. **Strings.** Short strings (40 bytes or fewer) are interned in a hash set
    owned by the `State`, so equality is pointer equality. Long strings are not
    interned and hash lazily. A string is one allocation: header, hash, length,
-   bytes, and a trailing zero. 5.5's external strings (bytes the collector does
-   not own) come later.
+   bytes, and a trailing zero. Landed in wave 3: PUC-Rio's `TString` layout,
+   32 bytes (a short length byte, and a union of a long string's length and a
+   short string's intern link); `State.Options.strings` gives strings their
+   own allocator, and the `lua` executable passes `SmallAllocator` (classes 8
+   bytes apart up to 128). A general size-class allocator for every object was
+   measured and rejected: closures, prototypes, and short arrays off 32-byte
+   boundaries cost call-heavy programs 20–30%. A long `auxlib.Buffer` result
+   becomes its string in place, as 5.5's `luaL_pushresult` does with an
+   external string (`results/strings-20261030.md`,
+   `results/buffer-strings-20261030.md`, `results/allocator-20261030.md`).
+   5.5's external strings as an API (bytes the collector does not own) come
+   later.
 8. **Tables.** An array part and a hash part. The array part uses 5.5's
    compact layout: payloads and tags in separate runs, 9 bytes per slot instead
    of 16. The hash part starts as PUC-Rio's chained scatter table with Brent's
@@ -152,6 +167,14 @@ reference.
   answer (`GETTABUP` with a constant string key: measure an inline cache).
 - Integer and float fast paths first in every arithmetic opcode; metamethods
   and coercions on the slow branch, out of line.
+- Slow paths take operands as `*const Value` and carry `@branchHint(.cold)`.
+  Zig passes a 16-byte `Value` to a noinline function by reference, so a
+  by-value argument makes the fast path copy the operand to a stack temporary,
+  and a 16-byte load of a value just written by two narrow stores stalls on
+  store forwarding. Copy values field by field (`put`, `setv`).
+  (`results/vm-operands-20261030.md`, `vm-copies`, `vm-registers`.)
+- The interpreter loop's register allocation shifts other programs by ±5%
+  with any edit; judge a change only by a full 10-round A/B.
 - `ReleaseFast` builds are the ones measured. `ReleaseSafe` runs the suite too.
 
 ## Testing
@@ -170,7 +193,8 @@ reference.
 mandelbrot), strings (concatenation, `string.format`, `gsub`), closures and
 upvalues, method calls through metatables, and coroutines. `just bench-compare`
 runs each on our binary and on reference Lua 5.5.1, interleaved and pinned to
-one core, and prints benchstat input.
+one core, and prints benchstat input: wall time, and each process's peak RSS
+(GNU time's `%M`) as the `peak-RSS-KiB` unit. Memory is a gate like time.
 
 ## Order of work
 
