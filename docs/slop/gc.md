@@ -53,6 +53,12 @@ Numbers are in `results/gc-wave3-20261030.md`.
   run a minor collection inside its `pairs` loop, so a table aged before
   it died and waited for the next pass: 9.0 MB peak RSS against the
   reference's 8.5 MB, 6.0 MB with the check.
+- `table.concat` checks the collector after each piece, standing in for
+  the checks the reference's `luaL_Buffer` makes each time it grows (its
+  box is a userdata). Without it `table_concat`'s one check at return
+  left generational mode in major collections (its live bytes landed
+  0.1% under the minor/major limit), and peak RSS went from 22 MB to
+  63 MB; with it, 43.6 MB against the reference's 40.5 MB.
 - A step can run finalizers, so the VM reloads its frame pointer and
   `base` after one.
 - `Heap.debt()` is lgc.c's `GCdebt` as `threshold - bytes`; the check in

@@ -168,6 +168,10 @@ fn concat(th: *Thread, base: u32) Error!u32 {
     while (i < last) : (i += 1) {
         try addField(th, w, t, i);
         w.writeAll(sep) catch return error.OutOfMemory;
+        // The reference's buffer checks the collector each time it grows;
+        // the table and the separator are on the stack, the buffer is not
+        // an object.
+        _ = th.state.checkGc(th);
     }
     if (i == last) try addField(th, w, t, i);
     try th.ensureStack(1);
