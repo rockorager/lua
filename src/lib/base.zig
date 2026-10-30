@@ -16,6 +16,7 @@ const Table = @import("../Table.zig");
 const State = @import("../State.zig");
 const Thread = @import("../Thread.zig");
 const Parser = @import("../Parser.zig");
+const undump = @import("../undump.zig");
 const vm = @import("../vm.zig");
 const gc = @import("../gc.zig");
 const number = @import("../number.zig");
@@ -349,16 +350,16 @@ inline fn ret1(th: *Thread, v: Value) u32 {
 // Loading chunks
 // ---------------------------------------------------------------------------
 
-/// Compiles a chunk into a function whose `_ENV` is the globals table,
-/// `lua_load`. `mode` holds 'b' and/or 't'. Raises the syntax error.
+/// Compiles a chunk, or loads a binary one, into a function whose first
+/// upvalue is the globals table and whose others are nil, `lua_load`.
+/// `mode` holds 'b' and/or 't'. Raises the syntax or format error.
 pub fn loadChunk(th: *Thread, src: [:0]const u8, chunkname: []const u8, mode: []const u8) Error!Value {
     const binary = src.len > 0 and src[0] == 0x1b;
     if (binary and std.mem.findScalar(u8, mode, 'b') == null)
         return throwFmt(th, "attempt to load a binary chunk (mode is '{s}')", .{mode});
     if (!binary and std.mem.findScalar(u8, mode, 't') == null)
         return throwFmt(th, "attempt to load a text chunk (mode is '{s}')", .{mode});
-    if (binary) return throwFmt(th, "{s}: bad binary format (binary chunks are not supported yet)", .{chunkname});
-    const p = try Parser.compile(th, src, chunkname);
+    const p = if (binary) try undump.undump(th, src, chunkname) else try Parser.compile(th, src, chunkname);
     return .luaClosure(try vm.mainClosure(th.state, p));
 }
 

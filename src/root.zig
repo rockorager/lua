@@ -16,6 +16,9 @@ pub const opcodes = @import("opcodes.zig");
 pub const vm = @import("vm.zig");
 pub const Parser = @import("Parser.zig");
 pub const Code = @import("Code.zig");
+/// `string.dump`'s binary chunks: writing and loading them.
+pub const dump = @import("dump.zig");
+pub const undump = @import("undump.zig");
 /// The standard libraries; `lib.openLibs` opens them.
 pub const lib = @import("lib/init.zig");
 

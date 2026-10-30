@@ -21,6 +21,7 @@ const libm = @import("libm.zig");
 const pattern = @import("pattern.zig");
 const fmt_engine = @import("format.zig");
 const pack_engine = @import("pack.zig");
+const dump_engine = @import("../dump.zig");
 
 const Error = Value.Error;
 const Args = auxlib.Args;
@@ -201,11 +202,19 @@ fn char(th: *Thread, base: u32) Error!u32 {
     return 1;
 }
 
-/// `string.dump` needs the bytecode dumper, which does not exist yet.
+/// `string.dump`: the function's prototype as a binary chunk
+/// (`dump_engine`), without debug information when `strip` is true.
 fn dump(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "dump");
-    if (a.get(1).tag != .lua_closure) return a.argError(1, "Lua function expected", .{});
-    return raise(th, "unable to dump given function", .{});
+    const f = a.get(1);
+    if (f.tag != .lua_closure) return a.argError(1, "Lua function expected", .{});
+    var b: auxlib.Buffer = undefined;
+    b.init(th.state);
+    defer b.deinit();
+    dump_engine.dump(th.heap().allocator(), &b.writer, f.asLuaClosure().proto, !a.get(2).isFalsy()) catch
+        return error.OutOfMemory;
+    th.push(.string(try b.toString(th.state)));
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

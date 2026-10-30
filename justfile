@@ -89,6 +89,45 @@ bytecode *FILES:
         exit 1
     fi
 
+[doc("Compare string.dump with the reference luac: for every suite and bench file, or only FILES, our dump of our compile must equal `luac -o` (and `luac -s -o` with strip), and luac's chunks must load on ours and dump back unchanged")]
+[group("test")]
+dump *FILES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    zig build -Doptimize=ReleaseSafe
+    ours=$PWD/zig-out/bin/lua
+    files=({{ FILES }})
+    if [ ${#files[@]} -eq 0 ]; then
+        files=(test/lua-5.5.1-tests/*.lua bench/*.lua)
+    fi
+    out=zig-out/dump
+    rm -rf "$out" && mkdir -p "$out"
+    # dump.lua FILE OUT STRIP MODE: dump loadfile(FILE, MODE) to OUT.
+    script=$out/dump.lua
+    echo 'local f = assert(loadfile(arg[1], arg[4])) local o = assert(io.open(arg[2], "wb")) o:write(string.dump(f, arg[3] == "s")) o:close()' > "$script"
+    same=0
+    differ=()
+    for f in "${files[@]}"; do
+        base=$out/$(echo "$f" | tr / _)
+        for strip in n s; do
+            flag=
+            [ $strip = s ] && flag=-s
+            luac $flag -o "$base.$strip.luac" "$f"
+            "$ours" "$script" "$f" "$base.$strip.ours" $strip t
+            "$ours" "$script" "$base.$strip.luac" "$base.$strip.back" $strip b
+            if cmp "$base.$strip.luac" "$base.$strip.ours" && cmp "$base.$strip.luac" "$base.$strip.back"; then
+                same=$((same + 1))
+            else
+                differ+=("$f ($strip)")
+            fi
+        done
+    done
+    echo "$same of $(( ${#files[@]} * 2 )) dumps are luac's, plain and stripped, both ways"
+    if [ ${#differ[@]} -ne 0 ]; then
+        printf 'differs: %s\n' "${differ[@]}"
+        exit 1
+    fi
+
 [doc("Differential tests: every test/diff/*.lua, or only FILES, on our zig-out/bin/lua and the reference lua; stdout, stderr, and exit status must match, with addresses masked")]
 [group("test")]
 diff *FILES:
