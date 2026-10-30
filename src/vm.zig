@@ -319,7 +319,8 @@ inline fn pushLuaFrame(th: *Thread, func: u32, p: *const Proto, nresults: i16) E
 
 noinline fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn) Error!void {
     try th.ensureStack(Thread.min_stack);
-    try th.frames.append(th.heap().allocator(), .{
+    if (th.frames.items.len == th.frames.capacity) try th.frames.ensureUnusedCapacity(th.heap().allocator(), 1);
+    th.frames.appendAssumeCapacity(.{
         .func = func,
         .top = th.top + Thread.min_stack,
         .nresults = nresults,
@@ -1550,9 +1551,13 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     ci = th.frame();
                     continue :newframe;
                 }
-                const lua = try preCall(th, func, nres);
+                if (callee.tag == .native_fn) {
+                    try callNative(th, func, nres, callee.asNative());
+                } else if (try preCall(th, func, nres)) {
+                    ci = th.frame();
+                    continue :newframe;
+                }
                 ci = th.frame();
-                if (lua) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1682,9 +1687,14 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const func = ci.base() + a + 3;
                 th.top = func + 3;
                 ci.pc = pc;
-                const lua = try preCall(th, func, @intCast(getC(i)));
+                const callee = th.stack[func];
+                if (callee.tag == .native_fn) {
+                    try callNative(th, func, @intCast(getC(i)), callee.asNative());
+                } else if (try preCall(th, func, @intCast(getC(i)))) {
+                    ci = th.frame();
+                    continue :newframe;
+                }
                 ci = th.frame();
-                if (lua) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -2219,7 +2229,7 @@ inline fn toStringBuf(v: Value, buf: *[number.max_len]u8) []const u8 {
 /// `t[key]` with `__index` (`lua_gettable`).
 pub inline fn get(th: *Thread, t: Value, key: Value) Error!Value {
     if (t.tag == .table) {
-        const v = t.asTable().get(key);
+        const v = if (key.tag == .int) t.asTable().getInt(key.payload.int) else t.asTable().get(key);
         if (!v.isNil() or th.state.fastTm(t.asTable().metatable, .index) == null) return v;
     }
     return getNative(th, t, key);
