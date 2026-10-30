@@ -24,3 +24,7 @@ test {
     _ = @import("number.zig");
     _ = @import("lib/pattern.zig");
 }
+
+test {
+    _ = @import("lib/format.zig");
+}
