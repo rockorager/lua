@@ -1,7 +1,7 @@
 # lua: Lua 5.5 in Zig, with no C. `just --list` shows the recipes.
 # AGENTS.md holds the working conventions.
 
-markdown := "README.md AGENTS.md CHANGELOG.md THIRD_PARTY.md .github"
+markdown := "README.md AGENTS.md CHANGELOG.md THIRD_PARTY.md docs/slop .github"
 
 [private]
 default:
