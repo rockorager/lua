@@ -34,6 +34,8 @@ const Thread = @import("Thread.zig");
 const State = @import("State.zig");
 const opcodes = @import("opcodes.zig");
 const number = @import("number.zig");
+// The reference's `pow`, so results match it bit for bit.
+const libm = @import("lib/libm.zig");
 const debuginfo = @import("debuginfo.zig");
 
 const Error = Value.Error;
@@ -104,14 +106,26 @@ pub fn pcall(th: *Thread, func: u32, nresults: i16) bool {
 /// a memory error) is passed to the handler before the stack unwinds, and
 /// the handler's result becomes the error object.
 pub fn pcallMsgh(th: *Thread, func: u32, nresults: i16, msgh: u32) bool {
+    // `closeSelf` refuses to unwind past this call, which cannot pass the
+    // unwinding on, so nothing else gets through.
+    th.npcall += 1;
+    defer th.npcall -= 1;
+    return protectedCall(th, func, nresults, msgh) catch false;
+}
+
+/// `pcallMsgh`, except that the unwinding `closeSelf` starts passes
+/// through as `error.LuaError`.
+fn protectedCall(th: *Thread, func: u32, nresults: i16, msgh: u32) Error!bool {
     const frames = th.frames.items.len;
     const old_errfunc = th.errfunc;
     th.errfunc = msgh;
     defer th.errfunc = old_errfunc;
     call(th, func, nresults) catch |e| {
+        if (th.closed_self) return e;
         const err = errorObject(th, e);
         th.frames.items.len = frames;
         th.stack[func] = closeProtected(th, func, err) orelse err;
+        if (th.closed_self) return error.LuaError;
         th.top = func + 1;
         th.shrinkStack();
         return false;
@@ -127,7 +141,7 @@ pub fn pcallMsgh(th: *Thread, func: u32, nresults: i16, msgh: u32) bool {
 /// later, and calls `k` with `ctx` and status `.yield` (success) or `.err`
 /// (the error object on top) in place of the rest of the native.
 pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn) Error!bool {
-    if (th.nny > 0) return pcallMsgh(th, func, nresults, msgh);
+    if (th.nny > 0) return protectedCall(th, func, nresults, msgh);
     const idx = th.frames.items.len - 1;
     {
         const f = &th.frames.items[idx];
@@ -233,6 +247,7 @@ noinline fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
         switch (f.tag) {
             .lua_closure => {
                 try pushLuaFrame(th, func, f.asLuaClosure().proto, nresults);
+                if (chain > 0) th.frame().ncallmt = @intCast(chain);
                 return true;
             },
             .native_fn => {
@@ -488,7 +503,7 @@ fn finishNative(th: *Thread) Error!void {
 /// error object at the call's function slot.
 fn finishPcallk(th: *Thread, idx: usize) Error!KStatus {
     var status: KStatus = .yield;
-    if (th.frames.items[idx].recover) {
+    if (th.frames.items[idx].flags.recover) {
         const func = th.frames.items[idx].aux;
         // The error object is on top, where `recoverAt` put it and where
         // each `__close` call leaves it.
@@ -496,7 +511,7 @@ fn finishPcallk(th: *Thread, idx: usize) Error!KStatus {
         th.stack[func] = th.stack[th.top - 1];
         th.top = func + 1;
         th.shrinkStack();
-        th.frames.items[idx].recover = false;
+        th.frames.items[idx].flags.recover = false;
         status = .err;
     }
     const f = &th.frames.items[idx];
@@ -523,7 +538,7 @@ fn recoverAt(th: *Thread, level: usize, err: Value) void {
     th.frames.items.len = level + 1;
     th.top = top;
     th.push(err);
-    th.frames.items[level].recover = true;
+    th.frames.items[level].flags.recover = true;
 }
 
 /// Closes coroutine `co`: unwinds its frames, closes its pending
@@ -536,6 +551,9 @@ pub fn closeThread(co: *Thread, from: ?*Thread) bool {
     const err: ?Value = if (co.status == .dead) co.stack[co.top - 1] else null;
     co.resetFrames();
     const result = closeProtected(co, 1, err);
+    // Closing from inside a handler ended this close too, unless this is
+    // that inner close itself.
+    if (from != co) co.closed_self = false;
     if (result) |e| {
         co.stack[1] = e;
         co.top = 2;
@@ -549,9 +567,9 @@ pub fn closeThread(co: *Thread, from: ?*Thread) bool {
 /// `coroutine.close` on the running coroutine: closes it and ends the
 /// resume that runs it, which returns what closing it returned.
 pub fn closeSelf(th: *Thread) Error {
-    // Unwinding to the resume skips Zig frames; only yieldable ones may
-    // be skipped.
-    if (th.nny > 0) return th.runError("attempt to yield across a C-call boundary", .{});
+    // The error unwinds to the resume or the outer close
+    // (`luaD_throwbaselevel`); a `pcallMsgh` on the way cannot pass it on.
+    if (th.npcall > 0) return th.runError("attempt to yield across a C-call boundary", .{});
     _ = closeThread(th, th);
     th.closed_self = true;
     return error.LuaError;
@@ -621,6 +639,8 @@ fn closeProtected(th: *Thread, level: u32, err_in: ?Value) ?Value {
     while (true) {
         const mode: CloseMode = if (err) |e| .{ .err = e } else .normal;
         closeLevel(th, level, mode, false) catch |e| {
+            // `closeSelf` from a handler closed the rest and left its result.
+            if (th.closed_self) return if (th.top == 2) th.stack[1] else null;
             err = errorObject(th, e);
             th.frames.items.len = frames;
             continue;
@@ -747,7 +767,8 @@ fn execute(th: *Thread) Error!void {
                     }
                 }
                 ci.pc = pc;
-                const done = try getSlow(th, .vm, ci, t, .int(getC(i)), .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                const origin: Origin = .{ .slot = ci.base() + getB(i) };
+                const done = try getSlow(th, .vm, ci, t, .int(getC(i)), origin, ci.base() + getA(i));
                 ci = th.frame();
                 if (!done) continue :newframe;
                 base = th.stack.ptr + ci.base();
@@ -990,14 +1011,16 @@ fn execute(th: *Thread) Error!void {
                         base[getA(i)] = .int(@bitCast(rb.asTable().length()));
                     } else {
                         ci.pc = pc;
-                        const done = try lenSlow(th, .vm, ci, rb, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                        const origin: Origin = .{ .slot = ci.base() + getB(i) };
+                        const done = try lenSlow(th, .vm, ci, rb, origin, ci.base() + getA(i));
                         ci = th.frame();
                         if (!done) continue :newframe;
                         base = th.stack.ptr + ci.base();
                     },
                     else => {
                         ci.pc = pc;
-                        const done = try lenSlow(th, .vm, ci, rb, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                        const origin: Origin = .{ .slot = ci.base() + getB(i) };
+                        const done = try lenSlow(th, .vm, ci, rb, origin, ci.base() + getA(i));
                         ci = th.frame();
                         if (!done) continue :newframe;
                         base = th.stack.ptr + ci.base();
@@ -1171,6 +1194,7 @@ fn execute(th: *Thread) Error!void {
                     ci.top = dest + 1 + fsize;
                     ci.pc = p.code.ptr;
                     ci.extra_args = 0;
+                    ci.ncallmt = @intCast(chain);
                     ci.flags.tail = true;
                     continue :newframe;
                 }
@@ -1419,7 +1443,16 @@ const Caller = enum { vm, native };
 /// Calls metamethod `f` with two or three arguments for `nresults` (0 or 1)
 /// results; see above for `caller`. `ci` is the running Lua frame for
 /// `.vm`.
-inline fn callTm(th: *Thread, comptime caller: Caller, ci: *Frame, f: Value, a1: Value, a2: Value, a3: ?Value, nresults: i16) Error!?Value {
+inline fn callTm(
+    th: *Thread,
+    comptime caller: Caller,
+    ci: *Frame,
+    f: Value,
+    a1: Value,
+    a2: Value,
+    a3: ?Value,
+    nresults: i16,
+) Error!?Value {
     if (caller == .vm) th.top = ci.top else try th.ensureStack(4);
     const func = th.top;
     th.push(f);
@@ -1442,7 +1475,15 @@ inline fn callTm(th: *Thread, comptime caller: Caller, ci: *Frame, f: Value, a1:
 /// `t[key]` with `__index` (`luaV_finishget`) into stack slot `dest`.
 /// False when a Lua metamethod frame was pushed. `origin` names `t` in a
 /// type error.
-noinline fn getSlow(th: *Thread, comptime caller: Caller, ci: *Frame, t_in: Value, key: Value, origin: Origin, dest: u32) Error!bool {
+noinline fn getSlow(
+    th: *Thread,
+    comptime caller: Caller,
+    ci: *Frame,
+    t_in: Value,
+    key: Value,
+    origin: Origin,
+    dest: u32,
+) Error!bool {
     var t = t_in;
     var org = origin;
     for (0..max_tag_loop) |_| {
@@ -1473,7 +1514,15 @@ noinline fn getSlow(th: *Thread, comptime caller: Caller, ci: *Frame, t_in: Valu
 
 /// `t[key] = v` with `__newindex` (`luaV_finishset`). False when a Lua
 /// metamethod frame was pushed.
-noinline fn setSlow(th: *Thread, comptime caller: Caller, ci: *Frame, t_in: Value, key: Value, v: Value, origin: Origin) Error!bool {
+noinline fn setSlow(
+    th: *Thread,
+    comptime caller: Caller,
+    ci: *Frame,
+    t_in: Value,
+    key: Value,
+    v: Value,
+    origin: Origin,
+) Error!bool {
     var t = t_in;
     var org = origin;
     for (0..max_tag_loop) |_| {
@@ -1512,7 +1561,17 @@ fn setError(th: *Thread, e: Table.SetError) Error {
 /// A binary or unary metamethod for `event` over `a` and `b` into stack
 /// slot `dest`, or the error the manual gives when neither operand has one
 /// (`luaT_trybinTM`). False when a Lua metamethod frame was pushed.
-noinline fn arithSlow(th: *Thread, comptime caller: Caller, ci: *Frame, a: Value, b: Value, event: Tm, oa: Origin, ob: Origin, dest: u32) Error!bool {
+noinline fn arithSlow(
+    th: *Thread,
+    comptime caller: Caller,
+    ci: *Frame,
+    a: Value,
+    b: Value,
+    event: Tm,
+    oa: Origin,
+    ob: Origin,
+    dest: u32,
+) Error!bool {
     const h = th.state.tmOf(a, event) orelse th.state.tmOf(b, event) orelse {
         switch (event) {
             .band, .bor, .bxor, .shl, .shr, .bnot => {
@@ -1838,6 +1897,17 @@ pub fn toInteger(v: Value) ?i64 {
     return toIntStrict(toNumber(v) orelse return null);
 }
 
+/// A string as is, or a number converted to one, else null
+/// (`lua_tolstring` without the conversion in place).
+pub fn toLString(state: *State, v: Value) error{OutOfMemory}!?*String {
+    if (v.isString()) return v.asString();
+    if (v.isNumber()) {
+        const converted = try numberToString(state, v);
+        return converted;
+    }
+    return null;
+}
+
 /// A number as `tostring` writes it, into `buf` (`luaO_tostringbuff`).
 pub fn formatNumber(v: Value, buf: *[number.max_len]u8) []const u8 {
     return if (v.tag == .int) number.formatInt(buf, v.payload.int) else number.formatFloat(buf, v.asFloat());
@@ -2024,7 +2094,7 @@ inline fn floatArith(a: ArithOp, x: f64, y: f64) f64 {
         .sub => x - y,
         .mul => x * y,
         .div => x / y,
-        .pow => if (y == 2) x * x else std.math.pow(f64, x, y),
+        .pow => if (y == 2) x * x else libm.pow(x, y),
         .idiv => number.divFloorFloat(x, y),
         .mod => number.modFloat(x, y),
         else => unreachable,

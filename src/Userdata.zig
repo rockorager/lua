@@ -51,5 +51,5 @@ pub inline fn setUserValue(u: *Userdata, heap: *gc.Heap, i: usize, v: Value) voi
 /// The raw memory.
 pub inline fn bytes(u: *Userdata) []align(16) u8 {
     const p: [*]align(16) u8 = @ptrCast(@alignCast(u));
-    return (p + bytesOffset(u.nuvalue))[0..u.len];
+    return @alignCast((p + bytesOffset(u.nuvalue))[0..u.len]);
 }

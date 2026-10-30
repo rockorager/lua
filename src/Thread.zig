@@ -46,8 +46,11 @@ native_calls: u16 = 0,
 nny: u16 = 0,
 /// Stack index of the running protected call's message handler, or 0.
 errfunc: u32 = 0,
-/// Set by `vm.closeSelf` while the error it raises unwinds to the resume.
+/// Set by `vm.closeSelf` while the error it raises unwinds to the resume
+/// or the `coroutine.close` that runs this thread.
 closed_self: bool = false,
+/// `vm.pcallMsgh` calls in progress, which catch every error.
+npcall: u16 = 0,
 
 pub const Status = enum(u8) { ok, yield, dead };
 
@@ -81,9 +84,9 @@ pub const Frame = struct {
     /// Results the caller wants, or -1 for all of them.
     nresults: i16,
     flags: Flags,
-    /// Native frames in a yieldable protected call: set when a resume
-    /// unwound an error to this frame, so its continuation sees it.
-    recover: bool = false,
+    /// `__call` handlers the call went through, each adding the called
+    /// value as an extra first argument (`debug.getinfo`'s `extraargs`).
+    ncallmt: u8 = 0,
     /// Lua vararg frames: how many extra arguments sit below `func`.
     /// Native frames: the continuation's context.
     extra_args: u32 = 0,
@@ -110,7 +113,10 @@ pub const Frame = struct {
         has_k: bool = false,
         /// Reused by a tail call.
         tail: bool = false,
-        _: u2 = 0,
+        /// Native frames in a yieldable protected call: set when a resume
+        /// unwound an error to this frame, so its continuation sees it.
+        recover: bool = false,
+        _: u1 = 0,
     };
 
     pub inline fn base(f: *const Frame) u32 {
@@ -210,7 +216,8 @@ pub fn shrinkStack(th: *Thread) void {
     const max: usize = if (inuse > max_stack / 3) max_stack else inuse * 3;
     if (inuse <= max_stack and size > max) {
         const new_size: usize = if (inuse > max_stack / 2) max_stack else inuse * 2;
-        th.reallocStack(new_size + extra_stack) catch {};
+        // Shrinking is an optimization; keep the larger stack if it fails.
+        th.reallocStack(new_size + extra_stack) catch return;
     }
 }
 
@@ -328,7 +335,7 @@ pub fn writeChunkId(w: *std.Io.Writer, source: []const u8) std.Io.Writer.Error!v
         const line_end = std.mem.findScalar(u8, source, '\n') orelse source.len;
         const room = id_size - "[string \"...\"]".len - 1;
         try w.writeAll("[string \"");
-        if (line_end < source.len or source.len > room) {
+        if (line_end < source.len or source.len >= room) {
             try w.writeAll(source[0..@min(line_end, room)]);
             try w.writeAll("...");
         } else {
