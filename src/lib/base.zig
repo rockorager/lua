@@ -604,10 +604,24 @@ fn next(th: *Thread, base: u32) Error!u32 {
     return ret1(th, .nil);
 }
 
+/// After `__pairs` returns, even when it yielded: its four results are on
+/// top.
+fn pairsCont(th: *Thread, base: u32, status: Value.KStatus, ctx: u32) Error!u32 {
+    _ = th;
+    _ = base;
+    _ = status;
+    _ = ctx;
+    return 4;
+}
+
 fn pairs(th: *Thread, base: u32) Error!u32 {
     const v = try checkAny(th, base, 1, "pairs");
     if (getMetafield(th, v, "__pairs")) |h| {
-        _ = try callValue(th, h, &.{v}, 4);
+        try th.ensureStack(2);
+        const func = th.top;
+        th.push(h);
+        th.push(v);
+        try vm.callk(th, func, 4, 0, &pairsCont);
         return 4;
     }
     th.push(.native(&next));
@@ -714,8 +728,15 @@ fn dofile(th: *Thread, base: u32) Error!u32 {
     const f = try loadFile(th, if (fname) |s| s.bytes() else null, "bt");
     const func = th.top;
     th.push(f);
-    try vm.call(th, func, -1);
+    try vm.callk(th, func, -1, func - base, &dofileCont);
     return th.top - func;
+}
+
+/// After the chunk returns, even when it yielded: its results are above
+/// the slot `ctx` past `base`.
+fn dofileCont(th: *Thread, base: u32, status: Value.KStatus, ctx: u32) Error!u32 {
+    _ = status;
+    return th.top - (base + ctx);
 }
 
 fn assert(th: *Thread, base: u32) Error!u32 {

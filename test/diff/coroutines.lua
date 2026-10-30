@@ -173,3 +173,16 @@ co = coroutine.wrap(function() local r = obj2.foo; return r end)
 print(co()) print(co("FOO"))
 co = coroutine.wrap(function() local r = {} r[1] = obj.foo; return r[1] end)
 print(co()) print(co("FOO"))
+
+-- yields inside __pairs and dofile
+local pt = setmetatable({10, 20, 30}, {__pairs = function(t)
+  local inc = coroutine.yield("in __pairs")
+  return function(t, i) if i > 1 then return i - inc, t[i - inc] end end, t, #t + 1
+end})
+local pco = coroutine.wrap(function() local r = {} for _, v in pairs(pt) do r[#r + 1] = v end return table.concat(r, ",") end)
+print(pco()) print(pco(1))
+local fname = os.tmpname()
+local fh = io.open(fname, "w") fh:write("local a = coroutine.yield('in dofile') return a, a * 2") fh:close()
+local dco = coroutine.wrap(function() return dofile(fname) end)
+print(dco()) print(dco(21))
+os.remove(fname)
