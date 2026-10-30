@@ -33,10 +33,15 @@
               # for benchmarks.
               lua5_5
               # `just bench-compare` (bench/README.md): nixpkgs' goperf is
-              # golang.org/x/perf, which supplies benchstat, and util-linux
-              # supplies taskset, which pins every run to one core.
+              # golang.org/x/perf, which supplies benchstat, util-linux
+              # supplies taskset, which pins every run to one core, and GNU
+              # time reports each run's peak RSS.
               goperf
               util-linux
+              time
+              # Profiling the interpreter: `perf record` and `perf annotate`
+              # on a ReleaseFast build.
+              perf
             ];
           };
         };

@@ -37,7 +37,7 @@ Until `build.zig` installs `zig-out/bin/lua`, `just bench-compare` says so and t
 
 ## Method
 
-`just bench-compare [ROUNDS] [PROGRAMS...]` (default 10 rounds of every program) builds our arm, then runs ROUNDS rounds. A round runs each program on each arm once, in an arm order that rotates each round, so drift on the machine lands on every arm alike. Every run is pinned with `taskset` to the last core. A row is one run's wall time, from process start to exit, so it includes startup, a millisecond or so on both arms.
+`just bench-compare [ROUNDS] [PROGRAMS...]` (default 10 rounds of every program) builds our arm, then runs ROUNDS rounds. A round runs each program on each arm once, in an arm order that rotates each round, so drift on the machine lands on every arm alike. Every run is pinned with `taskset` to the last core. A row is one run's wall time, from process start to exit, so it includes startup, a millisecond or so on both arms, and its peak resident memory (`ru_maxrss`, read with GNU time's `%M`) in KiB. benchstat compares both, as `sec/op` and `peak-RSS-KiB`: memory is held to the same bar as time.
 
 Every run's output must match the reference's first run. A program whose output differs on an arm, or that exits with an error, loses that arm's rows, the differences are printed, and the recipe fails after the table. `benchstat` then compares the arms with the reference as the base. Everything lands in `zig-out/bench-compare/`: each run's output in `stdout/`, the raw rows, the per-arm benchstat input, and `benchstat.txt`.
 

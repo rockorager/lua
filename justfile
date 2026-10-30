@@ -163,7 +163,7 @@ diff *FILES:
     done
     [ ${#failed[@]} -eq 0 ]
 
-[doc("Time every bench/ program, or only PROGRAMS, on our zig-out/bin/lua (ReleaseFast) and the reference lua: interleaved rounds on one core, checksums checked, then benchstat. The numbers are not claims")]
+[doc("Time every bench/ program, or only PROGRAMS, on our zig-out/bin/lua (ReleaseFast) and the reference lua: interleaved rounds on one core, wall time and peak RSS per run, checksums checked, then benchstat. The numbers are not claims")]
 [group("bench")]
 bench-compare ROUNDS="10" *PROGRAMS:
     #!/usr/bin/env bash
@@ -194,7 +194,10 @@ bench-compare ROUNDS="10" *PROGRAMS:
     done
     # The last core, and one run of each arm at a time in an order that
     # rotates each round, so drift on the machine lands on every arm alike.
-    # A row is one whole process, start to exit, in wall time.
+    # A row is one whole process, start to exit: its wall time, and its
+    # peak RSS (getrusage's ru_maxrss, through GNU time's %M) as a second
+    # benchstat unit.
+    gnutime=$(type -P time)
     core=$(( $(nproc) - 1 ))
     n=${#arms[@]}
     for round in $(seq 0 $(( {{ ROUNDS }} - 1 ))); do
@@ -204,10 +207,10 @@ bench-compare ROUNDS="10" *PROGRAMS:
                 arm=${arms[$(( (round + i) % n ))]}
                 status=0
                 start=${EPOCHREALTIME/[.,]/}
-                taskset -c "$core" "${bin[$arm]}" "bench/$prog.lua" > "$out/stdout/$prog.$arm.$round" 2>&1 || status=$?
+                "$gnutime" -f %M -o "$out/rss" taskset -c "$core" "${bin[$arm]}" "bench/$prog.lua" > "$out/stdout/$prog.$arm.$round" 2>&1 || status=$?
                 end=${EPOCHREALTIME/[.,]/}
                 [ $status -eq 0 ] || echo "exit status $status" >> "$out/stdout/$prog.$arm.$round"
-                printf 'BenchmarkLua/%s\t1\t%d ns/op\n' "$prog" $(( (end - start) * 1000 )) >> "$out/raw-$arm.txt"
+                printf 'BenchmarkLua/%s\t1\t%d ns/op\t%d peak-RSS-KiB\n' "$prog" $(( (end - start) * 1000 )) "$(tail -n 1 "$out/rss")" >> "$out/raw-$arm.txt"
             done
         done
     done
