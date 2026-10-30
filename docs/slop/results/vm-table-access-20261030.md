@@ -18,7 +18,7 @@ dispatch. `SETFIELD` on a table without a metatable called
   `setShortStr`. An integer key on a table without a metatable takes
   `setInt` as before; everything else goes to `setSlow`, by pointer.
 
-Base is the field-by-field copies (554e68b); new is this change. Same
+Base is the field-by-field copies (f01511e); new is this change. Same
 method: ReleaseFast, 10 rounds of every `bench/` program, interleaved,
 pinned to the last core, wall time and peak RSS per process, benchstat.
 

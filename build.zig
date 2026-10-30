@@ -14,14 +14,25 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
 
-    // The standalone interpreter, `lua`, as reference Lua's lua.c.
+    // The standalone interpreter, `lua`, as reference Lua's lua.c. It
+    // builds its own instance of the module without frame pointers in
+    // optimized builds: the interpreter loop needs every register
+    // (docs/slop/results/frame-pointer-20261030.md).
+    const omit_fp: ?bool = if (optimize == .Debug) null else true;
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = omit_fp,
+    });
     const exe = b.addExecutable(.{
         .name = "lua",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "lua", .module = mod }},
+            .omit_frame_pointer = omit_fp,
+            .imports = &.{.{ .name = "lua", .module = exe_mod }},
         }),
     });
     // Collector stress for the suite: `full` collects at every safe point,

@@ -286,6 +286,7 @@ noinline fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
 /// Replaces a called value that is not a function with its `__call`
 /// handler, shifting the value up to be the first argument (`tryfuncTM`).
 noinline fn insertCallTm(th: *Thread, func: u32, chain: *u32) Error!void {
+    @branchHint(.cold);
     const f = th.stack[func];
     const h = th.state.tmOf(f, .call) orelse return callError(th, func);
     try th.ensureStack(1);
@@ -626,6 +627,7 @@ pub fn closeSelf(th: *Thread) Error {
 /// Makes the variable at stack slot `level` to-be-closed (`luaF_newtbcupval`).
 /// False and nil need no closing; any other value needs a `__close`.
 noinline fn newTbc(th: *Thread, level: u32) Error!void {
+    @branchHint(.cold);
     const v = th.stack[level];
     if (v.isFalsy()) return;
     if (th.state.tmOf(v, .close) == null) {
@@ -650,6 +652,7 @@ const CloseMode = union(enum) {
 /// and above, innermost first (`luaF_close`). Each `__close` handler gets
 /// the variable's value and, with `.err`, the error object.
 noinline fn closeLevel(th: *Thread, level: u32, mode: CloseMode, comptime yieldable: bool) Error!void {
+    @branchHint(.cold);
     th.closeUpvals(level);
     while (th.tbc.items.len > 0) {
         const tbc = th.tbc.items[th.tbc.items.len - 1];
@@ -715,6 +718,7 @@ pub fn setHook(th: *Thread, hook: ?Thread.Hook, mask: u8, count: i32) void {
 /// a hook is running already. The hook runs above the frame's registers,
 /// with `Thread.min_stack` free slots, and the frame flagged `hooked`.
 noinline fn callHook(th: *Thread, event: Thread.HookEvent, line: i32, ftransfer: u32, ntransfer: u32) Error!void {
+    @branchHint(.cold);
     const hook = th.hook orelse return;
     if (!th.allowhook) return;
     const idx = th.frames.items.len - 1;
@@ -744,6 +748,7 @@ noinline fn callHook(th: *Thread, event: Thread.HookEvent, line: i32, ftransfer:
 /// The call hook of the running Lua frame, about to run its first
 /// instruction (`luaD_hookcall`). A tail call reports "tail call".
 noinline fn hookCall(th: *Thread) Error!void {
+    @branchHint(.cold);
     th.oldpc = 0;
     if (th.hookmask & Thread.HookMask.call == 0) return;
     const ci = th.frame();
@@ -760,6 +765,7 @@ noinline fn hookCall(th: *Thread) Error!void {
 /// stack slot `first` (`rethook`). It also sets `oldpc` for the line hook
 /// of a Lua caller, which goes on after its call instruction.
 noinline fn retHook(th: *Thread, first: u32, nres: u32) Error!void {
+    @branchHint(.cold);
     const idx = th.frames.items.len - 1;
     if (th.hookmask & Thread.HookMask.ret != 0) {
         const ci = &th.frames.items[idx];
@@ -786,6 +792,7 @@ noinline fn retHook(th: *Thread, first: u32, nres: u32) Error!void {
 /// and on a jump back to an instruction at or before the last one traced,
 /// which repeats a loop's line each time around.
 noinline fn traceExec(th: *Thread, pc: [*]const u32) Error!void {
+    @branchHint(.cold);
     const mask = th.hookmask;
     if (mask & (Thread.HookMask.line | Thread.HookMask.count) == 0) return;
     const ci = th.frame();
@@ -899,7 +906,6 @@ inline fn nextSkip(
 fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
     // The inline prongs instantiate many inline calls at compile time.
     @setEvalBranchQuota(10_000);
-    const heap = th.heap();
     var ci: *Frame = th.frame();
     newframe: while (true) {
         const cl = th.stack[ci.func].asLuaClosure();
@@ -966,7 +972,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .setupval => {
-                cl.upvals()[getB(i)].set(heap, base[getA(i)]);
+                cl.upvals()[getB(i)].set(th.heap(), base[getA(i)]);
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .gettabup => {
@@ -1090,10 +1096,14 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const t = cl.upvals()[getA(i)].v.*;
                 const key = k[getB(i)];
                 const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
-                const v = vp.*;
-                if (t.tag == .table and t.asTable().metatable == null) {
-                    try t.asTable().setShortStr(heap, key.asString(), v);
-                    continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
+                if (t.tag == .table) {
+                    const h = t.asTable();
+                    if (h.replaceShortStr(th.heap(), key.asString(), vp.*))
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
+                    if (h.metatable == null) {
+                        try setShortStrAt(th, h, key.asString(), vp);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
+                    }
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, cl.upvals()[getA(i)].v, &k[getB(i)], vp, .{ .upval = getA(i) });
@@ -1114,14 +1124,14 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     if (key.tag == .short_string) {
                         // A present key takes the value in place, metatable
                         // or not (`luaV_fastset`).
-                        if (h.replaceShortStr(heap, key.asString(), v))
+                        if (h.replaceShortStr(th.heap(), key.asString(), v))
                             continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                         if (h.metatable == null) {
-                            try h.setShortStr(heap, key.asString(), v);
+                            try setShortStrAt(th, h, key.asString(), vp);
                             continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                         }
                     } else if (key.tag == .int and h.metatable == null) {
-                        try h.setInt(heap, key.payload.int, v);
+                        try h.setInt(th.heap(), key.payload.int, v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
@@ -1138,7 +1148,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
                 const v = vp.*;
                 if (t.tag == .table and t.asTable().metatable == null) {
-                    try t.asTable().setInt(heap, getB(i), v);
+                    try t.asTable().setInt(th.heap(), getB(i), v);
                     continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
@@ -1167,10 +1177,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     const h = t.asTable();
                     // A present key takes the value in place, metatable or
                     // not (`luaV_fastset`); a new key goes through the table.
-                    if (h.replaceShortStr(heap, key.asString(), v))
+                    if (h.replaceShortStr(th.heap(), key.asString(), v))
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     if (h.metatable == null) {
-                        try h.setShortStr(heap, key.asString(), v);
+                        try setShortStrAt(th, h, key.asString(), vp);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
@@ -1188,7 +1198,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 if (getK(i)) narray += @as(u32, opcodes.ax(pc[0])) * (opcodes.max_vc + 1);
                 pc += 1;
                 const nhash: u32 = if (vb > 0) @as(u32, 1) << @intCast(vb - 1) else 0;
-                base[getA(i)] = .table(try Table.create(heap, narray, nhash));
+                base[getA(i)] = .table(try Table.create(th.heap(), narray, nhash));
                 ci.pc = pc;
                 if (th.state.gcDue()) {
                     // Registers above the new value are dead (`checkGC`).
@@ -1694,19 +1704,19 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     last += @as(u32, opcodes.ax(pc[0])) * (opcodes.max_vc + 1);
                     pc += 1;
                 }
-                if (last > t.asize) try t.resize(heap, last, if (t.isDummy()) 0 else t.nodeCount());
+                if (last > t.asize) try t.resize(th.heap(), last, if (t.isDummy()) 0 else t.nodeCount());
                 while (n > 0) : (n -= 1) {
-                    try t.setInt(heap, last, base[a + n]);
+                    try t.setInt(th.heap(), last, base[a + n]);
                     last -= 1;
                 }
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .closure => {
                 const p = cl.proto.p[opcodes.bx(i)];
-                const ncl = try LuaClosure.create(heap, p, @intCast(p.upvalues.len));
+                const ncl = try LuaClosure.create(th.heap(), p, @intCast(p.upvalues.len));
                 for (p.upvalues, 0..) |u, j| {
                     const uv = if (u.instack) try th.findUpval(ci.base() + u.idx) else cl.upvals()[u.idx];
-                    ncl.setUpval(heap, j, uv);
+                    ncl.setUpval(th.heap(), j, uv);
                 }
                 base[getA(i)] = .luaClosure(ncl);
                 ci.pc = pc;
@@ -1772,6 +1782,13 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
     }
 }
 
+/// `Table.setShortStr` with the value by pointer: a `Value` argument
+/// would make the interpreter loop copy the operand to a temporary on
+/// every store, not only on the ones that add a key.
+noinline fn setShortStrAt(th: *Thread, t: *Table, key: *String, vp: *const Value) error{OutOfMemory}!void {
+    return t.setShortStr(th.heap(), key, vp.*);
+}
+
 /// The offset `pc` moves by to take the jump instruction `j` that follows a
 /// test, counting the jump itself.
 inline fn jumpOffset(j: Instruction) usize {
@@ -1813,6 +1830,7 @@ inline fn doReturn(th: *Thread, comptime hooks: bool, first: u32, n: u32) Error!
 /// one before `ci.pc`; a metamethod's one result is at `top - 1`. It may
 /// push a new metamethod frame (`__concat` with more to concatenate).
 noinline fn finishOp(th: *Thread, ci: *Frame) Error!void {
+    @branchHint(.cold);
     const inst = (ci.pc - 1)[0];
     const base = ci.base();
     switch (op(inst)) {
@@ -1914,6 +1932,7 @@ noinline fn getSlow(
     origin: Origin,
     dest: u32,
 ) Error!bool {
+    @branchHint(.cold);
     var t = t_ptr.*;
     const key = key_ptr.*;
     var org = origin;
@@ -1954,6 +1973,7 @@ noinline fn setSlow(
     v_ptr: *const Value,
     origin: Origin,
 ) Error!bool {
+    @branchHint(.cold);
     var t = t_ptr.*;
     const key = key_ptr.*;
     const v = v_ptr.*;
@@ -1984,6 +2004,7 @@ noinline fn setSlow(
 }
 
 fn setError(th: *Thread, e: Table.SetError) Error {
+    @branchHint(.cold);
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.IndexIsNil => th.runError("table index is nil", .{}),
@@ -2005,6 +2026,7 @@ noinline fn arithSlow(
     ob: Origin,
     dest: u32,
 ) Error!bool {
+    @branchHint(.cold);
     const a = a_ptr.*;
     const b = b_ptr.*;
     const h = th.state.tmOf(a, event) orelse th.state.tmOf(b, event) orelse {
@@ -2036,6 +2058,7 @@ noinline fn lenSlow(
     origin: Origin,
     dest: u32,
 ) Error!bool {
+    @branchHint(.cold);
     const v = v_ptr.*;
     const h = th.state.tmOf(v, .len) orelse {
         if (v.tag == .table) {
@@ -2057,6 +2080,7 @@ noinline fn equalSlow(
     a_ptr: *const Value,
     b_ptr: *const Value,
 ) Error!?bool {
+    @branchHint(.cold);
     const a = a_ptr.*;
     const b = b_ptr.*;
     if (Value.rawEquals(a, b)) return true;
@@ -2077,6 +2101,7 @@ noinline fn orderSlow(
     b_ptr: *const Value,
     event: Tm,
 ) Error!?bool {
+    @branchHint(.cold);
     const a = a_ptr.*;
     const b = b_ptr.*;
     if (a.isNumber() and b.isNumber()) return if (event == .lt) lessThanNum(a, b) else lessEqualNum(a, b);
@@ -2393,6 +2418,7 @@ pub fn numberToString(state: *State, v: Value) error{OutOfMemory}!*String {
 /// "attempt to <what> a <type> value", with the variable's name when
 /// `origin` has one, as `luaG_typeerror` does.
 noinline fn typeError(th: *Thread, v: Value, comptime what: []const u8, origin: Origin) Error {
+    @branchHint(.cold);
     var buf: [128]u8 = undefined;
     return th.runError("attempt to " ++ what ++ " a {s} value{s}", .{
         th.state.typeName(v),
@@ -2403,6 +2429,7 @@ noinline fn typeError(th: *Thread, v: Value, comptime what: []const u8, origin: 
 /// Calling a value with no `__call`: named by the calling instruction when
 /// a Lua frame called it, else by its variable (`luaG_callerror`).
 noinline fn callError(th: *Thread, func: u32) Error {
+    @branchHint(.cold);
     var buf: [128]u8 = undefined;
     const info = if (debuginfo.callerName(th, th.frames.items.len - 1)) |n|
         debuginfo.format(n, &buf)
@@ -2412,11 +2439,13 @@ noinline fn callError(th: *Thread, func: u32) Error {
 }
 
 noinline fn zeroDivision(th: *Thread, o: ArithOp) Error {
+    @branchHint(.cold);
     if (o == .mod) return th.runError("attempt to perform 'n%0'", .{});
     return th.runError("attempt to divide by zero", .{});
 }
 
 fn forError(th: *Thread, v: Value, comptime what: []const u8) Error {
+    @branchHint(.cold);
     return th.runError("bad 'for' " ++ what ++ " (number expected, got {s})", .{th.state.typeName(v)});
 }
 
@@ -2492,6 +2521,7 @@ noinline fn getVarargs(th: *Thread, ci: *Frame, where: u32, wanted_in: i32, vata
 /// the loop runs zero times. Strings convert, as everywhere a number is
 /// expected.
 noinline fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
+    @branchHint(.cold);
     const init = ra[0];
     const limit = ra[1];
     const step = ra[2];
