@@ -18,3 +18,7 @@ test "version is the one the vendored test suite requires" {
     defer testing.allocator.free(all);
     try testing.expect(std.mem.find(u8, all, "local version = \"" ++ version ++ "\"") != null);
 }
+
+test {
+    _ = @import("number.zig");
+}
