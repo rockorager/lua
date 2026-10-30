@@ -965,7 +965,15 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try getSlow(th, .vm, ci, t, key, .{ .upval = getB(i) }, ci.base() + getA(i));
+                const done = try getSlow(
+                    th,
+                    .vm,
+                    ci,
+                    cl.upvals()[getB(i)].v,
+                    &k[getC(i)],
+                    .{ .upval = getB(i) },
+                    ci.base() + getA(i),
+                );
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -974,7 +982,8 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
             .gettable => {
                 const t = base[getB(i)];
-                const key = base[getC(i)];
+                const keyp = &base[getC(i)];
+                const key = keyp.*;
                 if (t.tag == .table) {
                     const h = t.asTable();
                     const v = if (key.tag == .int) h.getInt(key.payload.int) else h.get(key);
@@ -984,7 +993,15 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try getSlow(th, .vm, ci, t, key, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                const done = try getSlow(
+                    th,
+                    .vm,
+                    ci,
+                    &base[getB(i)],
+                    keyp,
+                    .{ .slot = ci.base() + getB(i) },
+                    ci.base() + getA(i),
+                );
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1003,7 +1020,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 }
                 ci.pc = pc;
                 const origin: Origin = .{ .slot = ci.base() + getB(i) };
-                const done = try getSlow(th, .vm, ci, t, .int(getC(i)), origin, ci.base() + getA(i));
+                const done = try getSlow(th, .vm, ci, &base[getB(i)], &Value.int(getC(i)), origin, ci.base() + getA(i));
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1012,7 +1029,8 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
             .getfield, .self => {
                 const t = base[getB(i)];
-                const key = k[getC(i)];
+                const keyp = &k[getC(i)];
+                const key = keyp.*;
                 if (op(i) == .self) base[getA(i) + 1] = t;
                 if (t.tag == .table) {
                     const h = t.asTable();
@@ -1035,7 +1053,15 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try getSlow(th, .vm, ci, t, key, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
+                const done = try getSlow(
+                    th,
+                    .vm,
+                    ci,
+                    &base[getB(i)],
+                    keyp,
+                    .{ .slot = ci.base() + getB(i) },
+                    ci.base() + getA(i),
+                );
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1045,13 +1071,14 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             .settabup => {
                 const t = cl.upvals()[getA(i)].v.*;
                 const key = k[getB(i)];
-                const v = if (getK(i)) k[getC(i)] else base[getC(i)];
+                const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
+                const v = vp.*;
                 if (t.tag == .table and t.asTable().metatable == null) {
                     try t.asTable().setShortStr(heap, key.asString(), v);
                     continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
-                const done = try setSlow(th, .vm, ci, t, key, v, .{ .upval = getA(i) });
+                const done = try setSlow(th, .vm, ci, cl.upvals()[getA(i)].v, &k[getB(i)], vp, .{ .upval = getA(i) });
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1060,8 +1087,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
             .settable => {
                 const t = base[getA(i)];
-                const key = base[getB(i)];
-                const v = if (getK(i)) k[getC(i)] else base[getC(i)];
+                const keyp = &base[getB(i)];
+                const key = keyp.*;
+                const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
+                const v = vp.*;
                 if (t.tag == .table and t.asTable().metatable == null) {
                     if (key.tag == .int) {
                         try t.asTable().setInt(heap, key.payload.int, v);
@@ -1072,7 +1101,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
-                const done = try setSlow(th, .vm, ci, t, key, v, .{ .slot = ci.base() + getA(i) });
+                const done = try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .{ .slot = ci.base() + getA(i) });
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1081,13 +1110,22 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
             .seti => {
                 const t = base[getA(i)];
-                const v = if (getK(i)) k[getC(i)] else base[getC(i)];
+                const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
+                const v = vp.*;
                 if (t.tag == .table and t.asTable().metatable == null) {
                     try t.asTable().setInt(heap, getB(i), v);
                     continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
-                const done = try setSlow(th, .vm, ci, t, .int(getB(i)), v, .{ .slot = ci.base() + getA(i) });
+                const done = try setSlow(
+                    th,
+                    .vm,
+                    ci,
+                    &base[getA(i)],
+                    &Value.int(getB(i)),
+                    vp,
+                    .{ .slot = ci.base() + getA(i) },
+                );
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1096,8 +1134,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
             .setfield => {
                 const t = base[getA(i)];
-                const key = k[getB(i)];
-                const v = if (getK(i)) k[getC(i)] else base[getC(i)];
+                const keyp = &k[getB(i)];
+                const key = keyp.*;
+                const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
+                const v = vp.*;
                 if (t.tag == .table) {
                     const h = t.asTable();
                     if (h.metatable == null) {
@@ -1108,7 +1148,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
-                const done = try setSlow(th, .vm, ci, t, key, v, .{ .slot = ci.base() + getA(i) });
+                const done = try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .{ .slot = ci.base() + getA(i) });
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1177,6 +1217,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                     continue :dispatch try nextSkip(hooked, th, &ci, &pc, &i, &base);
                 }
+                if (rb.tag == .float and rc.tag == .float) {
+                    base[getA(i)] = .float(floatArith(ao, rb.payload.float, rc.payload.float));
+                    continue :dispatch try nextSkip(hooked, th, &ci, &pc, &i, &base);
+                }
                 if (rb.isNumber() and rc.isNumber()) {
                     base[getA(i)] = .float(floatArith(ao, rb.asNumber(), rc.asNumber()));
                     continue :dispatch try nextSkip(hooked, th, &ci, &pc, &i, &base);
@@ -1229,7 +1273,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const event: Tm = @enumFromInt(getC(i));
                 const dest = ci.base() + getA((pc - 2)[0]);
                 ci.pc = pc;
-                const done = try arithSlow(th, .vm, ci, first, rb, event, o1, o2, dest);
+                const done = try arithSlow(th, .vm, ci, &first, &rb, event, o1, o2, dest);
                 ci = th.frame();
                 if (!done) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
@@ -1245,7 +1289,17 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 } else {
                     ci.pc = pc;
                     const o: Origin = .{ .slot = ci.base() + getB(i) };
-                    const done = try arithSlow(th, .vm, ci, rb, rb, .unm, o, o, ci.base() + getA(i));
+                    const done = try arithSlow(
+                        th,
+                        .vm,
+                        ci,
+                        &base[getB(i)],
+                        &base[getB(i)],
+                        .unm,
+                        o,
+                        o,
+                        ci.base() + getA(i),
+                    );
                     ci = th.frame();
                     if (!done) continue :newframe;
                     if (hookSwitch(hooked, th)) return true;
@@ -1260,7 +1314,17 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 } else {
                     ci.pc = pc;
                     const o: Origin = .{ .slot = ci.base() + getB(i) };
-                    const done = try arithSlow(th, .vm, ci, rb, rb, .bnot, o, o, ci.base() + getA(i));
+                    const done = try arithSlow(
+                        th,
+                        .vm,
+                        ci,
+                        &base[getB(i)],
+                        &base[getB(i)],
+                        .bnot,
+                        o,
+                        o,
+                        ci.base() + getA(i),
+                    );
                     ci = th.frame();
                     if (!done) continue :newframe;
                     if (hookSwitch(hooked, th)) return true;
@@ -1281,7 +1345,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     } else {
                         ci.pc = pc;
                         const origin: Origin = .{ .slot = ci.base() + getB(i) };
-                        const done = try lenSlow(th, .vm, ci, rb, origin, ci.base() + getA(i));
+                        const done = try lenSlow(th, .vm, ci, &base[getB(i)], origin, ci.base() + getA(i));
                         ci = th.frame();
                         if (!done) continue :newframe;
                         if (hookSwitch(hooked, th)) return true;
@@ -1290,7 +1354,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     else => {
                         ci.pc = pc;
                         const origin: Origin = .{ .slot = ci.base() + getB(i) };
-                        const done = try lenSlow(th, .vm, ci, rb, origin, ci.base() + getA(i));
+                        const done = try lenSlow(th, .vm, ci, &base[getB(i)], origin, ci.base() + getA(i));
                         ci = th.frame();
                         if (!done) continue :newframe;
                         if (hookSwitch(hooked, th)) return true;
@@ -1342,6 +1406,12 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                         .lt => ra.payload.int < rb.payload.int,
                         else => ra.payload.int <= rb.payload.int,
                     };
+                } else if (ra.tag == .float and rb.tag == .float) {
+                    cond = switch (o) {
+                        .eq => ra.payload.float == rb.payload.float,
+                        .lt => ra.payload.float < rb.payload.float,
+                        else => ra.payload.float <= rb.payload.float,
+                    };
                 } else if (ra.isNumber() and rb.isNumber()) {
                     cond = switch (o) {
                         .eq => Value.rawEquals(ra, rb),
@@ -1351,9 +1421,9 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 } else {
                     ci.pc = pc;
                     const r = switch (o) {
-                        .eq => try equalSlow(th, .vm, ci, ra, rb),
-                        .lt => try orderSlow(th, .vm, ci, ra, rb, .lt),
-                        else => try orderSlow(th, .vm, ci, ra, rb, .le),
+                        .eq => try equalSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)]),
+                        .lt => try orderSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)], .lt),
+                        else => try orderSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)], .le),
                     };
                     ci = th.frame();
                     cond = r orelse continue :newframe;
@@ -1400,10 +1470,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     ci.pc = pc;
                     const imv: Value = if (getC(i) != 0) .float(@floatFromInt(im)) else .int(im);
                     const r = switch (o) {
-                        .lti => try orderSlow(th, .vm, ci, ra, imv, .lt),
-                        .lei => try orderSlow(th, .vm, ci, ra, imv, .le),
-                        .gti => try orderSlow(th, .vm, ci, imv, ra, .lt),
-                        else => try orderSlow(th, .vm, ci, imv, ra, .le),
+                        .lti => try orderSlow(th, .vm, ci, &base[getA(i)], &imv, .lt),
+                        .lei => try orderSlow(th, .vm, ci, &base[getA(i)], &imv, .le),
+                        .gti => try orderSlow(th, .vm, ci, &imv, &base[getA(i)], .lt),
+                        else => try orderSlow(th, .vm, ci, &imv, &base[getA(i)], .le),
                     };
                     ci = th.frame();
                     cond = r orelse continue :newframe;
@@ -1812,12 +1882,13 @@ noinline fn getSlow(
     th: *Thread,
     comptime caller: Caller,
     ci: *Frame,
-    t_in: Value,
-    key: Value,
+    t_ptr: *const Value,
+    key_ptr: *const Value,
     origin: Origin,
     dest: u32,
 ) Error!bool {
-    var t = t_in;
+    var t = t_ptr.*;
+    const key = key_ptr.*;
     var org = origin;
     for (0..max_tag_loop) |_| {
         var h: Value = undefined;
@@ -1851,12 +1922,14 @@ noinline fn setSlow(
     th: *Thread,
     comptime caller: Caller,
     ci: *Frame,
-    t_in: Value,
-    key: Value,
-    v: Value,
+    t_ptr: *const Value,
+    key_ptr: *const Value,
+    v_ptr: *const Value,
     origin: Origin,
 ) Error!bool {
-    var t = t_in;
+    var t = t_ptr.*;
+    const key = key_ptr.*;
+    const v = v_ptr.*;
     var org = origin;
     for (0..max_tag_loop) |_| {
         var h: Value = undefined;
@@ -1898,13 +1971,15 @@ noinline fn arithSlow(
     th: *Thread,
     comptime caller: Caller,
     ci: *Frame,
-    a: Value,
-    b: Value,
+    a_ptr: *const Value,
+    b_ptr: *const Value,
     event: Tm,
     oa: Origin,
     ob: Origin,
     dest: u32,
 ) Error!bool {
+    const a = a_ptr.*;
+    const b = b_ptr.*;
     const h = th.state.tmOf(a, event) orelse th.state.tmOf(b, event) orelse {
         switch (event) {
             .band, .bor, .bxor, .shl, .shr, .bnot => {
@@ -1926,7 +2001,15 @@ noinline fn arithSlow(
     return true;
 }
 
-noinline fn lenSlow(th: *Thread, comptime caller: Caller, ci: *Frame, v: Value, origin: Origin, dest: u32) Error!bool {
+noinline fn lenSlow(
+    th: *Thread,
+    comptime caller: Caller,
+    ci: *Frame,
+    v_ptr: *const Value,
+    origin: Origin,
+    dest: u32,
+) Error!bool {
+    const v = v_ptr.*;
     const h = th.state.tmOf(v, .len) orelse {
         if (v.tag == .table) {
             th.stack[dest] = .int(@bitCast(v.asTable().length()));
@@ -1940,7 +2023,15 @@ noinline fn lenSlow(th: *Thread, comptime caller: Caller, ci: *Frame, v: Value, 
 
 /// `a == b` for operands not both numbers; null when a Lua `__eq` frame
 /// was pushed.
-noinline fn equalSlow(th: *Thread, comptime caller: Caller, ci: *Frame, a: Value, b: Value) Error!?bool {
+noinline fn equalSlow(
+    th: *Thread,
+    comptime caller: Caller,
+    ci: *Frame,
+    a_ptr: *const Value,
+    b_ptr: *const Value,
+) Error!?bool {
+    const a = a_ptr.*;
+    const b = b_ptr.*;
     if (Value.rawEquals(a, b)) return true;
     if (a.tag != b.tag or (a.tag != .table and a.tag != .userdata)) return false;
     const h = th.state.fastTm(th.state.metatableOf(a), .eq) orelse
@@ -1951,7 +2042,16 @@ noinline fn equalSlow(th: *Thread, comptime caller: Caller, ci: *Frame, a: Value
 
 /// `a < b` or `a <= b` for operands not both numbers; null when a Lua
 /// metamethod frame was pushed.
-noinline fn orderSlow(th: *Thread, comptime caller: Caller, ci: *Frame, a: Value, b: Value, event: Tm) Error!?bool {
+noinline fn orderSlow(
+    th: *Thread,
+    comptime caller: Caller,
+    ci: *Frame,
+    a_ptr: *const Value,
+    b_ptr: *const Value,
+    event: Tm,
+) Error!?bool {
+    const a = a_ptr.*;
+    const b = b_ptr.*;
     if (a.isNumber() and b.isNumber()) return if (event == .lt) lessThanNum(a, b) else lessEqualNum(a, b);
     if (a.isString() and b.isString()) {
         const ord = std.mem.order(u8, a.asString().bytes(), b.asString().bytes());
@@ -2077,14 +2177,14 @@ noinline fn getNative(th: *Thread, t: Value, key: Value) Error!Value {
     try th.ensureStack(1);
     const dest = th.top;
     th.top += 1;
-    _ = try getSlow(th, .native, th.frame(), t, key, .none, dest);
+    _ = try getSlow(th, .native, th.frame(), &t, &key, .none, dest);
     th.top = dest;
     return th.stack[dest];
 }
 
 /// `t[key] = v` with `__newindex` (`lua_settable`).
 pub fn set(th: *Thread, t: Value, key: Value, v: Value) Error!void {
-    _ = try setSlow(th, .native, th.frame(), t, key, v, .none);
+    _ = try setSlow(th, .native, th.frame(), &t, &key, &v, .none);
 }
 
 /// The arithmetic and bitwise operators, in `lua_arith`'s order.
@@ -2127,7 +2227,7 @@ pub fn arith(th: *Thread, o: ArithOp, a: Value, b_in: Value) Error!Value {
     try th.ensureStack(1);
     const dest = th.top;
     th.top += 1;
-    _ = try arithSlow(th, .native, th.frame(), a, b, o.event(), .none, .none, dest);
+    _ = try arithSlow(th, .native, th.frame(), &a, &b, o.event(), .none, .none, dest);
     th.top = dest;
     return th.stack[dest];
 }
@@ -2173,17 +2273,17 @@ pub fn rawArith(th: *Thread, o: ArithOp, a: Value, b: Value) Error!?Value {
 /// `a == b` with `__eq` (`lua_compare` with `LUA_OPEQ`).
 pub fn equal(th: *Thread, a: Value, b: Value) Error!bool {
     if (a.isNumber() and b.isNumber()) return Value.rawEquals(a, b);
-    return (try equalSlow(th, .native, th.frame(), a, b)).?;
+    return (try equalSlow(th, .native, th.frame(), &a, &b)).?;
 }
 
 /// `a < b` with `__lt` (`lua_compare` with `LUA_OPLT`).
 pub fn lessThan(th: *Thread, a: Value, b: Value) Error!bool {
-    return (try orderSlow(th, .native, th.frame(), a, b, .lt)).?;
+    return (try orderSlow(th, .native, th.frame(), &a, &b, .lt)).?;
 }
 
 /// `a <= b` with `__le` (`lua_compare` with `LUA_OPLE`).
 pub fn lessEqual(th: *Thread, a: Value, b: Value) Error!bool {
-    return (try orderSlow(th, .native, th.frame(), a, b, .le)).?;
+    return (try orderSlow(th, .native, th.frame(), &a, &b, .le)).?;
 }
 
 /// `#v` with `__len` (`lua_len`).
@@ -2194,7 +2294,7 @@ pub fn length(th: *Thread, v: Value) Error!Value {
             try th.ensureStack(1);
             const dest = th.top;
             th.top += 1;
-            _ = try lenSlow(th, .native, th.frame(), v, .none, dest);
+            _ = try lenSlow(th, .native, th.frame(), &v, .none, dest);
             th.top = dest;
             return th.stack[dest];
         },
