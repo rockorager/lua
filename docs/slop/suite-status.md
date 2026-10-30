@@ -91,7 +91,7 @@ modules the files load.
 | `bitwise.lua`    | ok  | ok    |                                                                                                       |
 | `verybig.lua`    | ok  | ok    |                                                                                                       |
 | `files.lua`      | ok  | FAIL  | `require "debug"`; with a stub, line 110: too many open files, since `__gc` does not run              |
-| `all.lua`        | ok  | FAIL  | line 153: `string.dump`, after `main.lua`                                                             |
+| `all.lua`        | ok  | FAIL  | line 158: `require"tracegc"` needs `debug`, after main.lua's dump round trip (line 153)               |
 
 Under `_U`, five files return at once: `main.lua` (`_port`), `big.lua`
 (`_soft`), and `api.lua`, `code.lua`, and `memerr.lua` (`T`, the C test

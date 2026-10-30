@@ -119,14 +119,21 @@ reference.
     file, addresses masked: 49 of 49 identical. Keep it that way; a
     deliberate divergence goes in the recipe with the reason. Line info is
     one absolute line per instruction (`Proto.lineinfo`), not luac's
-    delta encoding, which only `string.dump` would need.
-14. **Library host.** The libraries reach I/O and state the core does not keep
+    delta encoding; `dump.zig` re-encodes it for `string.dump`.
+14. **Binary chunks are luac's.** Landed: `dump.zig` (`string.dump`) and
+    `undump.zig` (`load` of a chunk starting with ESC) read and write
+    5.5.1's format exactly, so `luac -o` output runs here and our dumps
+    load on the reference. `just dump` checks that our dump of every suite
+    and bench file is `luac -o`'s byte for byte, plain and stripped, and
+    that luac's chunks load and dump back unchanged: 98 of 98. Details and
+    the one line-info case that can differ are in `dump.md`.
+15. **Library host.** The libraries reach I/O and state the core does not keep
     (warning mode, the collector's mode and parameters) through
     `lib.base.Host`, which the embedder owns and `lib.openLibs` stores in the
     registry as a light userdata under `_LUA_HOST`. A field on `State` would
     save the lookup; ask the core's owner when a library needs it on a hot
     path.
-15. **Embedding API.** A Zig API, not the C API, designed once the standard
+16. **Embedding API.** A Zig API, not the C API, designed once the standard
     library has exercised the internal one. Nothing outside `src/` depends on
     internals until then.
 
@@ -197,6 +204,10 @@ messages that still differ. The package, io, and os libraries
 `main.zig` hands them the environment and `-E` through the registry until
 `Host` carries them. Coverage, verification, and what they need from the core
 are in `io-os-package.md`. Most suite files now stop on `require "debug"`.
+
+Landed from wave 3: `string.dump` and binary chunks (`dump.zig`,
+`undump.zig`, decision 16); all.lua now runs main.lua through its dump
+round trip and stops on `require "debug"`.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.

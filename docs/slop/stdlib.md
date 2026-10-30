@@ -13,8 +13,7 @@ which builds its table and sets it as a global; `init.zig` calls them.
   to `%9`, "invalid replacement value", "invalid use of '%' in replacement
   string"), `len`, `lower`, `match`, `pack`, `packsize`, `rep` (separator,
   "resulting string too large"), `reverse`, `sub`, `unpack`, `upper`. `dump`
-  checks for a Lua function, then raises "unable to dump given function";
-  there is no dumper yet. `open` sets the string metatable: `__index` is the
+  writes luac's binary format through `dump.zig` (see `dump.md`). `open` sets the string metatable: `__index` is the
   library, and `__add`, `__sub`, `__mul`, `__mod`, `__pow`, `__div`, `__idiv`,
   and `__unm` convert strings as lstrlib.c's `trymt`/`tonum` do, with its
   "attempt to add a 'string' with a 'table'" messages. Bitwise operators on
