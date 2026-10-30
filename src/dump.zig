@@ -143,8 +143,8 @@ const Dumper = struct {
             return d.varint(gop.value_ptr.*);
         }
         gop.value_ptr.* = d.saved.count();
-        try d.varint(str.len + 1);
-        try d.block(str.bytesZ()[0 .. str.len + 1]);
+        try d.varint(str.len() + 1);
+        try d.block(str.bytesZ()[0 .. str.len() + 1]);
     }
 
     fn function(d: *Dumper, f: *const Proto) Error!void {

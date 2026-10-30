@@ -502,7 +502,7 @@ fn rawlen(th: *Thread, base: u32) Error!u32 {
     const v = get(th, base, 1);
     return switch (v.tag) {
         .table => ret1(th, .int(@bitCast(v.asTable().length()))),
-        .short_string, .long_string => ret1(th, .int(@intCast(v.asString().len))),
+        .short_string, .long_string => ret1(th, .int(@intCast(v.asString().len()))),
         else => typeError(th, base, 1, "rawlen", "table or string"),
     };
 }
@@ -712,7 +712,7 @@ fn loadFromReader(th: *Thread, reader: Value, name: []const u8, mode: []const u8
         th.top = func;
         if (piece.isNil()) break;
         if (piece.isString()) {
-            if (piece.asString().len == 0) break;
+            if (piece.asString().len() == 0) break;
             try src.appendSlice(gpa, piece.asString().bytes());
         } else if (piece.isNumber()) {
             var buf: [number.max_len]u8 = undefined;
@@ -759,7 +759,7 @@ fn assert(th: *Thread, base: u32) Error!u32 {
 fn select(th: *Thread, base: u32) Error!u32 {
     const n: i64 = th.top - base;
     const first = get(th, base, 1);
-    if (first.isString() and first.asString().len > 0 and first.asString().bytes()[0] == '#')
+    if (first.isString() and first.asString().len() > 0 and first.asString().bytes()[0] == '#')
         return ret1(th, .int(n - 1));
     var i = try checkInteger(th, base, 1, "select");
     if (i < 0) i = n + i else if (i > n) i = n;

@@ -76,9 +76,9 @@ fn decode(s: [*:0]const u8, strict: bool) ?struct { code: u32, len: usize } {
 fn len(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "len");
     const str = try a.checkString(1);
-    const n: i64 = @intCast(str.len);
-    var posi = posrelat(try a.optInteger(2, 1), str.len);
-    var posj = posrelat(try a.optInteger(3, -1), str.len);
+    const n: i64 = @intCast(str.len());
+    var posi = posrelat(try a.optInteger(2, 1), str.len());
+    var posj = posrelat(try a.optInteger(3, -1), str.len());
     const lax = !a.get(4).isFalsy();
     if (!(1 <= posi and posi - 1 <= n)) return a.argError(2, "initial position out of bounds", .{});
     posi -= 1;
@@ -104,9 +104,9 @@ fn len(th: *Thread, base: u32) Error!u32 {
 fn codepoint(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "codepoint");
     const str = try a.checkString(1);
-    const n: i64 = @intCast(str.len);
-    const posi = posrelat(try a.optInteger(2, 1), str.len);
-    const pose = posrelat(try a.optInteger(3, posi), str.len);
+    const n: i64 = @intCast(str.len());
+    const posi = posrelat(try a.optInteger(2, 1), str.len());
+    const pose = posrelat(try a.optInteger(3, posi), str.len());
     const lax = !a.get(4).isFalsy();
     if (posi < 1) return a.argError(2, "out of bounds", .{});
     if (pose > n) return a.argError(3, "out of bounds", .{});
@@ -170,7 +170,7 @@ fn char(th: *Thread, base: u32) Error!u32 {
 fn offset(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "offset");
     const str = try a.checkString(1);
-    const l = str.len;
+    const l = str.len();
     var n = try a.checkInteger(2);
     const def: i64 = if (n >= 0) 1 else @as(i64, @intCast(l)) + 1;
     const li: i64 = @intCast(l);
@@ -218,7 +218,7 @@ fn offset(th: *Thread, base: u32) Error!u32 {
 fn iterAux(th: *Thread, base: u32, comptime strict: bool) Error!u32 {
     const a: Args = .init(th, base, "for iterator");
     const str = try a.checkString(1);
-    const l = str.len;
+    const l = str.len();
     var n: u64 = @bitCast(auxlib.toInteger(a.get(2)) orelse 0);
     const s = str.bytesZ().ptr;
     if (n < l) {

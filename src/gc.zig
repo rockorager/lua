@@ -101,6 +101,9 @@ const max_mem: isize = std.math.maxInt(isize);
 /// The collector's state and the allocator that counts every byte.
 pub const Heap = struct {
     backing: Allocator,
+    /// Where strings and string buffers come from, when not `backing`:
+    /// `State.Options.strings`.
+    strings: ?Allocator = null,
     /// Bytes currently allocated through `allocator()`.
     bytes: usize = 0,
     /// A step runs once `bytes` reaches this: `bytes - threshold` is
@@ -156,9 +159,17 @@ pub const Heap = struct {
     /// with the program as finely as it can: shakes out missing barriers.
     stress_step: bool = false,
 
-    /// The counting allocator. Every byte of a Lua universe goes through it.
+    /// The counting allocator. Every byte of a Lua universe goes through it
+    /// or `stringAllocator`.
     pub fn allocator(heap: *Heap) Allocator {
-        return .{ .ptr = heap, .vtable = &vtable };
+        return .{ .ptr = heap, .vtable = &Counting("backing").vtable };
+    }
+
+    /// The counting allocator for strings and the buffers that become
+    /// them.
+    pub fn stringAllocator(heap: *Heap) Allocator {
+        if (heap.strings == null) return heap.allocator();
+        return .{ .ptr = heap, .vtable = &Counting("strings").vtable };
     }
 
     /// Links a new object into `allgc`, white and new.
@@ -199,38 +210,43 @@ pub const Heap = struct {
         return heap.stopped == 0;
     }
 
-    const vtable: Allocator.VTable = .{
-        .alloc = countAlloc,
-        .resize = countResize,
-        .remap = countRemap,
-        .free = countFree,
-    };
+    /// An allocator over the heap's `field` that counts the bytes.
+    fn Counting(comptime field: []const u8) type {
+        return struct {
+            const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
 
-    fn countAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
-        const heap: *Heap = @ptrCast(@alignCast(ctx));
-        const p = heap.backing.rawAlloc(len, alignment, ret) orelse return null;
-        heap.bytes += len;
-        return p;
-    }
+            inline fn backingOf(heap: *Heap) Allocator {
+                const a = @field(heap, field);
+                return if (@TypeOf(a) == Allocator) a else a.?;
+            }
 
-    fn countResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
-        const heap: *Heap = @ptrCast(@alignCast(ctx));
-        if (!heap.backing.rawResize(memory, alignment, new_len, ret)) return false;
-        heap.bytes = heap.bytes - memory.len + new_len;
-        return true;
-    }
+            fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+                const heap: *Heap = @ptrCast(@alignCast(ctx));
+                const p = backingOf(heap).rawAlloc(len, alignment, ret) orelse return null;
+                heap.bytes += len;
+                return p;
+            }
 
-    fn countRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
-        const heap: *Heap = @ptrCast(@alignCast(ctx));
-        const p = heap.backing.rawRemap(memory, alignment, new_len, ret) orelse return null;
-        heap.bytes = heap.bytes - memory.len + new_len;
-        return p;
-    }
+            fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+                const heap: *Heap = @ptrCast(@alignCast(ctx));
+                if (!backingOf(heap).rawResize(memory, alignment, new_len, ret)) return false;
+                heap.bytes = heap.bytes - memory.len + new_len;
+                return true;
+            }
 
-    fn countFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
-        const heap: *Heap = @ptrCast(@alignCast(ctx));
-        heap.backing.rawFree(memory, alignment, ret);
-        heap.bytes -= memory.len;
+            fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+                const heap: *Heap = @ptrCast(@alignCast(ctx));
+                const p = backingOf(heap).rawRemap(memory, alignment, new_len, ret) orelse return null;
+                heap.bytes = heap.bytes - memory.len + new_len;
+                return p;
+            }
+
+            fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+                const heap: *Heap = @ptrCast(@alignCast(ctx));
+                backingOf(heap).rawFree(memory, alignment, ret);
+                heap.bytes -= memory.len;
+            }
+        };
     }
 };
 
@@ -401,7 +417,7 @@ fn objSize(h: *Header) usize {
         .userdata => @as(*Userdata, @fieldParentPtr("header", h)).byteSize(),
         .proto => @as(*Proto, @fieldParentPtr("header", h)).byteSize(),
         .thread => threadSize(@fieldParentPtr("header", h)),
-        .short_string, .long_string => @sizeOf(String) + @as(*String, @fieldParentPtr("header", h)).len + 1,
+        .short_string, .long_string => @sizeOf(String) + @as(*String, @fieldParentPtr("header", h)).len() + 1,
         .upval => @sizeOf(Proto.Upval),
         else => unreachable,
     };

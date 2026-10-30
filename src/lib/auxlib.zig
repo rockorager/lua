@@ -316,7 +316,7 @@ pub const Buffer = struct {
     const vtable: Writer.VTable = .{ .drain = drain, .rebase = rebase };
 
     pub fn init(b: *Buffer, state: *State) void {
-        b.gpa = state.heap.allocator();
+        b.gpa = state.heap.stringAllocator();
         b.on_heap = false;
         b.writer = .{ .vtable = &vtable, .buffer = &b.small };
     }

@@ -503,7 +503,11 @@ pub fn main(init: std.process.Init) u8 {
     host.init(io);
     const progname: []const u8 = if (args.len > 0 and args[0].len > 0) args[0] else "lua";
     const stress = std.meta.stringToEnum(@FieldType(State.Options, "gc_stress"), build_options.gc_stress).?;
-    const state = State.create(gpa, .{ .gc_stress = stress }) catch {
+    // One state on one thread: strings get an allocator without locks and
+    // with size classes 8 bytes apart.
+    var small: lua.SmallAllocator = .init(gpa);
+    defer small.deinit();
+    const state = State.create(gpa, .{ .gc_stress = stress, .strings = small.allocator() }) catch {
         host.writeStderr(progname);
         host.writeStderr(": cannot create state: not enough memory\n");
         return 1;

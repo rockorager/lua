@@ -1377,7 +1377,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             .len => {
                 const rb = base[getB(i)];
                 switch (rb.tag) {
-                    .short_string, .long_string => base[getA(i)] = .int(@intCast(rb.asString().len)),
+                    .short_string, .long_string => base[getA(i)] = .int(@intCast(rb.asString().len())),
                     .table => if (th.state.fastTm(rb.asTable().metatable, .len) == null) {
                         base[getA(i)] = .int(@bitCast(rb.asTable().length()));
                     } else {
@@ -2379,7 +2379,7 @@ pub fn lessEqual(th: *Thread, a: Value, b: Value) Error!bool {
 /// `#v` with `__len` (`lua_len`).
 pub fn length(th: *Thread, v: Value) Error!Value {
     switch (v.tag) {
-        .short_string, .long_string => return .int(@intCast(v.asString().len)),
+        .short_string, .long_string => return .int(@intCast(v.asString().len())),
         else => {
             try th.ensureStack(1);
             const dest = th.top;

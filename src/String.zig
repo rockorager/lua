@@ -14,24 +14,40 @@ header: gc.Header,
 /// Short strings: free for the lexer to mark reserved words (0 means none).
 /// Long strings: 1 once `hash` holds the hash.
 extra: u8 = 0,
+/// Short strings: the length.
+shrlen: u8 = 0,
 hash: u32,
-len: usize,
-/// The next string in the same intern bucket (short strings only).
-hnext: ?*String = null,
+u: extern union {
+    /// Long strings: the length.
+    lnglen: usize,
+    /// Short strings: the next string in the same intern bucket.
+    hnext: ?*String,
+},
+
+comptime {
+    // PUC-Rio's `TString` layout: the header, then a union of a long
+    // string's length and a short string's link.
+    std.debug.assert(@sizeOf(String) == 32);
+}
 
 /// The longest short string, PUC-Rio's `LUAI_MAXSHORTLEN`.
 pub const max_short_len = 40;
 
 pub const alignment: std.mem.Alignment = .of(String);
 
+/// The length in bytes (`tsslen`).
+pub inline fn len(s: *const String) usize {
+    return if (s.isShort()) s.shrlen else s.u.lnglen;
+}
+
 /// The bytes, without the trailing zero.
 pub inline fn bytes(s: *const String) []const u8 {
-    return s.bytesPtr()[0..s.len];
+    return s.bytesPtr()[0..s.len()];
 }
 
 /// The bytes followed by the zero terminator, for code that needs one.
 pub inline fn bytesZ(s: *const String) [:0]const u8 {
-    return s.bytesPtr()[0..s.len :0];
+    return s.bytesPtr()[0..s.len() :0];
 }
 
 inline fn bytesPtr(s: *const String) [*]u8 {
@@ -43,8 +59,8 @@ pub inline fn isShort(s: *const String) bool {
     return s.header.tag == .short_string;
 }
 
-pub inline fn allocSize(len: usize) usize {
-    return @sizeOf(String) + len + 1;
+pub inline fn allocSize(n: usize) usize {
+    return @sizeOf(String) + n + 1;
 }
 
 /// The seeded hash of `b`. Wyhash: fast on short keys, and the per-state
@@ -66,51 +82,58 @@ pub inline fn hashOf(s: *String) u32 {
 
 /// Content equality of two long strings.
 pub fn eqlLong(a: *const String, b: *const String) bool {
-    return a == b or (a.len == b.len and std.mem.eql(u8, a.bytes(), b.bytes()));
+    return a == b or (a.u.lnglen == b.u.lnglen and std.mem.eql(u8, a.bytes(), b.bytes()));
 }
 
-/// Allocates a string object with room for `len` bytes, not yet linked.
-fn alloc(heap: *gc.Heap, len: usize) error{OutOfMemory}!*String {
-    const mem = try heap.allocator().alignedAlloc(u8, alignment, allocSize(len));
+/// Allocates a string object with room for `n` bytes, not yet linked: a
+/// short one when `n` is at most `max_short_len`.
+fn alloc(heap: *gc.Heap, n: usize) error{OutOfMemory}!*String {
+    const mem = try heap.stringAllocator().alignedAlloc(u8, alignment, allocSize(n));
     const s: *String = @ptrCast(mem.ptr);
-    s.* = .{ .header = undefined, .hash = 0, .len = len };
-    s.bytesPtr()[len] = 0;
+    init(s, 0, n);
     return s;
 }
 
-/// A new long string of `len` bytes, contents undefined, for building
-/// results such as concatenations in place. `len` must exceed
+fn init(s: *String, hash: u32, n: usize) void {
+    s.* = if (n <= max_short_len)
+        .{ .header = undefined, .hash = hash, .shrlen = @intCast(n), .u = .{ .hnext = null } }
+    else
+        .{ .header = undefined, .hash = hash, .u = .{ .lnglen = n } };
+    s.bytesPtr()[n] = 0;
+}
+
+/// A new long string of `n` bytes, contents undefined, for building
+/// results such as concatenations in place. `n` must exceed
 /// `max_short_len`; build shorter results in a buffer and intern them.
-pub fn createLong(heap: *gc.Heap, seed: u64, len: usize) error{OutOfMemory}!*String {
-    std.debug.assert(len > max_short_len);
-    const s = try alloc(heap, len);
+pub fn createLong(heap: *gc.Heap, seed: u64, n: usize) error{OutOfMemory}!*String {
+    std.debug.assert(n > max_short_len);
+    const s = try alloc(heap, n);
     s.hash = @truncate(seed);
     heap.link(&s.header, .long_string);
     return s;
 }
 
-/// Makes a long string of the block `mem`, `allocSize(len)` bytes from
-/// the heap's allocator whose `len` bytes after the header are already the
-/// contents: a buffer becomes its string without a copy. `len` must exceed
-/// `max_short_len`.
-pub fn adoptLong(heap: *gc.Heap, seed: u64, mem: []align(alignment.toByteUnits()) u8, len: usize) *String {
-    std.debug.assert(len > max_short_len);
-    std.debug.assert(mem.len == allocSize(len));
+/// Makes a long string of the block `mem`, `allocSize(n)` bytes from the
+/// heap's `stringAllocator` whose `n` bytes after the header are already
+/// the contents: a buffer becomes its string without a copy. `n` must
+/// exceed `max_short_len`.
+pub fn adoptLong(heap: *gc.Heap, seed: u64, mem: []align(alignment.toByteUnits()) u8, n: usize) *String {
+    std.debug.assert(n > max_short_len);
+    std.debug.assert(mem.len == allocSize(n));
     const s: *String = @ptrCast(mem.ptr);
-    s.* = .{ .header = undefined, .hash = @truncate(seed), .len = len };
-    s.bytesPtr()[len] = 0;
+    init(s, @truncate(seed), n);
     heap.link(&s.header, .long_string);
     return s;
 }
 
 /// The writable bytes of a string made by `createLong` and not yet shared.
 pub inline fn mutableBytes(s: *String) []u8 {
-    return s.bytesPtr()[0..s.len];
+    return s.bytesPtr()[0..s.u.lnglen];
 }
 
 pub fn destroy(heap: *gc.Heap, s: *String) void {
     const p: [*]align(alignment.toByteUnits()) u8 = @ptrCast(s);
-    heap.allocator().free(p[0..allocSize(s.len)]);
+    heap.stringAllocator().free(p[0..allocSize(s.len())]);
 }
 
 /// The state's set of short strings, a chained hash set through `hnext`.
@@ -146,8 +169,8 @@ pub const Interner = struct {
         std.debug.assert(b.len <= max_short_len);
         const h = hashBytes(self.seed, b);
         var it = self.buckets[h & (self.buckets.len - 1)];
-        while (it) |s| : (it = s.hnext) {
-            if (s.hash == h and s.len == b.len and std.mem.eql(u8, s.bytes(), b)) {
+        while (it) |s| : (it = s.u.hnext) {
+            if (s.hash == h and s.shrlen == b.len and std.mem.eql(u8, s.bytes(), b)) {
                 // Dead but not swept yet: in use again.
                 if (heap.isDead(&s.header)) gc.Heap.resurrect(&s.header);
                 return s;
@@ -159,7 +182,7 @@ pub const Interner = struct {
         s.hash = h;
         heap.link(&s.header, .short_string);
         const slot = &self.buckets[h & (self.buckets.len - 1)];
-        s.hnext = slot.*;
+        s.u.hnext = slot.*;
         slot.* = s;
         self.count += 1;
         return s;
@@ -177,15 +200,15 @@ pub const Interner = struct {
         }
     }
 
-    fn resize(self: *Interner, heap: *gc.Heap, len: usize) void {
-        const new = heap.allocator().alloc(?*String, len) catch return;
+    fn resize(self: *Interner, heap: *gc.Heap, n: usize) void {
+        const new = heap.allocator().alloc(?*String, n) catch return;
         @memset(new, null);
         for (self.buckets) |head| {
             var it = head;
             while (it) |s| {
-                it = s.hnext;
+                it = s.u.hnext;
                 const slot = &new[s.hash & (new.len - 1)];
-                s.hnext = slot.*;
+                s.u.hnext = slot.*;
                 slot.* = s;
             }
         }
@@ -196,8 +219,8 @@ pub const Interner = struct {
     /// Drops a short string the collector is about to free.
     pub fn remove(self: *Interner, s: *String) void {
         var link: *?*String = &self.buckets[s.hash & (self.buckets.len - 1)];
-        while (link.*.? != s) link = &link.*.?.hnext;
-        link.* = s.hnext;
+        while (link.*.? != s) link = &link.*.?.u.hnext;
+        link.* = s.u.hnext;
         self.count -= 1;
     }
 };

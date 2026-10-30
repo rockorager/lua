@@ -88,6 +88,10 @@ pub const Options = struct {
     /// Collector stress for testing: `full` collects at every safe point,
     /// `step` takes one incremental step at each.
     gc_stress: enum { off, full, step } = .off,
+    /// Where strings come from, when not `gpa`. Their sizes are rarely a
+    /// power of two, so an allocator with finer size classes saves memory
+    /// (the `lua` executable passes a `SmallAllocator`).
+    strings: ?std.mem.Allocator = null,
 };
 
 /// A new state with an empty registry and globals. Every byte it ever
@@ -101,7 +105,12 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
         std.mem.asBytes(&[_]usize{ @intFromPtr(&local), @intFromPtr(&create), @intFromPtr(&gpa) }),
     );
     state.* = .{
-        .heap = .{ .backing = gpa, .stress = options.gc_stress == .full, .stress_step = options.gc_stress == .step },
+        .heap = .{
+            .backing = gpa,
+            .strings = options.strings,
+            .stress = options.gc_stress == .full,
+            .stress_step = options.gc_stress == .step,
+        },
         .strings = undefined,
         .seed = seed,
         .main = undefined,

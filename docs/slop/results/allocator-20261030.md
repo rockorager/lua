@@ -107,6 +107,13 @@ The allocator is not in. hash_string's remaining gap is the `String`
 header and what the collector keeps; the allocator alone cannot close it
 without the layout cost above.
 
+Follow-up: aligning only closures to 32 bytes (a 32-byte alignment request
+from `LuaClosure.create`) did not bring the time back (spectral_norm 1.03
+and 1.05 s, methods 0.82 and 0.84). Classes for strings alone, with every
+other object on SmpAllocator, kept the time (an A/B on seven programs:
+geomean +0.5%, nothing but methods outside noise at +3%); that and a
+32-byte header are `strings-20261030.md`.
+
 ## Raw output
 
 base:

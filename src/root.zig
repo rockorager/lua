@@ -22,6 +22,9 @@ pub const dump = @import("dump.zig");
 pub const undump = @import("undump.zig");
 /// The standard libraries; `lib.openLibs` opens them.
 pub const lib = @import("lib/init.zig");
+/// A single-threaded allocator with fine size classes for small blocks;
+/// the `lua` executable allocates strings with it.
+pub const SmallAllocator = @import("SmallAllocator.zig");
 
 /// The value of the global `_VERSION`, as the reference manual's §6.2 gives it.
 pub const version = "Lua 5.5";

@@ -20,3 +20,10 @@ All notable changes to lua are recorded here. The format follows
 - Runtime errors name the variable involved ("attempt to index a nil value (global 'x')"), "bad argument" messages name the function as the call site does, and `xpcall`'s message handler runs before the stack unwinds, as in the reference.
 - To-be-closed variables (`local x <close>`), `__concat`, and named vararg tables (`function f(...t)`) run instead of raising "not implemented yet".
 - The collector is Lua 5.5's: weak tables (`__mode` "k", "v", "kv") with ephemerons, `__gc` finalizers on tables and userdata (set with the metatable, run in reverse order, resurrection, errors as "error in __gc" warnings, every pending one at `State.destroy` and `os.exit(code, true)`), incremental collection, and generational mode; `collectgarbage` supports every 5.5 option, and the standalone `lua` runs in generational mode as the reference's does. Files left open close when collected.
+- `State.Options.strings`, an allocator for string objects, and `SmallAllocator`, a single-threaded allocator with size classes 8 bytes apart up to 128 bytes; the standalone `lua` allocates strings with it.
+
+### Changed
+
+- The interpreter is faster on float arithmetic, table indexing with integer and string keys, and calls: against reference Lua 5.5.1, mandelbrot, nbody, hash_int, hash_string, array, binary_trees, and fib now run faster, and every `bench/` program peaks at or below the reference's memory.
+- `String.len` is a method, `len()`: a string is 32 bytes plus its contents, in PUC-Rio's `TString` layout.
+- `table.concat`, `string.format`, `gsub`, and the other functions that build strings in an `auxlib.Buffer` no longer copy a long result into a new string, and grow their buffer by half instead of doubling, halving table_concat's peak memory.

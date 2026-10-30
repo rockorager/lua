@@ -93,7 +93,7 @@ fn pushString(th: *Thread, b: []const u8) Error!void {
 
 fn len(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "len");
-    th.push(.int(@intCast((try a.checkString(1)).len)));
+    th.push(.int(@intCast((try a.checkString(1)).len())));
     return 1;
 }
 
@@ -283,7 +283,7 @@ fn gmatch(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "gmatch");
     const s = try a.checkString(1);
     const p = try a.checkString(2);
-    const init = posrelatI(try a.optInteger(3, 1), s.len) - 1;
+    const init = posrelatI(try a.optInteger(3, 1), s.len()) - 1;
     const heap = th.heap();
     const ud = try Userdata.create(heap, @sizeOf(pattern.Gmatch), 0);
     const g: *pattern.Gmatch = @ptrCast(ud.bytes().ptr);
@@ -361,7 +361,7 @@ fn gsub(th: *Thread, base: u32) Error!u32 {
     const src = try a.checkString(1);
     const p = (try a.checkString(2)).bytes();
     const repl = a.get(3);
-    const max_n = try a.optInteger(4, @intCast(src.len + 1));
+    const max_n = try a.optInteger(4, @intCast(src.len() + 1));
     var b: auxlib.Buffer = undefined;
     b.init(th.state);
     defer b.deinit();
