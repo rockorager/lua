@@ -153,7 +153,8 @@ Wave 1, in parallel, with no shared files:
   gmatch, gsub's matching, with captures and position captures), `lib/format.zig`
   (`string.format`'s conversions), and `lib/pack.zig` (`string.pack`,
   `string.unpack`, `string.packsize`), each over byte slices and plain numbers,
-  with no dependency on `Value`.
+  with no dependency on `Value`. Landed: the interfaces the glue implements and
+  how they were checked against the reference are in `string-engines.md`.
 - **Harness**: `bench/` programs, `just bench-compare`, and `just suite`,
   working against the reference `lua` now and ready for ours.
 
