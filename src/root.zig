@@ -22,4 +22,5 @@ test "version is the one the vendored test suite requires" {
 test {
     _ = @import("Lexer.zig");
     _ = @import("number.zig");
+    _ = @import("lib/pattern.zig");
 }
