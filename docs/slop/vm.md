@@ -3,8 +3,8 @@
 What wave 2 added to the interpreter after the core (`core.md`): numbers
 through `number.zig`, concatenation, to-be-closed variables, vararg tables,
 coroutines with continuations, error messages that name variables, stack
-overflow handling, the debug library, and binary chunks. Files: `vm.zig`,
-`Thread.zig`, `State.zig`, `Value.zig`, `debuginfo.zig`, `undump.zig`,
+overflow handling, and the debug library. Files: `vm.zig`,
+`Thread.zig`, `State.zig`, `Value.zig`, `debuginfo.zig`,
 `lib/coroutine.zig`, `lib/debug.zig`. Performance is in
 `results/vm-wave2-20261030.md`.
 
@@ -73,8 +73,13 @@ overflow handling, the debug library, and binary chunks. Files: `vm.zig`,
 - `GETFIELD`/`SELF` that miss on a table whose `__index` is a table look
   the key up there before calling `getSlow`: one level of method lookup
   inline. Deeper chains and `__index` functions still take `getSlow`.
+- An arithmetic fast path that skips its `MMBIN` fetches past it in one
+  step (`fetchSkip`), which keeps `pc` in its register.
+- `fib` measured slower in wall time with fewer instructions: `execute`
+  spills values the call path uses. Moving cold code out of `execute` is
+  the next thing to measure.
 - Measured in `results/vm-wave2-20261030.md`: `bench/methods.lua` went from
-  1.40× the reference to parity.
+  1.45× the reference to parity.
 
 ### To-be-closed variables
 
@@ -91,7 +96,7 @@ overflow handling, the debug library, and binary chunks. Files: `vm.zig`,
   `n`, and `VARARG` with k reads from that table ("vararg table has no
   proper 'n'").
 
-### Debug library and binary chunks
+### Debug library
 
 - `lib/debug.zig` has everything but hooks: `sethook` accepts its arguments
   and never calls the hook, `gethook` returns nil. `getinfo` covers
@@ -103,11 +108,10 @@ overflow handling, the debug library, and binary chunks. Files: `vm.zig`,
 - `registry._LOADED` holds `_G` and the libraries (`lib/init.zig`), which
   names functions in messages ("bad argument #1 to 'table.sort'") until a
   package library owns it.
-- `undump.zig` loads luac 5.5.1 chunks with lundump.c's messages; `load`
-  and `loadfile` use it. `dump.zig` writes them for `string.dump`,
-  rebuilding the relative line information as lcode.c's `savelineinfo`
-  does; a dump is not byte-for-byte luac's where the compiler's line
-  fix-ups differ, but loads in both.
+- `vm.closeState` is what `lua_close` runs before freeing (the main
+  thread's pending `__close` handlers), for `os.exit(code, true)`. The
+  libraries' `base.Host` hangs off `State.host`, and carries the
+  environment and `-E`.
 
 ## Not done
 

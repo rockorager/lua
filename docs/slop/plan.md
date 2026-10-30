@@ -202,8 +202,7 @@ library (`lib/base.zig`), `lib/init.zig`'s `openLibs`, and the standalone
 `lua` (`main.zig`, lua.c without the traceback). `just diff` runs
 `test/diff/*.lua` on both interpreters. The package, io, and os libraries
 (`lib/package.zig`, `lib/io.zig`, `lib/os.zig`) landed too, with `require`;
-`main.zig` hands them the environment and `-E` through the registry until
-`Host` carries them. Coverage, verification, and what they need from the core
+`main.zig` hands them the environment and `-E` in `base.Host`. Coverage, verification, and what they need from the core
 are in `io-os-package.md`. Most suite files now stop on `require "debug"`.
 
 Landed from wave 3: `string.dump` and binary chunks (`dump.zig`,
@@ -214,8 +213,8 @@ Landed from wave 2, the VM (`vm.md`): `number.zig` arithmetic, `__concat`,
 to-be-closed variables, vararg tables, coroutines and continuations
 (`lib/coroutine.zig`), error messages with variable names, stack overflow
 handling, and the debug library without hooks (`lib/debug.zig`). Still
-open there: hooks, and the
-standalone `lua` running its chunk from a native frame.
+open there: hooks, and the standalone `lua` running its chunk from a
+native frame.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.
