@@ -192,8 +192,11 @@ Landed from wave 2: the compiler (`Parser.zig`, `Code.zig`), the base
 library (`lib/base.zig`), `lib/init.zig`'s `openLibs`, and the standalone
 `lua` (`main.zig`, lua.c without the traceback). `just diff` runs
 `test/diff/*.lua` on both interpreters; `vm_errors.lua` there lists the VM's
-messages that still differ. Nothing owns `package`/`require` yet, and most
-suite files start with `require`.
+messages that still differ. The package, io, and os libraries
+(`lib/package.zig`, `lib/io.zig`, `lib/os.zig`) landed too, with `require`;
+`main.zig` hands them the environment and `-E` through the registry until
+`Host` carries them. Coverage, verification, and what they need from the core
+are in `io-os-package.md`. Most suite files now stop on `require "debug"`.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.

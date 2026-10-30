@@ -50,49 +50,57 @@ Measured 2026-10-30 on reference C Lua 5.5.1 from nixpkgs
 ## Files
 
 `ref` is the reference alone (`just suite ref each`); `ours` is
-`just suite ours each` at the commit noted. Ours: the wave-2 parser branch
-(`wave2-parser`, 2026-10-30), with the base library only. "With a stub" is
-a rerun with `require = function(n) return _G[n] or {} end` to find the next
-blocker; no failure so far is in the compiler or the base library. `heavy.lua`, `bwcoercion.lua`, and
-`tracegc.lua` are not in the list: all.lua does not run the first, and the
-other two are modules the files load.
+`just suite ours each` (each file under `timeout 20`, since two hang) on the
+`wave2-io` branch, 2026-10-30: the compiler, the base, package, io, os,
+string, table, math, and utf8 libraries. Most files now stop on
+`require "debug"` (line 6 or so): "with a stub" is a rerun with
+`package.preload.debug` returning a table with `traceback` and `getinfo`, to
+find the next blocker. `heavy.lua`, `bwcoercion.lua`, and `tracegc.lua` are
+not in the list: all.lua does not run the first, and the other two are
+modules the files load.
 
-| File             | ref | ours  | Notes                                                                   |
-| ---------------- | --- | ----- | ----------------------------------------------------------------------- |
-| `main.lua`       | ok  | ok    | returns at once (`_port`)                                               |
-| `gc.lua`         | ok  | FAIL  | `require`; with a stub, line 139 needs `string.gsub`                    |
-| `db.lua`         | ok  | FAIL  | `require`; then the debug library                                       |
-| `calls.lua`      | ok  | FAIL  | `require`; with a stub, line 168 needs `string.find`                    |
-| `strings.lua`    | ok  | FAIL  | line 10: the string library                                             |
-| `literals.lua`   | ok  | FAIL  | `require`; with a stub, line 14 needs the string library                |
-| `tpack.lua`      | ok  | FAIL  | line 4: `string.pack`                                                   |
-| `attrib.lua`     | ok  | FAIL  | `require`, the package library                                          |
-| `gengc.lua`      | ok  | FAIL  | `require`; with a stub, line 86 needs `coroutine`                       |
-| `locals.lua`     | ok  | FAIL  | `require`; with a stub, line 78 needs `debug.getupvalue`                |
-| `constructs.lua` | ok  | FAIL  | `require`; with a stub, line 73 needs `string.format`                   |
-| `code.lua`       | ok  | ok    | returns at once (no `T`)                                                |
-| `big.lua`        | ok  | ok    | returns at once (`_soft`)                                               |
-| `cstack.lua`     | ok  | FAIL  | `require"tracegc"`, the package library                                 |
-| `nextvar.lua`    | ok  | FAIL  | line 77: the string library                                             |
-| `pm.lua`         | ok  | FAIL  | line 22: the string library                                             |
-| `utf8.lua`       | ok  | FAIL  | `require`; then the utf8 library                                        |
-| `api.lua`        | ok  | ok    | returns at once (no `T`)                                                |
-| `memerr.lua`     | ok  | ok    | returns at once (no `T`)                                                |
-| `events.lua`     | ok  | FAIL  | `require`; with a stub, line 55 needs the string arithmetic metamethods |
-| `vararg.lua`     | ok  | FAIL  | line 23: named vararg tables in the VM                                  |
-| `closure.lua`    | ok  | hangs | line 38 waits for a weak table to be collected                          |
-| `coroutine.lua`  | ok  | FAIL  | `require`; then the coroutine library                                   |
-| `goto.lua`       | ok  | FAIL  | line 14: the string library                                             |
-| `errors.lua`     | ok  | FAIL  | `require`; with a stub, line 35 needs the string library                |
-| `math.lua`       | ok  | FAIL  | `require`; then the math library                                        |
-| `sort.lua`       | ok  | FAIL  | line 6: the table library                                               |
-| `bitwise.lua`    | ok  | FAIL  | `require"bwcoercion"`, the package library                              |
-| `verybig.lua`    | ok  | ok    |                                                                         |
-| `files.lua`      | ok  | FAIL  | `require`; then the io and os libraries                                 |
-| `all.lua`        | ok  | FAIL  | line 61: `math.randomseed`                                              |
+| File             | ref | ours  | Notes                                                                                                 |
+| ---------------- | --- | ----- | ----------------------------------------------------------------------------------------------------- |
+| `main.lua`       | ok  | ok    | returns at once (`_port`); without `_port`, see below                                                 |
+| `gc.lua`         | ok  | FAIL  | `require "debug"`; with a stub, line 249                                                              |
+| `db.lua`         | ok  | FAIL  | `require "debug"`; with a stub, line 16: the debug library                                            |
+| `calls.lua`      | ok  | FAIL  | `require "debug"`; with a stub, line 168                                                              |
+| `strings.lua`    | ok  | FAIL  | line 176: indexes nil                                                                                 |
+| `literals.lua`   | ok  | FAIL  | `require "debug"`; with a stub, line 40                                                               |
+| `tpack.lua`      | ok  | ok    |                                                                                                       |
+| `attrib.lua`     | ok  | FAIL  | `require "coroutine"` loads `./coroutine.lua`, which needs `debug`; with a `coroutine` stub it passes |
+| `gengc.lua`      | ok  | FAIL  | `require "debug"`; with a stub, line 86: `coroutine`                                                  |
+| `locals.lua`     | ok  | FAIL  | `require "debug"`; with a stub, line 78: `debug.getupvalue`                                           |
+| `constructs.lua` | ok  | FAIL  | `require "debug"`; with a stub, line 92                                                               |
+| `code.lua`       | ok  | ok    | returns at once (no `T`)                                                                              |
+| `big.lua`        | ok  | ok    | returns at once (`_soft`)                                                                             |
+| `cstack.lua`     | ok  | FAIL  | `require "debug"`; with a stub, `tracegc.lua:33`                                                      |
+| `nextvar.lua`    | ok  | hangs | "testing attack on table length": the collector                                                       |
+| `pm.lua`         | ok  | ok    |                                                                                                       |
+| `utf8.lua`       | ok  | ok    |                                                                                                       |
+| `api.lua`        | ok  | ok    | returns at once (no `T`)                                                                              |
+| `memerr.lua`     | ok  | ok    | returns at once (no `T`)                                                                              |
+| `events.lua`     | ok  | FAIL  | `require "debug"`; with a stub, line 371                                                              |
+| `vararg.lua`     | ok  | FAIL  | line 23: named vararg tables in the VM                                                                |
+| `closure.lua`    | ok  | hangs | line 38 waits for a weak table to be collected                                                        |
+| `coroutine.lua`  | ok  | FAIL  | `require "debug"`; with a stub, line 10: the coroutine library                                        |
+| `goto.lua`       | ok  | FAIL  | `require "debug"`; with a stub, line 197                                                              |
+| `errors.lua`     | ok  | FAIL  | `require "debug"`; with a stub, line 30                                                               |
+| `math.lua`       | ok  | FAIL  | line 66: assertion                                                                                    |
+| `sort.lua`       | ok  | FAIL  | `require "debug"`; with a stub, line 78                                                               |
+| `bitwise.lua`    | ok  | ok    |                                                                                                       |
+| `verybig.lua`    | ok  | ok    |                                                                                                       |
+| `files.lua`      | ok  | FAIL  | `require "debug"`; with a stub, line 110: too many open files, since `__gc` does not run              |
+| `all.lua`        | ok  | FAIL  | line 153: `string.dump`, after `main.lua`                                                             |
 
 Under `_U`, five files return at once: `main.lua` (`_port`), `big.lua`
 (`_soft`), and `api.lua`, `code.lua`, and `memerr.lua` (`T`, the C test
 library, is nil). Ours passing them says only that they load; `big.lua` gets
 real coverage when `_soft` turns off, `main.lua` never does without the C
 modules.
+
+Without `_U` (`_port` false), ours runs `main.lua` through line 206 and stops
+where the interpreter would warn about readline (the reference stops at 212);
+with that block skipped, both stop at line 251 on the C module `lib2-v2`.
+`attrib.lua` with a `coroutine` stub stops at line 337 on the same C modules,
+where the reference stops at 272 on the missing `libs/P1/`.
