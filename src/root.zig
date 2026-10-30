@@ -23,8 +23,6 @@ test {
     _ = @import("Lexer.zig");
     _ = @import("number.zig");
     _ = @import("lib/pattern.zig");
-}
-
-test {
     _ = @import("lib/format.zig");
+    _ = @import("lib/pack.zig");
 }
