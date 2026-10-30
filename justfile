@@ -10,10 +10,11 @@ suite_files := "main gc db calls strings literals tpack attrib gengc locals cons
 default:
     @just --list
 
-[doc("Unit tests")]
+[doc("Unit tests, in Debug and ReleaseSafe")]
 [group("test")]
 test:
     zig build test --summary all
+    zig build test -Doptimize=ReleaseSafe --summary all
 
 [doc("The official suite on BIN: ours (zig-out/bin/lua, built ReleaseSafe), ref (the dev shell's lua), or a path. With no FILES it runs all.lua with _U=true; FILES (or `each` for all of them) runs each file alone and prints one line per file")]
 [group("test")]
