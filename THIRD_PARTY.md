@@ -10,6 +10,7 @@ lua is MIT (`LICENSE`). Most of the implementation is written for this repositor
 Adapted into Zig, function by function:
 
 - `src/Parser.zig` from `lparser.c`, and `src/Code.zig` from `lcode.c`, with its listing writer from `luac.c`'s `PrintFunction`.
+- `src/lib/base.zig` from `lbaselib.c` and the parts of `lauxlib.c` it uses.
 
 ## Lua 5.5 Reference Manual
 

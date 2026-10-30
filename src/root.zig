@@ -16,6 +16,8 @@ pub const opcodes = @import("opcodes.zig");
 pub const vm = @import("vm.zig");
 pub const Parser = @import("Parser.zig");
 pub const Code = @import("Code.zig");
+/// The standard libraries; `lib.openLibs` opens them.
+pub const lib = @import("lib/init.zig");
 
 /// The value of the global `_VERSION`, as the reference manual's §6.2 gives it.
 pub const version = "Lua 5.5";
@@ -45,4 +47,5 @@ test {
     _ = @import("lib/table.zig");
     _ = @import("lib/math.zig");
     _ = @import("lib/utf8.zig");
+    _ = @import("lib/base.zig");
 }
