@@ -276,10 +276,12 @@ pub fn loadChunk(th: *Thread, src: [:0]const u8, chunkname: []const u8, mode: []
     return .luaClosure(try vm.mainClosure(th.state, p));
 }
 
+/// Raises a load error, which `load` returns instead of raising, so no
+/// message handler sees it (`luaD_throw`).
 fn throwFmt(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
     var buf: [256]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch &buf;
-    return th.throw(.string(try th.state.newString(s)));
+    return th.throwRaw(.string(try th.state.newString(s)));
 }
 
 /// The error object of a failed protected operation, clearing it.
@@ -725,7 +727,11 @@ fn loadFromReader(th: *Thread, reader: Value, name: []const u8, mode: []const u8
 
 fn dofile(th: *Thread, base: u32) Error!u32 {
     const fname = try optString(th, base, 1, "dofile");
-    const f = try loadFile(th, if (fname) |s| s.bytes() else null, "bt");
+    // `dofile` raises a load error, through the message handler.
+    const f = loadFile(th, if (fname) |s| s.bytes() else null, "bt") catch |e| switch (e) {
+        error.LuaError => return th.throw(th.err),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     const func = th.top;
     th.push(f);
     try vm.callk(th, func, -1, func - base, &dofileCont);

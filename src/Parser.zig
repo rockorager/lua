@@ -128,7 +128,7 @@ pub fn compile(th: *Thread, source: [:0]const u8, chunkname: []const u8) Value.E
     defer ls.deinit();
     return ls.mainFunc() catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.SyntaxError => return th.throw(.string(try state.newString(ls.msg.items))),
+        error.SyntaxError => return th.throwRaw(.string(try state.newString(ls.msg.items))),
     };
 }
 

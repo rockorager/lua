@@ -214,7 +214,8 @@ to-be-closed variables, vararg tables, coroutines and continuations
 (`lib/coroutine.zig`), error messages with variable names, stack overflow
 handling, and the debug library (`lib/debug.zig`). Wave 3 added hooks,
 with a second instance of the interpreter loop so the unhooked one checks
-nothing per instruction (`vm.md`).
+nothing per instruction (`vm.md`), and the standalone `lua` runs
+everything from a native frame with lua.c's traceback handler.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.

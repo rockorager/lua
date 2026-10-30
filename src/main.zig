@@ -1,8 +1,10 @@
 //! The standalone interpreter, `lua`, as reference Lua 5.5.1's lua.c
 //! behaves: a script with its `arg` table, `-e`, `-l`, `-i`, `-v`, `-E`,
 //! `-W`, `--`, `-` for stdin, `LUA_INIT`, and an interactive loop when
-//! stdin is a terminal. Errors print as "lua: message" on stderr, without
-//! the reference's traceback, and the exit status is 1.
+//! stdin is a terminal. Everything runs inside a native function called
+//! in protected mode, as lua.c's `pmain`, so a traceback ends in its
+//! "[C]: in ?". Errors print as "lua: message" and a traceback on stderr,
+//! and the exit status is 1.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,9 +42,9 @@ const Interp = struct {
     fn report(it: *Interp) void {
         const th = it.th;
         const v = th.stack[th.top - 1];
+        const s = vm.toLString(th.state, v) catch null;
+        it.message(if (s) |m| m.bytes() else "(error message not a string)");
         th.top -= 1;
-        var buf: [number_len]u8 = undefined;
-        it.message(it.errorText(v, &buf));
     }
 
     /// The text of an error object: a string or number as is, a `__tostring`
@@ -61,10 +63,22 @@ const Interp = struct {
     }
 
     /// Calls the function below `narg` arguments on top in protected
-    /// mode. On failure the error object is left on top.
+    /// mode, with `msghandler` adding a traceback to the error message.
+    /// On failure the error object is left on top.
     fn docall(it: *Interp, narg: u32, nres: i16) bool {
         const th = it.th;
-        return vm.pcall(th, th.top - narg - 1, nres);
+        th.ensureStack(1) catch {
+            th.push(.string(th.state.memerr));
+            return false;
+        };
+        const func = th.top - narg - 1;
+        @memmove(th.stack[func + 1 .. th.top + 1], th.stack[func..th.top]);
+        th.stack[func] = .native(&msghandler);
+        th.top += 1;
+        const ok = vm.pcallMsgh(th, func + 1, nres, func);
+        @memmove(th.stack[func .. th.top - 1], th.stack[func + 1 .. th.top]);
+        th.top -= 1;
+        return ok;
     }
 
     /// Pushes the result of a load, or its error object, and says which.
@@ -284,6 +298,29 @@ const Interp = struct {
 
 const number_len = 128;
 
+/// The message handler of every chunk the interpreter runs: the message
+/// and a traceback, or a non-string error object's `__tostring`, as
+/// lua.c's `msghandler`.
+fn msghandler(th: *Thread, b: u32) Value.Error!u32 {
+    const v = th.stack[b];
+    var buf: [number_len]u8 = undefined;
+    const msg = if (try vm.toLString(th.state, v)) |s| s.bytes() else blk: {
+        if (base.getMetafield(th, v, "__tostring") != null) {
+            const s = try base.toStringValue(th, v);
+            if (s.isString()) {
+                th.push(s);
+                return 1;
+            }
+        }
+        break :blk std.fmt.bufPrint(&buf, "(error object is a {s} value)", .{v.typeOf().name()}) catch unreachable;
+    };
+    var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
+    defer aw.deinit();
+    lua.debuginfo.traceback(&aw.writer, th, msg, 1) catch return error.OutOfMemory;
+    th.push(.string(try th.state.newString(aw.written())));
+    return 1;
+}
+
 const Flags = struct {
     const has_error = 1;
     const has_i = 2;
@@ -436,6 +473,21 @@ fn pmain(it: *Interp, args: []const [:0]const u8) Value.Error!bool {
     return true;
 }
 
+/// What `main` hands `pmainNative`, through a light userdata.
+const Main = struct {
+    it: *Interp,
+    args: []const [:0]const u8,
+};
+
+/// `pmain` as a native function, which `main` calls in protected mode.
+/// Returns whether everything succeeded.
+fn pmainNative(th: *Thread, b: u32) Value.Error!u32 {
+    const m: *Main = @ptrCast(@alignCast(th.stack[b].asLightUserdata().?));
+    const ok = try pmain(m.it, m.args);
+    th.push(.boolean(ok));
+    return 1;
+}
+
 pub fn main(init: std.process.Init) u8 {
     // Debug builds keep the leak-checking allocator; the others use a fast
     // general-purpose one.
@@ -455,14 +507,23 @@ pub fn main(init: std.process.Init) u8 {
     };
     defer state.destroy();
     var it: Interp = .{ .th = state.main, .host = &host, .environ = init.environ_map, .progname = progname };
-    const ok = pmain(&it, args) catch |e| blk: {
-        // Opening the libraries or building `arg` failed.
-        it.th.err = .nil;
-        it.message(switch (e) {
-            error.OutOfMemory => "not enough memory",
-            error.LuaError => "error opening the libraries",
-        });
-        break :blk false;
+    var m: Main = .{ .it = &it, .args = args };
+    const th = it.th;
+    const ok = blk: {
+        th.ensureStack(2) catch {
+            it.message("not enough memory");
+            break :blk false;
+        };
+        const func = th.top;
+        th.push(.native(&pmainNative));
+        th.push(Value.lightUserdata(&m));
+        if (!vm.pcall(th, func, 1)) {
+            // Opening the libraries or building `arg` failed.
+            it.report();
+            break :blk false;
+        }
+        th.top -= 1;
+        break :blk !th.stack[th.top].isFalsy();
     };
     // Open files flush at exit, as C's `exit` flushes every stream.
     lua.lib.io.flushAll(it.th);

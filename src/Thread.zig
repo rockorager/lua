@@ -326,6 +326,14 @@ pub fn throw(th: *Thread, v: Value) Error {
     return error.LuaError;
 }
 
+/// Raises `v` without the message handler, as `luaD_throw` does: for the
+/// errors loading a chunk returns instead of raising (syntax errors, bad
+/// binary chunks, unreadable files), which no handler sees.
+pub fn throwRaw(th: *Thread, v: Value) Error {
+    th.err = v;
+    return error.LuaError;
+}
+
 /// Raises "error in error handling", without the message handler: a
 /// stack overflow while handling one, or runaway nesting of handlers.
 pub fn errorInErrorHandling(th: *Thread) Error {

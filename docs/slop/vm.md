@@ -141,6 +141,12 @@ hooked)`. The unhooked instance's dispatch is the wave-2 loop with no
   off and the frame flagged `hooked` (getinfo names the hook "hook '?'");
   a protected call restores `allowhook` after an error (`Frame.flags.oah`
   for yieldable ones). Hooks cannot yield: `hookf` calls with `vm.call`.
+- Errors loading a chunk (syntax, binary format, unreadable file) raise
+  with `Thread.throwRaw`, which skips the message handler, as
+  `luaD_throw` does; `dofile` re-raises through the handler.
+- `main.zig` runs `pmain` as a native function in protected mode and calls
+  each chunk with lua.c's `msghandler`, so uncaught errors print the
+  reference's traceback, ending in "[C]: in ?".
 
 ## Not done
 

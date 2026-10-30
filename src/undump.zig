@@ -52,7 +52,7 @@ const Loader = struct {
         const gpa = s.th.heap().allocator();
         const msg = try std.fmt.allocPrint(gpa, "{s}: bad binary format ({s})", .{ s.name, why });
         defer gpa.free(msg);
-        return s.th.throw(.string(try s.th.state.newString(msg)));
+        return s.th.throwRaw(.string(try s.th.state.newString(msg)));
     }
 
     fn block(s: *Loader, n: usize) Error![]const u8 {
