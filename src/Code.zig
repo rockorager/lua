@@ -17,6 +17,8 @@ const State = @import("State.zig");
 const opcodes = @import("opcodes.zig");
 const number = @import("number.zig");
 const Parser = @import("Parser.zig");
+// The reference's `pow`, so folded constants match the VM's `^`.
+const libm = @import("lib/libm.zig");
 
 const OpCode = opcodes.OpCode;
 const Instruction = opcodes.Instruction;
@@ -1426,7 +1428,7 @@ fn constFolding(o: FoldOp, e1: *ExpDesc, e2: *const ExpDesc) bool {
         .sub => x - y,
         .mul => x * y,
         .div => x / y,
-        .pow => if (y == 2) x * x else std.math.pow(f64, x, y),
+        .pow => if (y == 2) x * x else libm.pow(x, y),
         .idiv => number.divFloorFloat(x, y),
         .mod => number.modFloat(x, y),
         .unm => -x,
