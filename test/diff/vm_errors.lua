@@ -1,5 +1,4 @@
--- Messages the VM and Thread.zig produce, which still differ from the
--- reference; each line names what it checks.
+-- Messages the VM and Thread.zig produce; each line names what it checks.
 local function try(f, ...) print(pcall(f, ...)) end
 try(function() return 1 // 0 end)                       -- "attempt to divide by zero"
 try(function() return 1 % 0 end)                        -- "attempt to perform 'n%%0'"
