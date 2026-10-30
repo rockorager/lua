@@ -32,6 +32,11 @@
               # suite: the oracle for differential tests and the baseline
               # for benchmarks.
               lua5_5
+              # `just bench-compare` (bench/README.md): nixpkgs' goperf is
+              # golang.org/x/perf, which supplies benchstat, and util-linux
+              # supplies taskset, which pins every run to one core.
+              goperf
+              util-linux
             ];
           };
         };
