@@ -3,6 +3,9 @@
 
 markdown := "README.md AGENTS.md CHANGELOG.md THIRD_PARTY.md bench/README.md docs/slop .github"
 
+# The files all.lua runs, in its order, for `just suite BIN each`.
+suite_files := "main gc db calls strings literals tpack attrib gengc locals constructs code big cstack nextvar pm utf8 api memerr events vararg closure coroutine goto errors math sort bitwise verybig files"
+
 [private]
 default:
     @just --list
@@ -11,6 +14,48 @@ default:
 [group("test")]
 test:
     zig build test --summary all
+
+[doc("The official suite on BIN: ours (zig-out/bin/lua, built ReleaseSafe), ref (the dev shell's lua), or a path. With no FILES it runs all.lua with _U=true; FILES (or `each` for all of them) runs each file alone and prints one line per file")]
+[group("test")]
+suite BIN="ours" *FILES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ BIN }}" in
+        ours)
+            rm -f zig-out/bin/lua
+            zig build -Doptimize=ReleaseSafe
+            if [ ! -x zig-out/bin/lua ]; then
+                echo "no zig-out/bin/lua: build.zig does not install a lua executable yet. Run 'just suite ref' for the reference" >&2
+                exit 1
+            fi
+            bin=$PWD/zig-out/bin/lua
+            ;;
+        ref) bin=$(command -v lua) ;;
+        *) bin=$(realpath "{{ BIN }}") ;;
+    esac
+    files=({{ FILES }})
+    [ "${files[*]}" = each ] && files=({{ suite_files }})
+    log=$PWD/zig-out/suite
+    # lua.org's instructions: run from the suite's directory. main.lua starts
+    # the interpreter again by name, so the path is absolute.
+    cd test/lua-5.5.1-tests
+    if [ ${#files[@]} -eq 0 ]; then
+        exec "$bin" -e"_U=true" all.lua
+    fi
+    # Alone, a file gets the globals all.lua sets under _U. It skips all.lua's
+    # string.dump round trip.
+    rm -rf "$log" && mkdir -p "$log"
+    failed=0
+    for f in "${files[@]}"; do
+        f=${f%.lua}
+        if "$bin" -e"_U=true _soft=true _port=true _nomsg=true" "$f.lua" > "$log/$f.txt" 2>&1; then
+            echo "ok    $f"
+        else
+            echo "FAIL  $f    zig-out/suite/$f.txt: $(tail -n 1 "$log/$f.txt")"
+            failed=1
+        fi
+    done
+    exit $failed
 
 [doc("Time every bench/ program, or only PROGRAMS, on our zig-out/bin/lua (ReleaseFast) and the reference lua: interleaved rounds on one core, checksums checked, then benchstat. The numbers are not claims")]
 [group("bench")]
