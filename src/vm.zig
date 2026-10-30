@@ -118,12 +118,14 @@ pub fn pcallMsgh(th: *Thread, func: u32, nresults: i16, msgh: u32) bool {
 fn protectedCall(th: *Thread, func: u32, nresults: i16, msgh: u32) Error!bool {
     const frames = th.frames.items.len;
     const old_errfunc = th.errfunc;
+    const old_allowhook = th.allowhook;
     th.errfunc = msgh;
     defer th.errfunc = old_errfunc;
     call(th, func, nresults) catch |e| {
         if (th.closed_self) return e;
         const err = errorObject(th, e);
         th.frames.items.len = frames;
+        th.allowhook = old_allowhook;
         th.stack[func] = closeProtected(th, func, err) orelse err;
         if (th.closed_self) return error.LuaError;
         th.top = func + 1;
@@ -149,6 +151,7 @@ pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn
         f.aux = func;
         f.old_errfunc = th.errfunc;
         f.flags.ypcall = true;
+        f.flags.oah = th.allowhook;
     }
     th.errfunc = msgh;
     // An error unwinds past here to `resumeThread`, which finds this frame
@@ -247,7 +250,7 @@ noinline fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
         switch (f.tag) {
             .lua_closure => {
                 try pushLuaFrame(th, func, f.asLuaClosure().proto, nresults);
-                if (chain > 0) th.frame().ncallmt = @intCast(chain);
+                if (chain > 0) th.frame().flags.ncallmt = @intCast(chain);
                 return true;
             },
             .native_fn => {
@@ -304,15 +307,18 @@ noinline fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn)
         .nresults = nresults,
         .flags = .{},
     });
+    if (th.hookmask & Thread.HookMask.call != 0) try callHook(th, .call, -1, 1, th.top - func - 1);
     const n = try f(th, func + 1);
     std.debug.assert(n <= th.top - func - 1);
+    if (th.hookmask != 0) try retHook(th, th.top - n, n);
     moveResults(th, func, th.top - n, n, nresults);
     th.frames.items.len -= 1;
 }
 
 /// Finishes the running frame, a native one, with `n` results on top
 /// (`luaD_poscall`).
-fn posCall(th: *Thread, n: u32) void {
+fn posCall(th: *Thread, n: u32) Error!void {
+    if (th.hookmask != 0) try retHook(th, th.top - n, n);
     const f = th.frame();
     moveResults(th, f.func, th.top - n, n, f.nresults);
     th.frames.items.len -= 1;
@@ -465,7 +471,7 @@ fn resumeBody(co: *Thread, nargs: u32) Error!void {
     var n = nargs;
     const f = co.frame();
     if (f.k()) |k| n = try k(co, f.base(), .yield, f.extra_args);
-    posCall(co, n);
+    try posCall(co, n);
     try unroll(co);
 }
 
@@ -493,7 +499,7 @@ fn finishNative(th: *Thread) Error!void {
     if (f.top < th.top) f.top = th.top;
     const k = f.k() orelse unreachable;
     const n = try k(th, f.base(), status, f.extra_args);
-    posCall(th, n);
+    try posCall(th, n);
 }
 
 /// Completes the protected call of the native frame at `idx` after it was
@@ -512,6 +518,7 @@ fn finishPcallk(th: *Thread, idx: usize) Error!KStatus {
         th.top = func + 1;
         th.shrinkStack();
         th.frames.items[idx].flags.recover = false;
+        th.allowhook = th.frames.items[idx].flags.oah;
         status = .err;
     }
     const f = &th.frames.items[idx];
@@ -648,6 +655,7 @@ noinline fn closeLevel(th: *Thread, level: u32, mode: CloseMode, comptime yielda
 fn closeProtected(th: *Thread, level: u32, err_in: ?Value) ?Value {
     var err = err_in;
     const frames = th.frames.items.len;
+    const old_allowhook = th.allowhook;
     while (true) {
         const mode: CloseMode = if (err) |e| .{ .err = e } else .normal;
         closeLevel(th, level, mode, false) catch |e| {
@@ -655,10 +663,140 @@ fn closeProtected(th: *Thread, level: u32, err_in: ?Value) ?Value {
             if (th.closed_self) return if (th.top == 2) th.stack[1] else null;
             err = errorObject(th, e);
             th.frames.items.len = frames;
+            th.allowhook = old_allowhook;
             continue;
         };
         return err;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+/// Sets the debug hook of `th` (`lua_sethook`): `mask` is `HookMask`
+/// bits, and `count` the instructions between count events. A null hook
+/// or an empty mask turns hooks off. The interpreter notices the change
+/// when the native that made it returns.
+pub fn setHook(th: *Thread, hook: ?Thread.Hook, mask: u8, count: i32) void {
+    const off = hook == null or mask == 0;
+    th.hook = if (off) null else hook;
+    th.hookmask = if (off) 0 else mask;
+    th.basehookcount = count;
+    th.hookcount = count;
+}
+
+/// Calls the hook for `event` in the running frame (`luaD_hook`), unless
+/// a hook is running already. The hook runs above the frame's registers,
+/// with `Thread.min_stack` free slots, and the frame flagged `hooked`.
+noinline fn callHook(th: *Thread, event: Thread.HookEvent, line: i32, ftransfer: u32, ntransfer: u32) Error!void {
+    const hook = th.hook orelse return;
+    if (!th.allowhook) return;
+    const idx = th.frames.items.len - 1;
+    const top = th.top;
+    const ci_top = th.frames.items[idx].top;
+    th.ftransfer = @intCast(ftransfer);
+    th.ntransfer = @intCast(ntransfer);
+    {
+        const ci = &th.frames.items[idx];
+        if (ci.flags.lua and th.top < ci.top) th.top = ci.top;
+    }
+    try th.ensureStack(Thread.min_stack);
+    const ci = &th.frames.items[idx];
+    if (ci.top < th.top + Thread.min_stack) ci.top = th.top + Thread.min_stack;
+    th.allowhook = false;
+    ci.flags.hooked = true;
+    // An error leaves the frame to be unwound, and the protected call
+    // that catches it restores `allowhook`.
+    try hook(th, event, line, idx);
+    th.allowhook = true;
+    const after = &th.frames.items[idx];
+    after.top = ci_top;
+    th.top = top;
+    after.flags.hooked = false;
+}
+
+/// The call hook of the running Lua frame, about to run its first
+/// instruction (`luaD_hookcall`). A tail call reports "tail call".
+noinline fn hookCall(th: *Thread) Error!void {
+    th.oldpc = 0;
+    if (th.hookmask & Thread.HookMask.call == 0) return;
+    const ci = th.frame();
+    const event: Thread.HookEvent = if (ci.flags.tail) .tail_call else .call;
+    const p = th.stack[ci.func].asLuaClosure().proto;
+    const idx = th.frames.items.len - 1;
+    // Hooks see the pc past the instruction, as everywhere else.
+    ci.pc += 1;
+    try callHook(th, event, -1, 1, p.numparams);
+    th.frames.items[idx].pc -= 1;
+}
+
+/// The return hook of the running frame, whose `nres` results start at
+/// stack slot `first` (`rethook`). It also sets `oldpc` for the line hook
+/// of a Lua caller, which goes on after its call instruction.
+noinline fn retHook(th: *Thread, first: u32, nres: u32) Error!void {
+    const idx = th.frames.items.len - 1;
+    if (th.hookmask & Thread.HookMask.ret != 0) {
+        const ci = &th.frames.items[idx];
+        // A vararg function's results count from where its function sat
+        // while it ran, above the extra arguments.
+        var delta: u32 = 0;
+        if (ci.flags.lua) {
+            const p = th.stack[ci.func].asLuaClosure().proto;
+            if (p.flags.vararg) delta = ci.extra_args + p.numparams + 1;
+        }
+        ci.func += delta;
+        const ftransfer = first - ci.func;
+        defer th.frames.items[idx].func -= delta;
+        try callHook(th, .ret, -1, ftransfer, nres);
+    }
+    if (idx > 0) {
+        const prev = &th.frames.items[idx - 1];
+        if (prev.flags.lua) th.oldpc = @intCast(Thread.currentPc(th.stack[prev.func].asLuaClosure().proto, prev));
+    }
+}
+
+/// The count and line hooks before the instruction at `pc` of the running
+/// Lua frame (`luaG_traceexec`). A line event fires on entering a new line,
+/// and on a jump back to an instruction at or before the last one traced,
+/// which repeats a loop's line each time around.
+noinline fn traceExec(th: *Thread, pc: [*]const u32) Error!void {
+    const mask = th.hookmask;
+    if (mask & (Thread.HookMask.line | Thread.HookMask.count) == 0) return;
+    const ci = th.frame();
+    ci.pc = pc + 1;
+    var counthook = false;
+    if (mask & Thread.HookMask.count != 0) {
+        th.hookcount -%= 1;
+        if (th.hookcount == 0) {
+            th.hookcount = th.basehookcount;
+            counthook = true;
+        }
+    }
+    if (!counthook and mask & Thread.HookMask.line == 0) return;
+    // An instruction that takes its operands up to `top` keeps it.
+    if (!usesTop(pc[0])) th.top = ci.top;
+    const p = th.stack[ci.func].asLuaClosure().proto;
+    const npci: u32 = @intCast((@intFromPtr(pc) - @intFromPtr(p.code.ptr)) / 4);
+    if (counthook) try callHook(th, .count, -1, 0, 0);
+    if (mask & Thread.HookMask.line != 0) {
+        // `oldpc` may be stale; any valid value costs at most one extra
+        // event.
+        const oldpc = if (th.oldpc < p.code.len) th.oldpc else 0;
+        if (npci <= oldpc or p.lineAt(oldpc) != p.lineAt(npci)) {
+            const line: i32 = if (p.lineAt(npci)) |l| @intCast(l) else -1;
+            try callHook(th, .line, line, 0, 0);
+        }
+        th.oldpc = npci;
+    }
+}
+
+/// Whether instruction `i` takes its operands up to `top`, as set by the
+/// instruction before it (`luaP_isIT`).
+fn usesTop(i: Instruction) bool {
+    const o = op(i);
+    if (!opcodes.props[@intFromEnum(o)].in_top) return false;
+    return if (o == .setlist) opcodes.vb(i) == 0 else getB(i) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -680,8 +818,60 @@ inline fn fetchSkip(pc: *[*]const u32, i: *Instruction) opcodes.OpCode {
 }
 
 /// Runs Lua frames from the current one until a frame flagged `fresh`
-/// returns.
+/// returns (`luaV_execute`). The loop has two instances: one without
+/// hooks, whose dispatch checks nothing, and one that runs the hooks
+/// before each instruction and at calls and returns. Each switches to the
+/// other when the thread's hook mask changes, which only code the loop
+/// calls out to can do.
 fn execute(th: *Thread) Error!void {
+    while (if (th.hookmask != 0) try runLoop(th, true) else try runLoop(th, false)) {}
+}
+
+/// Whether the loop instance `hooked` must hand over to the other one.
+inline fn hookSwitch(comptime hooked: bool, th: *const Thread) bool {
+    return (th.hookmask != 0) != hooked;
+}
+
+/// The next instruction, after the hooks for it when `hooked`
+/// (`vmfetch`). A hook may grow the stack and move the frames, so `ci`
+/// and `base` are reloaded.
+inline fn nextOp(
+    comptime hooked: bool,
+    th: *Thread,
+    ci: **Frame,
+    pc: *[*]const u32,
+    i: *Instruction,
+    base: *[*]Value,
+) Error!opcodes.OpCode {
+    if (hooked) {
+        try traceExec(th, pc.*);
+        ci.* = th.frame();
+        base.* = th.stack.ptr + ci.*.base();
+    }
+    return fetch(pc, i);
+}
+
+/// `nextOp` past the next instruction: an arithmetic fast path skipping
+/// its `MMBIN`.
+inline fn nextSkip(
+    comptime hooked: bool,
+    th: *Thread,
+    ci: **Frame,
+    pc: *[*]const u32,
+    i: *Instruction,
+    base: *[*]Value,
+) Error!opcodes.OpCode {
+    if (hooked) {
+        pc.* += 1;
+        return nextOp(true, th, ci, pc, i, base);
+    }
+    return fetchSkip(pc, i);
+}
+
+/// One instance of the loop. Returns false when the frame flagged
+/// `fresh` returned, and true to switch instances, with the running
+/// frame's `pc` saved at the next instruction.
+fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
     // The inline prongs instantiate many inline calls at compile time.
     @setEvalBranchQuota(10_000);
     const heap = th.heap();
@@ -692,53 +882,67 @@ fn execute(th: *Thread) Error!void {
         var base: [*]Value = th.stack.ptr + ci.base();
         var pc: [*]const u32 = ci.pc;
         var i: Instruction = undefined;
-        dispatch: switch (fetch(&pc, &i)) {
+        // A function's first instruction gets the call hook first
+        // (`luaG_tracecall`); a vararg function's comes after
+        // `VARARGPREP`, which is not traced.
+        const starting = hooked and pc == cl.proto.code.ptr;
+        const vararg = cl.proto.flags.vararg or cl.proto.flags.vararg_table;
+        if (starting and !vararg) {
+            try hookCall(th);
+            ci = th.frame();
+            base = th.stack.ptr + ci.base();
+        }
+        const first_op = if (hooked and !(starting and vararg))
+            try nextOp(true, th, &ci, &pc, &i, &base)
+        else
+            fetch(&pc, &i);
+        dispatch: switch (first_op) {
             .move => {
                 base[getA(i)] = base[getB(i)];
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadi => {
                 base[getA(i)] = .int(opcodes.sbx(i));
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadf => {
                 base[getA(i)] = .float(@floatFromInt(opcodes.sbx(i)));
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadk => {
                 base[getA(i)] = k[opcodes.bx(i)];
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadkx => {
                 base[getA(i)] = k[opcodes.ax(pc[0])];
                 pc += 1;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadfalse => {
                 base[getA(i)] = .false;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .lfalseskip => {
                 base[getA(i)] = .false;
                 pc += 1;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadtrue => {
                 base[getA(i)] = .true;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .loadnil => {
                 const a = getA(i);
                 for (0..@as(usize, getB(i)) + 1) |j| base[a + j] = .nil;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .getupval => {
                 base[getA(i)] = cl.upvals()[getB(i)].v.*;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .setupval => {
                 cl.upvals()[getB(i)].set(heap, base[getA(i)]);
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .gettabup => {
                 const t = cl.upvals()[getB(i)].v.*;
@@ -748,15 +952,16 @@ fn execute(th: *Thread) Error!void {
                     const v = h.getShortStr(key.asString());
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
                         base[getA(i)] = v;
-                        continue :dispatch fetch(&pc, &i);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
                 ci.pc = pc;
                 const done = try getSlow(th, .vm, ci, t, key, .{ .upval = getB(i) }, ci.base() + getA(i));
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .gettable => {
                 const t = base[getB(i)];
@@ -766,15 +971,16 @@ fn execute(th: *Thread) Error!void {
                     const v = if (key.tag == .int) h.getInt(key.payload.int) else h.get(key);
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
                         base[getA(i)] = v;
-                        continue :dispatch fetch(&pc, &i);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
                 ci.pc = pc;
                 const done = try getSlow(th, .vm, ci, t, key, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .geti => {
                 const t = base[getB(i)];
@@ -783,7 +989,7 @@ fn execute(th: *Thread) Error!void {
                     const v = h.getInt(getC(i));
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
                         base[getA(i)] = v;
-                        continue :dispatch fetch(&pc, &i);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
                 ci.pc = pc;
@@ -791,8 +997,9 @@ fn execute(th: *Thread) Error!void {
                 const done = try getSlow(th, .vm, ci, t, .int(getC(i)), origin, ci.base() + getA(i));
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .getfield, .self => {
                 const t = base[getB(i)];
@@ -803,18 +1010,18 @@ fn execute(th: *Thread) Error!void {
                     const v = h.getShortStr(key.asString());
                     if (!v.isNil()) {
                         base[getA(i)] = v;
-                        continue :dispatch fetch(&pc, &i);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                     const tm = th.state.fastTm(h.metatable, .index) orelse {
                         base[getA(i)] = .nil;
-                        continue :dispatch fetch(&pc, &i);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     };
                     // A class table as `__index`, the usual method lookup.
                     if (tm.tag == .table) {
                         const v2 = tm.asTable().getShortStr(key.asString());
                         if (!v2.isNil()) {
                             base[getA(i)] = v2;
-                            continue :dispatch fetch(&pc, &i);
+                            continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                         }
                     }
                 }
@@ -822,8 +1029,9 @@ fn execute(th: *Thread) Error!void {
                 const done = try getSlow(th, .vm, ci, t, key, .{ .slot = ci.base() + getB(i) }, ci.base() + getA(i));
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .settabup => {
                 const t = cl.upvals()[getA(i)].v.*;
@@ -831,14 +1039,15 @@ fn execute(th: *Thread) Error!void {
                 const v = if (getK(i)) k[getC(i)] else base[getC(i)];
                 if (t.tag == .table and t.asTable().metatable == null) {
                     try t.asTable().setShortStr(heap, key.asString(), v);
-                    continue :dispatch fetch(&pc, &i);
+                    continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, t, key, v, .{ .upval = getA(i) });
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .settable => {
                 const t = base[getA(i)];
@@ -847,32 +1056,34 @@ fn execute(th: *Thread) Error!void {
                 if (t.tag == .table and t.asTable().metatable == null) {
                     if (key.tag == .int) {
                         try t.asTable().setInt(heap, key.payload.int, v);
-                        continue :dispatch fetch(&pc, &i);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                     ci.pc = pc;
                     t.asTable().set(heap, key, v) catch |e| return setError(th, e);
-                    continue :dispatch fetch(&pc, &i);
+                    continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, t, key, v, .{ .slot = ci.base() + getA(i) });
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .seti => {
                 const t = base[getA(i)];
                 const v = if (getK(i)) k[getC(i)] else base[getC(i)];
                 if (t.tag == .table and t.asTable().metatable == null) {
                     try t.asTable().setInt(heap, getB(i), v);
-                    continue :dispatch fetch(&pc, &i);
+                    continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, t, .int(getB(i)), v, .{ .slot = ci.base() + getA(i) });
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .setfield => {
                 const t = base[getA(i)];
@@ -882,16 +1093,18 @@ fn execute(th: *Thread) Error!void {
                     const h = t.asTable();
                     if (h.metatable == null) {
                         try h.setShortStr(heap, key.asString(), v);
-                        continue :dispatch fetch(&pc, &i);
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
-                    if (h.replaceShortStr(heap, key.asString(), v)) continue :dispatch fetch(&pc, &i);
+                    if (h.replaceShortStr(heap, key.asString(), v))
+                        continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
                 const done = try setSlow(th, .vm, ci, t, key, v, .{ .slot = ci.base() + getA(i) });
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .newtable => {
                 const vb = opcodes.vb(i);
@@ -902,7 +1115,8 @@ fn execute(th: *Thread) Error!void {
                 base[getA(i)] = .table(try Table.create(heap, narray, nhash));
                 ci.pc = pc;
                 th.state.checkGc();
-                continue :dispatch fetch(&pc, &i);
+                if (hookSwitch(hooked, th)) return true;
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             inline .addi,
             .addk,
@@ -946,14 +1160,14 @@ fn execute(th: *Thread) Error!void {
                         },
                         else => unreachable,
                     }
-                    continue :dispatch fetchSkip(&pc, &i);
+                    continue :dispatch try nextSkip(hooked, th, &ci, &pc, &i, &base);
                 }
                 if (rb.isNumber() and rc.isNumber()) {
                     base[getA(i)] = .float(floatArith(ao, rb.asNumber(), rc.asNumber()));
-                    continue :dispatch fetchSkip(&pc, &i);
+                    continue :dispatch try nextSkip(hooked, th, &ci, &pc, &i, &base);
                 }
                 // Otherwise the next instruction, an MMBIN, handles it.
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             inline .bandk, .bork, .bxork, .shli, .shri, .band, .bor, .bxor, .shl, .shr => |o| {
                 const rb = base[getB(i)];
@@ -977,9 +1191,9 @@ fn execute(th: *Thread) Error!void {
                         .shli => number.shiftLeft(y, x),
                         else => unreachable,
                     });
-                    continue :dispatch fetchSkip(&pc, &i);
+                    continue :dispatch try nextSkip(hooked, th, &ci, &pc, &i, &base);
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .mmbin, .mmbini, .mmbink => {
                 const ra = base[getA(i)];
@@ -1003,8 +1217,9 @@ fn execute(th: *Thread) Error!void {
                 const done = try arithSlow(th, .vm, ci, first, rb, event, o1, o2, dest);
                 ci = th.frame();
                 if (!done) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .unm => {
                 const rb = base[getB(i)];
@@ -1018,9 +1233,10 @@ fn execute(th: *Thread) Error!void {
                     const done = try arithSlow(th, .vm, ci, rb, rb, .unm, o, o, ci.base() + getA(i));
                     ci = th.frame();
                     if (!done) continue :newframe;
+                    if (hookSwitch(hooked, th)) return true;
                     base = th.stack.ptr + ci.base();
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .bnot => {
                 const rb = base[getB(i)];
@@ -1032,13 +1248,14 @@ fn execute(th: *Thread) Error!void {
                     const done = try arithSlow(th, .vm, ci, rb, rb, .bnot, o, o, ci.base() + getA(i));
                     ci = th.frame();
                     if (!done) continue :newframe;
+                    if (hookSwitch(hooked, th)) return true;
                     base = th.stack.ptr + ci.base();
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .not => {
                 base[getA(i)] = .boolean(base[getB(i)].isFalsy());
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .len => {
                 const rb = base[getB(i)];
@@ -1052,6 +1269,7 @@ fn execute(th: *Thread) Error!void {
                         const done = try lenSlow(th, .vm, ci, rb, origin, ci.base() + getA(i));
                         ci = th.frame();
                         if (!done) continue :newframe;
+                        if (hookSwitch(hooked, th)) return true;
                         base = th.stack.ptr + ci.base();
                     },
                     else => {
@@ -1060,10 +1278,11 @@ fn execute(th: *Thread) Error!void {
                         const done = try lenSlow(th, .vm, ci, rb, origin, ci.base() + getA(i));
                         ci = th.frame();
                         if (!done) continue :newframe;
+                        if (hookSwitch(hooked, th)) return true;
                         base = th.stack.ptr + ci.base();
                     },
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .concat => {
                 th.top = ci.base() + getA(i) + getB(i);
@@ -1072,29 +1291,31 @@ fn execute(th: *Thread) Error!void {
                 ci = th.frame();
                 if (!done) continue :newframe;
                 th.state.checkGc();
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .close => {
                 const level = ci.base() + getA(i);
                 if (th.tbc.items.len == 0 or th.tbc.items[th.tbc.items.len - 1] < level) {
                     th.closeUpvals(level);
-                    continue :dispatch fetch(&pc, &i);
+                    continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
                 try closeLevel(th, level, .normal, true);
                 ci = th.frame();
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .tbc => {
                 ci.pc = pc;
                 try newTbc(th, ci.base() + getA(i));
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .jmp => {
                 pc += @as(usize, @bitCast(@as(isize, opcodes.sj(i))));
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             inline .eq, .lt, .le => |o| {
                 const ra = base[getA(i)];
@@ -1122,14 +1343,18 @@ fn execute(th: *Thread) Error!void {
                     ci = th.frame();
                     cond = r orelse continue :newframe;
                     base = th.stack.ptr + ci.base();
+                    if (hookSwitch(hooked, th)) {
+                        ci.pc = if (cond != getK(i)) pc + 1 else pc + jumpOffset(pc[0]);
+                        return true;
+                    }
                 }
                 if (cond != getK(i)) pc += 1 else pc += jumpOffset(pc[0]);
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .eqk => {
                 const cond = Value.rawEquals(base[getA(i)], k[getB(i)]);
                 if (cond != getK(i)) pc += 1 else pc += jumpOffset(pc[0]);
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             inline .eqi, .lti, .lei, .gti, .gei => |o| {
                 const ra = base[getA(i)];
@@ -1168,14 +1393,18 @@ fn execute(th: *Thread) Error!void {
                     ci = th.frame();
                     cond = r orelse continue :newframe;
                     base = th.stack.ptr + ci.base();
+                    if (hookSwitch(hooked, th)) {
+                        ci.pc = if (cond != getK(i)) pc + 1 else pc + jumpOffset(pc[0]);
+                        return true;
+                    }
                 }
                 if (cond != getK(i)) pc += 1 else pc += jumpOffset(pc[0]);
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .@"test" => {
                 const cond = !base[getA(i)].isFalsy();
                 if (cond != getK(i)) pc += 1 else pc += jumpOffset(pc[0]);
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .testset => {
                 const rb = base[getB(i)];
@@ -1185,7 +1414,7 @@ fn execute(th: *Thread) Error!void {
                     base[getA(i)] = rb;
                     pc += jumpOffset(pc[0]);
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .call => {
                 const func = ci.base() + getA(i);
@@ -1202,8 +1431,9 @@ fn execute(th: *Thread) Error!void {
                 const lua = try preCall(th, func, nres);
                 ci = th.frame();
                 if (lua) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .tailcall => {
                 const func = ci.base() + getA(i);
@@ -1231,7 +1461,7 @@ fn execute(th: *Thread) Error!void {
                     ci.top = dest + 1 + fsize;
                     ci.pc = p.code.ptr;
                     ci.extra_args = 0;
-                    ci.ncallmt = @intCast(chain);
+                    ci.flags.ncallmt = @intCast(chain);
                     ci.flags.tail = true;
                     continue :newframe;
                 }
@@ -1242,7 +1472,9 @@ fn execute(th: *Thread) Error!void {
                 try callNative(th, func, -1, f);
                 ci = th.frame();
                 ci.func -= delta;
-                if (try doReturn(th, func, th.top - func)) return;
+                // The native may have set a hook: check the mask.
+                if (try doReturn(th, true, func, th.top - func) == .exit) return false;
+                if (hookSwitch(hooked, th)) return true;
                 ci = th.frame();
                 continue :newframe;
             },
@@ -1257,17 +1489,29 @@ fn execute(th: *Thread) Error!void {
                     ci = th.frame();
                 }
                 if (getC(i) != 0) ci.func -= ci.extra_args + getC(i);
-                if (try doReturn(th, first, n)) return;
+                // A `__close` handler may have set a hook: check the mask.
+                if (try doReturn(th, true, first, n) == .exit) return false;
+                if (hookSwitch(hooked, th)) return true;
                 ci = th.frame();
                 continue :newframe;
             },
             .return0 => {
-                if (try doReturn(th, ci.base() + getA(i), 0)) return;
+                if (hooked) ci.pc = pc;
+                switch (try doReturn(th, hooked, ci.base() + getA(i), 0)) {
+                    .exit => return false,
+                    .next => {},
+                    .finished => if (hookSwitch(hooked, th)) return true,
+                }
                 ci = th.frame();
                 continue :newframe;
             },
             .return1 => {
-                if (try doReturn(th, ci.base() + getA(i), 1)) return;
+                if (hooked) ci.pc = pc;
+                switch (try doReturn(th, hooked, ci.base() + getA(i), 1)) {
+                    .exit => return false,
+                    .next => {},
+                    .finished => if (hookSwitch(hooked, th)) return true,
+                }
                 ci = th.frame();
                 continue :newframe;
             },
@@ -1289,12 +1533,12 @@ fn execute(th: *Thread) Error!void {
                         pc -= opcodes.bx(i);
                     }
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .forprep => {
                 ci.pc = pc;
                 if (try forPrep(th, base + getA(i))) pc += @as(usize, opcodes.bx(i)) + 1;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .tforprep => {
                 const a = getA(i);
@@ -1306,7 +1550,7 @@ fn execute(th: *Thread) Error!void {
                     try newTbc(th, ci.base() + a + 2);
                 }
                 pc += opcodes.bx(i);
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .tforcall => {
                 const a = getA(i);
@@ -1319,12 +1563,13 @@ fn execute(th: *Thread) Error!void {
                 const lua = try preCall(th, func, @intCast(getC(i)));
                 ci = th.frame();
                 if (lua) continue :newframe;
+                if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .tforloop => {
                 if (!base[getA(i) + 3].isNil()) pc -= opcodes.bx(i);
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .setlist => {
                 const a = getA(i);
@@ -1342,7 +1587,7 @@ fn execute(th: *Thread) Error!void {
                     try t.setInt(heap, last, base[a + n]);
                     last -= 1;
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .closure => {
                 const p = cl.proto.p[opcodes.bx(i)];
@@ -1354,14 +1599,15 @@ fn execute(th: *Thread) Error!void {
                 base[getA(i)] = .luaClosure(ncl);
                 ci.pc = pc;
                 th.state.checkGc();
-                continue :dispatch fetch(&pc, &i);
+                if (hookSwitch(hooked, th)) return true;
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .vararg => {
                 ci.pc = pc;
                 const vatab: ?u32 = if (getK(i)) getB(i) else null;
                 try getVarargs(th, ci, ci.base() + getA(i), @as(i32, @intCast(getC(i))) - 1, vatab);
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .getvarg => {
                 const rc = base[getC(i)];
@@ -1374,7 +1620,7 @@ fn execute(th: *Thread) Error!void {
                     result = .int(nextra);
                 }
                 base[getA(i)] = result;
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .errnnil => {
                 if (!base[getA(i)].isNil()) {
@@ -1383,14 +1629,20 @@ fn execute(th: *Thread) Error!void {
                     const name = if (bx > 0 and k[bx - 1].isString()) k[bx - 1].asString().bytes() else "?";
                     return th.runError("global '{s}' already defined", .{name});
                 }
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .varargprep => {
                 ci.pc = pc;
                 try adjustVarargs(th, ci, cl.proto);
                 if (cl.proto.flags.vararg_table) th.state.checkGc();
+                if (hooked) {
+                    try hookCall(th);
+                    // The next instruction counts as a new line.
+                    th.oldpc = 1;
+                    ci = th.frame();
+                }
                 base = th.stack.ptr + ci.base();
-                continue :dispatch fetch(&pc, &i);
+                continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .extraarg => unreachable,
         }
@@ -1403,16 +1655,34 @@ inline fn jumpOffset(j: Instruction) usize {
     return @bitCast(@as(isize, opcodes.sj(j)) + 1);
 }
 
-/// Returns from the running Lua frame with `n` results at `first`. True
-/// when the frame was the fresh one and the loop must exit.
-inline fn doReturn(th: *Thread, first: u32, n: u32) Error!bool {
+const Returned = enum {
+    /// The frame was the fresh one: the loop exits.
+    exit,
+    /// Back in the calling Lua frame.
+    next,
+    /// Back in the calling Lua frame after `finishOp` completed the
+    /// instruction that called a metamethod, which may have run anything.
+    finished,
+};
+
+/// Returns from the running Lua frame with `n` results at `first`
+/// (`luaD_poscall`). With `hooks`, runs the return hook when the thread
+/// has a hook.
+inline fn doReturn(th: *Thread, comptime hooks: bool, first: u32, n: u32) Error!Returned {
+    if (hooks and th.hookmask != 0) {
+        th.top = first + n;
+        try retHook(th, first, n);
+    }
     const ret = th.frame();
     moveResults(th, ret.func, first, n, ret.nresults);
     const flags = ret.flags;
     th.frames.items.len -= 1;
-    if (flags.fresh) return true;
-    if (flags.finish_op) try finishOp(th, th.frame());
-    return false;
+    if (flags.fresh) return .exit;
+    if (flags.finish_op) {
+        try finishOp(th, th.frame());
+        return .finished;
+    }
+    return .next;
 }
 
 /// Completes the instruction of Lua frame `ci` that a metamethod or a

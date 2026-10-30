@@ -1,9 +1,10 @@
 //! The debug library (§6.10): `getinfo`, `getlocal`, `setlocal`,
 //! `getupvalue`, `setupvalue`, `upvalueid`, `upvaluejoin`, `traceback`,
-//! `getmetatable`, `setmetatable`, `getregistry`, `getuservalue`, and
-//! `setuservalue`, as ldblib.c has them. Hooks are not implemented:
-//! `sethook` accepts its arguments and never calls the hook, and
-//! `gethook` returns nothing set.
+//! `getmetatable`, `setmetatable`, `getregistry`, `getuservalue`,
+//! `setuservalue`, `sethook`, and `gethook`, as ldblib.c has them. A
+//! thread's Lua hook function lives in `registry._HOOKKEY`, a table with
+//! weak keys from threads to functions, and `hookf` is the `Thread.Hook`
+//! that calls it.
 
 const std = @import("std");
 const Value = @import("../Value.zig");
@@ -175,7 +176,7 @@ fn getinfo(th: *Thread, base: u32) Error!u32 {
         };
         try setField(th, r, "nups", .int(@intCast(nups)));
         try setField(th, r, "nparams", .int(if (lua) |p| p.numparams else 0));
-        try setField(th, r, "isvararg", .boolean(if (lua) |p| p.flags.vararg else true));
+        try setField(th, r, "isvararg", .boolean(if (lua) |p| p.flags.vararg or p.flags.vararg_table else true));
     }
     if (has(options, 'n')) {
         const n = if (frame) |i| debuginfo.funcName(t1, i) else null;
@@ -183,13 +184,15 @@ fn getinfo(th: *Thread, base: u32) Error!u32 {
         try setField(th, r, "namewhat", .string(try th.state.newString(if (n) |v| v.kind else "")));
     }
     if (has(options, 'r')) {
-        try setField(th, r, "ftransfer", .int(0));
-        try setField(th, r, "ntransfer", .int(0));
+        // Only a frame that is running a hook has transfer information.
+        const hooked = if (frame) |i| t1.frames.items[i].flags.hooked else false;
+        try setField(th, r, "ftransfer", .int(if (hooked) t1.ftransfer else 0));
+        try setField(th, r, "ntransfer", .int(if (hooked) t1.ntransfer else 0));
     }
     if (has(options, 't')) {
         const f = if (frame) |i| &t1.frames.items[i] else null;
         try setField(th, r, "istailcall", .boolean(if (f) |x| x.flags.tail else false));
-        try setField(th, r, "extraargs", .int(if (f) |x| x.ncallmt else 0));
+        try setField(th, r, "extraargs", .int(if (f) |x| x.flags.ncallmt else 0));
     }
     if (has(options, 'L')) {
         if (lua) |p| {
@@ -197,7 +200,7 @@ fn getinfo(th: *Thread, base: u32) Error!u32 {
             try setField(th, r, "activelines", .table(lines));
             // A vararg function's first instruction, `VARARGPREP`, has no
             // line of its own.
-            const first: usize = if (p.flags.vararg) 1 else 0;
+            const first: usize = if (p.flags.vararg or p.flags.vararg_table) 1 else 0;
             if (p.lineinfo.len > first) {
                 for (p.lineinfo[first..]) |line| try lines.setInt(th.heap(), line, .true);
             }
@@ -446,14 +449,93 @@ fn setuservalue(th: *Thread, base: u32) Error!u32 {
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+const hook_names = [_][]const u8{ "call", "return", "line", "count", "tail call" };
+
+/// `registry._HOOKKEY`, or null before the first `sethook`.
+fn hookTable(state: *State) Error!?*Table {
+    const v = state.registry.getStr(try state.newString("_HOOKKEY"));
+    return if (v.tag == .table) v.asTable() else null;
+}
+
+/// The hook `sethook` installs: calls the thread's function in the hook
+/// table with the event's name and, for a line event, the line (`hookf`).
+fn hookf(th: *Thread, event: Thread.HookEvent, line: i32, frame: usize) Error!void {
+    _ = frame;
+    const hooks = try hookTable(th.state) orelse return;
+    const f = hooks.get(.thread(th));
+    if (!f.isFunction()) return;
+    try th.ensureStack(3);
+    const func = th.top;
+    th.push(f);
+    try pushString(th, hook_names[@intFromEnum(event)]);
+    th.push(if (line >= 0) .int(line) else .nil);
+    try vm.call(th, func, 0);
+}
+
 fn sethook(th: *Thread, base: u32) Error!u32 {
-    _ = th;
-    _ = base;
+    const t1, const off = getThread(th, base);
+    var mask: u8 = 0;
+    var count: i64 = 0;
+    const f = arg(th, base, off + 1);
+    if (!f.isNil()) {
+        const smask_v = arg(th, base, off + 2);
+        if (!smask_v.isString() and !smask_v.isNumber()) return typeError(th, base, off + 2, "string");
+        const smask = (try vm.toLString(th.state, smask_v)).?.bytes();
+        if (!f.isFunction()) return typeError(th, base, off + 1, "function");
+        count = try optInteger(th, base, off + 3, 0);
+        const has = std.mem.findScalar;
+        if (has(u8, smask, 'c') != null) mask |= Thread.HookMask.call;
+        if (has(u8, smask, 'r') != null) mask |= Thread.HookMask.ret;
+        if (has(u8, smask, 'l') != null) mask |= Thread.HookMask.line;
+        if (count > 0) mask |= Thread.HookMask.count;
+    }
+    const hooks = try hookTable(th.state) orelse blk: {
+        // hooks.__mode = "k", and hooks is its own metatable.
+        const t = try th.state.newTable(0, 1);
+        try th.state.registry.setStr(th.heap(), try th.state.newString("_HOOKKEY"), .table(t));
+        try setField(th, t, "__mode", .string(try th.state.newString("k")));
+        th.state.setMetatable(.table(t), t);
+        break :blk t;
+    };
+    hooks.set(th.heap(), .thread(t1), f) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The key is a thread.
+        error.IndexIsNil, error.IndexIsNaN => unreachable,
+    };
+    // lua_sethook takes an int; ldblib passes the integer through a cast.
+    const c: i32 = @truncate(count);
+    vm.setHook(t1, if (f.isNil()) null else &hookf, mask, c);
     return 0;
 }
 
 fn gethook(th: *Thread, base: u32) Error!u32 {
-    _ = base;
-    th.push(.nil);
-    return 1;
+    const t1, _ = getThread(th, base);
+    try th.ensureStack(3);
+    if (t1.hook == null) {
+        th.push(.nil);
+        return 1;
+    }
+    const hooks = try hookTable(th.state);
+    th.push(if (hooks) |t| t.get(.thread(t1)) else .nil);
+    var buf: [3]u8 = undefined;
+    var n: usize = 0;
+    if (t1.hookmask & Thread.HookMask.call != 0) {
+        buf[n] = 'c';
+        n += 1;
+    }
+    if (t1.hookmask & Thread.HookMask.ret != 0) {
+        buf[n] = 'r';
+        n += 1;
+    }
+    if (t1.hookmask & Thread.HookMask.line != 0) {
+        buf[n] = 'l';
+        n += 1;
+    }
+    try pushString(th, buf[0..n]);
+    th.push(.int(t1.basehookcount));
+    return 3;
 }

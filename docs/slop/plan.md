@@ -212,9 +212,9 @@ round trip and stops on `require "debug"`.
 Landed from wave 2, the VM (`vm.md`): `number.zig` arithmetic, `__concat`,
 to-be-closed variables, vararg tables, coroutines and continuations
 (`lib/coroutine.zig`), error messages with variable names, stack overflow
-handling, and the debug library without hooks (`lib/debug.zig`). Still
-open there: hooks, and the standalone `lua` running its chunk from a
-native frame.
+handling, and the debug library (`lib/debug.zig`). Wave 3 added hooks,
+with a second instance of the interpreter loop so the unhooked one checks
+nothing per instruction (`vm.md`).
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.

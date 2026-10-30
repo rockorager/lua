@@ -87,6 +87,7 @@ fn create(th: *Thread, base: u32) Error!u32 {
     if (base >= th.top or !th.stack[base].isFunction())
         return argError(th, 1, "function expected, got {s}", .{typeNameAt(th, base, 0)});
     const co = try Thread.create(th.state);
+    co.inheritHook(th);
     th.push(.thread(co));
     co.push(th.stack[base]);
     return 1;

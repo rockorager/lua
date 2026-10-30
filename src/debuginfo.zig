@@ -97,6 +97,7 @@ pub fn funcName(th: *Thread, level: usize) ?Name {
 /// `funcnamefromcall`.
 pub fn callerName(th: *Thread, level: usize) ?Name {
     const f = &th.frames.items[level];
+    if (f.flags.hooked) return .{ .kind = "hook", .name = "?" };
     if (!f.flags.lua) return null;
     const p = th.stack[f.func].asLuaClosure().proto;
     return funcNameFromCode(th.state, p, Thread.currentPc(p, f));

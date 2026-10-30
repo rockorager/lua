@@ -51,8 +51,40 @@ errfunc: u32 = 0,
 closed_self: bool = false,
 /// `vm.pcallMsgh` calls in progress, which catch every error.
 npcall: u16 = 0,
+/// The debug hook (`lua_Hook`), called for the events in `hookmask`.
+hook: ?Hook = null,
+/// The events the hook gets, `HookMask` bits; 0 when there is no hook.
+hookmask: u8 = 0,
+/// False while a hook runs: hooks do not nest (`allowhook`).
+allowhook: bool = true,
+/// Instructions between count events, and the ones left before the next.
+basehookcount: i32 = 0,
+hookcount: i32 = 0,
+/// The instruction of the last line event, to tell a new line or a jump
+/// back from the next instruction (`L->oldpc`).
+oldpc: u32 = 0,
+/// The values a call or return event transfers: the first one's stack
+/// offset from the function, and how many (`transferinfo`).
+ftransfer: u16 = 0,
+ntransfer: u16 = 0,
 
 pub const Status = enum(u8) { ok, yield, dead };
+
+/// The events a hook can ask for, `LUA_MASK*`.
+pub const HookMask = struct {
+    pub const call: u8 = 1;
+    pub const ret: u8 = 2;
+    pub const line: u8 = 4;
+    pub const count: u8 = 8;
+};
+
+/// A hook event, `LUA_HOOK*`, in the order of their names.
+pub const HookEvent = enum(u8) { call, ret, line, count, tail_call };
+
+/// A debug hook (`lua_Hook`): runs on the thread with `frame` (an index
+/// into `frames`) the frame the event happened in, and `line` the new
+/// line for a line event, else -1.
+pub const Hook = *const fn (th: *Thread, event: HookEvent, line: i32, frame: usize) Error!void;
 
 /// Slots a native function may use without checking, `LUA_MINSTACK`.
 pub const min_stack = 20;
@@ -84,9 +116,6 @@ pub const Frame = struct {
     /// Results the caller wants, or -1 for all of them.
     nresults: i16,
     flags: Flags,
-    /// `__call` handlers the call went through, each adding the called
-    /// value as an extra first argument (`debug.getinfo`'s `extraargs`).
-    ncallmt: u8 = 0,
     /// Lua vararg frames: how many extra arguments sit below `func`.
     /// Native frames: the continuation's context.
     extra_args: u32 = 0,
@@ -98,7 +127,7 @@ pub const Frame = struct {
     /// restore.
     old_errfunc: u32 = 0,
 
-    pub const Flags = packed struct(u8) {
+    pub const Flags = packed struct(u16) {
         /// A Lua function, run by the interpreter.
         lua: bool = false,
         /// The interpreter loop was entered for this frame from Zig, so its
@@ -116,7 +145,16 @@ pub const Frame = struct {
         /// Native frames in a yieldable protected call: set when a resume
         /// unwound an error to this frame, so its continuation sees it.
         recover: bool = false,
-        _: u1 = 0,
+        /// Running a hook for an event in this frame (`CIST_HOOKED`).
+        hooked: bool = false,
+        /// Native frames in a yieldable protected call: `allowhook` when
+        /// the call started, restored after an error (`CIST_OAH`).
+        oah: bool = false,
+        /// `__call` handlers the call went through, each adding the
+        /// called value as an extra first argument (`debug.getinfo`'s
+        /// `extraargs`), at most `vm.max_call_chain`.
+        ncallmt: u4 = 0,
+        _: u3 = 0,
     };
 
     pub inline fn base(f: *const Frame) u32 {
@@ -156,6 +194,15 @@ pub fn create(state: *State) error{OutOfMemory}!*Thread {
 
 fn baseFrame() Frame {
     return .{ .func = 0, .top = 1 + min_stack, .nresults = 0, .flags = .{} };
+}
+
+/// Gives a new coroutine the hook of the thread that creates it, as
+/// `lua_newthread` does.
+pub fn inheritHook(th: *Thread, from: *const Thread) void {
+    th.hook = from.hook;
+    th.hookmask = from.hookmask;
+    th.basehookcount = from.basehookcount;
+    th.hookcount = from.basehookcount;
 }
 
 pub fn destroy(h: *gc.Heap, th: *Thread) void {

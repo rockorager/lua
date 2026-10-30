@@ -98,10 +98,9 @@ overflow handling, and the debug library. Files: `vm.zig`,
 
 ### Debug library
 
-- `lib/debug.zig` has everything but hooks: `sethook` accepts its arguments
-  and never calls the hook, `gethook` returns nil. `getinfo` covers
-  `SlnrtuLf` (`ftransfer`/`ntransfer` are 0); `extraargs` counts the
-  `__call` handlers a call went through (`Frame.ncallmt`).
+- `lib/debug.zig` is ldblib.c. `getinfo` covers `SlnrtuLf`; `extraargs`
+  counts the `__call` handlers a call went through (`Frame.flags.ncallmt`),
+  and `ftransfer`/`ntransfer` are set only for a frame running a hook.
 - `debuginfo.traceback` is `luaL_traceback`; `debuginfo.raise` and
   `debuginfo.argError` are `luaL_error` and `luaL_argerror` with call-site
   names, and `auxlib.zig` and `base.zig` use them.
@@ -113,15 +112,38 @@ overflow handling, and the debug library. Files: `vm.zig`,
   libraries' `base.Host` hangs off `State.host`, and carries the
   environment and `-E`.
 
+### Hooks (wave 3)
+
+- A thread has its own hook (`Thread.hook`, a `Thread.Hook`), mask, and
+  count, as `lua_State` does; `vm.setHook` is `lua_sethook`, and a new
+  coroutine inherits its creator's (`Thread.inheritHook`). `debug.sethook`
+  keeps the Lua functions in `registry._HOOKKEY`, keyed weakly by thread,
+  and installs `hookf`, which calls the thread's function.
+- `vm.execute` runs one of two instances of the loop, `runLoop(th,
+hooked)`. The unhooked instance's dispatch is the wave-2 loop with no
+  check per instruction. Only code the loop calls out to can change the
+  mask (a native, a metamethod, a `__close` or `__gc` handler), so each
+  call-out's return point checks `hookSwitch`, and on a change the loop
+  saves `pc` and returns to `execute`, which starts the other instance at
+  the same frame and instruction. Lua-to-Lua calls and returns check
+  nothing. Measured: `fib` and a 10^8 loop are within noise of the wave-2
+  build, peak RSS unchanged (`results/hooks-20261030.md`).
+- The hooked instance runs `traceExec` (`luaG_traceexec`) before each
+  instruction, the call hook when a frame starts (`hookCall`; a vararg
+  function's after `VARARGPREP`, then `oldpc = 1`), and the return hook in
+  `doReturn` (`retHook`, which also sets `oldpc` for a Lua caller).
+  Natives get call and return hooks in `callNative` and `posCall`. A
+  general `RETURN` and a tail call of a native check the mask at run time
+  in either instance, since a `__close` handler or the native may have set
+  a hook just before the return event.
+- Line events follow ldebug.c: a new line, or an instruction at or before
+  the last traced one (a loop going around). Hooks run with `allowhook`
+  off and the frame flagged `hooked` (getinfo names the hook "hook '?'");
+  a protected call restores `allowhook` after an error (`Frame.flags.oah`
+  for yieldable ones). Hooks cannot yield: `hookf` calls with `vm.call`.
+
 ## Not done
 
-- Hooks (`debug.sethook`): `coroutine.lua` (line 413) and `locals.lua`
-  (line 851, through `checktable` at 625) assert on hook events. A hooked
-  interpreter loop instantiated separately would keep the unhooked loop's
-  dispatch as it is.
-- Weak tables and finalizers (`coroutine.lua` line 478 checks a weak
-  table); wave 3's collector work.
-- The standalone `lua` runs the main chunk from the base frame, not from a
-  native function as lua.c's `pmain`, so tracebacks lack the final
-  "[C]: in ?" line and `debug.getinfo` levels are one short at the bottom.
-- `io`, `os`, and `package` do not exist; messages that name them differ.
+- Weak tables and finalizers, wave 3's collector work: `coroutine.lua`
+  stops at line 478 on a weak table and `db.lua` at line 926 waiting for a
+  `__gc`; with those cases cut, both run to "OK" (2026-10-30).
