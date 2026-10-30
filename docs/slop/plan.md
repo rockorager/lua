@@ -167,6 +167,10 @@ Wave 1, in parallel, with no shared files:
 Wave 2, once the core and the lexer land: the parser and code generator, the
 opcodes in `vm.zig`, metatables, the standalone `lua`, and the standard library
 in pieces (base, string glue, table, math, utf8, os, io, coroutine, debug).
+Landed: the string, table, math, and utf8 libraries, with `lib/auxlib.zig`
+(lauxlib's checks and messages) and `lib/libm.zig` (glibc's `exp`, `pow`, and
+logarithms, bit for bit); coverage, verification, and the helpers they need
+from the core are in `stdlib.md`.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.

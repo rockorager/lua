@@ -1,0 +1,792 @@
+//! What the standard libraries share, the counterpart of the reference's
+//! lauxlib.c and of the lapi.c calls its libraries make: argument checks with
+//! the reference's messages, errors positioned at the calling Lua function, a
+//! string buffer that starts on the Zig stack, and the metamethod-aware
+//! indexing, length, comparison, and `tostring` that natives need.
+//!
+//! TODO(core): the core owns the files these belong to. `raise`, the
+//! metamethod-aware operations (`index`, `setIndex`, `getI`, `setI`, `len`,
+//! `lessThan`, `equal`), `toInteger`/`toNumber`, and `tolstring` are written
+//! here privately until the core exposes them; docs/slop/stdlib.md lists the
+//! requests.
+
+const std = @import("std");
+const Writer = std.Io.Writer;
+const Value = @import("../Value.zig");
+const Userdata = @import("../Userdata.zig");
+const String = @import("../String.zig");
+const Table = @import("../Table.zig");
+const Thread = @import("../Thread.zig");
+const State = @import("../State.zig");
+const vm = @import("../vm.zig");
+const Proto = @import("../Proto.zig");
+const opcodes = @import("../opcodes.zig");
+const number = @import("../number.zig");
+
+pub const Error = Value.Error;
+
+/// Longest `__index`/`__newindex` chain, the VM's `MAXTAGLOOP`.
+const max_tag_loop = 2000;
+
+/// Raises a message as `luaL_error` does: prefixed with "chunk:line:" when
+/// the function that called the running native is a Lua function.
+/// TODO(core): `Thread.runError` positions at the running frame, which is
+/// right for `luaG_runerror` but not for errors a native raises about its
+/// caller.
+pub fn raise(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
+    var aw: Writer.Allocating = .init(th.heap().allocator());
+    defer aw.deinit();
+    const w = &aw.writer;
+    where(th, w) catch return error.OutOfMemory;
+    w.print(fmt, args) catch return error.OutOfMemory;
+    return th.throw(.string(try th.state.newString(aw.written())));
+}
+
+/// `luaL_where(L, 1)`: the position of the running native's caller, when it
+/// is a Lua function.
+fn where(th: *Thread, w: *Writer) Writer.Error!void {
+    const frames = th.frames.items;
+    if (frames.len < 2) return;
+    const f = &frames[frames.len - 2];
+    if (!f.flags.lua) return;
+    const p = th.stack[f.func].asLuaClosure().proto;
+    const pc = @intFromPtr(f.pc) - @intFromPtr(p.code.ptr);
+    const line = p.lineAt(pc / 4 -| 1) orelse return;
+    try Thread.writeChunkId(w, if (p.source) |s| s.bytes() else "?");
+    try w.print(":{d}: ", .{line});
+}
+
+/// `luaL_checkstack`: room for `n` more values, or "stack overflow (msg)".
+pub fn checkStack(th: *Thread, n: usize, comptime msg: []const u8) Error!void {
+    if (th.top + n + Thread.extra_stack > Thread.max_stack) return raise(th, "stack overflow (" ++ msg ++ ")", .{});
+    try th.ensureStack(@intCast(n));
+}
+
+/// A native's arguments, `stack[base..top]`, and the name its messages use.
+/// Argument numbers are Lua's, from 1.
+///
+/// The reference names the function as its caller wrote it ("bad argument #1
+/// to 'f'" after `local f = string.rep`) and does not count `self` in a method
+/// call. TODO(core): that needs the call site's debug information; until then
+/// every message uses the library name given here.
+pub const Args = struct {
+    th: *Thread,
+    base: u32,
+    /// One past the last argument, as it was on entry, so values the native
+    /// pushes later are not taken for arguments.
+    top: u32,
+    name: []const u8,
+
+    pub inline fn init(th: *Thread, base: u32, name: []const u8) Args {
+        return .{ .th = th, .base = base, .top = th.top, .name = name };
+    }
+
+    /// The number of arguments.
+    pub inline fn count(a: Args) u32 {
+        return a.top - a.base;
+    }
+
+    /// The stack slot of argument `n`.
+    pub inline fn slot(a: Args, n: u32) u32 {
+        return a.base + n - 1;
+    }
+
+    /// Argument `n`, or nil when it is absent.
+    pub inline fn get(a: Args, n: u32) Value {
+        const i = a.slot(n);
+        return if (i < a.top) a.th.stack[i] else .nil;
+    }
+
+    pub inline fn isNone(a: Args, n: u32) bool {
+        return a.slot(n) >= a.top;
+    }
+
+    pub inline fn isNoneOrNil(a: Args, n: u32) bool {
+        return a.get(n).isNil();
+    }
+
+    /// `luaL_argerror`: "bad argument #n to 'name' (msg)".
+    pub fn argError(a: Args, n: u32, comptime fmt: []const u8, args: anytype) Error {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+        return raise(a.th, "bad argument #{d} to '{s}' ({s})", .{ n, a.name, msg });
+    }
+
+    /// `luaL_typeerror`: "bad argument #n to 'name' (T expected, got U)".
+    pub fn typeError(a: Args, n: u32, expected: []const u8) Error {
+        const got = if (a.isNone(n)) "no value" else typeName(a.th.state, a.get(n));
+        return a.argError(n, "{s} expected, got {s}", .{ expected, got });
+    }
+
+    /// `luaL_checkany`.
+    pub fn checkAny(a: Args, n: u32) Error!void {
+        if (a.isNone(n)) return a.argError(n, "value expected", .{});
+    }
+
+    /// `luaL_checkinteger`.
+    pub fn checkInteger(a: Args, n: u32) Error!i64 {
+        const v = a.get(n);
+        if (v.tag == .int) return v.payload.int;
+        if (toInteger(v)) |i| return i;
+        if (toNumber(v) != null) return a.argError(n, "number has no integer representation", .{});
+        return a.typeError(n, "number");
+    }
+
+    /// `luaL_optinteger`.
+    pub fn optInteger(a: Args, n: u32, def: i64) Error!i64 {
+        return if (a.isNoneOrNil(n)) def else a.checkInteger(n);
+    }
+
+    /// `luaL_checknumber`.
+    pub fn checkNumber(a: Args, n: u32) Error!f64 {
+        const v = a.get(n);
+        if (v.tag == .float) return v.payload.float;
+        return toNumber(v) orelse a.typeError(n, "number");
+    }
+
+    /// `luaL_optnumber`.
+    pub fn optNumber(a: Args, n: u32, def: f64) Error!f64 {
+        return if (a.isNoneOrNil(n)) def else a.checkNumber(n);
+    }
+
+    /// `luaL_checklstring`: a string argument, or a number converted to one
+    /// in place, as `lua_tolstring` does.
+    pub fn checkString(a: Args, n: u32) Error!*String {
+        const v = a.get(n);
+        if (v.isString()) return v.asString();
+        if (v.isNumber()) {
+            const s = try numberToString(a.th.state, v);
+            a.th.stack[a.slot(n)] = .string(s);
+            return s;
+        }
+        return a.typeError(n, "string");
+    }
+
+    /// `luaL_optlstring`.
+    pub fn optString(a: Args, n: u32, def: []const u8) Error![]const u8 {
+        return if (a.isNoneOrNil(n)) def else (try a.checkString(n)).bytes();
+    }
+
+    /// `luaL_checktype(L, n, LUA_TTABLE)`.
+    pub fn checkTable(a: Args, n: u32) Error!*Table {
+        const v = a.get(n);
+        if (v.tag != .table) return a.typeError(n, "table");
+        return v.asTable();
+    }
+};
+
+/// The type name messages use for `v`: its metatable's `__name` when that is
+/// a string (`luaL_typeerror`), "light userdata", or the basic type's name.
+pub fn typeName(state: *State, v: Value) []const u8 {
+    if (metafield(state, v, "__name")) |n| {
+        if (n.isString()) return n.asString().bytes();
+    }
+    if (v.tag == .light_userdata) return "light userdata";
+    return v.typeOf().name();
+}
+
+/// The type name runtime errors use (`luaT_objtypename`): a table's or full
+/// userdata's `__name` when it is a string, else the basic type's name.
+fn objTypeName(state: *State, v: Value) []const u8 {
+    if (v.tag == .table or v.tag == .userdata) {
+        if (metafield(state, v, "__name")) |n| {
+            if (n.isString()) return n.asString().bytes();
+        }
+    }
+    return v.typeOf().name();
+}
+
+/// Field `name` of `v`'s metatable, raw, or null (`luaL_getmetafield`).
+pub fn metafield(state: *State, v: Value, comptime name: []const u8) ?Value {
+    const mt = state.metatableOf(v) orelse return null;
+    // Looking the name up interns it; that allocation failing means no
+    // table can hold the key either.
+    const key = state.newString(name) catch return null;
+    const r = mt.getShortStr(key);
+    return if (r.isNil()) null else r;
+}
+
+// ---------------------------------------------------------------------------
+// Conversions (§3.4.3)
+// ---------------------------------------------------------------------------
+
+/// `lua_tointegerx`: an integer, a float with an exact integer value, or a
+/// string that converts to one of those.
+pub fn toInteger(v: Value) ?i64 {
+    return switch (v.tag) {
+        .int => v.payload.int,
+        .float => number.floatToInt(v.payload.float, .exact),
+        .short_string, .long_string => switch (number.parse(v.asString().bytes()) orelse return null) {
+            .int => |i| i,
+            .float => |f| number.floatToInt(f, .exact),
+        },
+        else => null,
+    };
+}
+
+/// `lua_tonumberx`: a number, or a string that converts to one.
+pub fn toNumber(v: Value) ?f64 {
+    return switch (v.tag) {
+        .int => @floatFromInt(v.payload.int),
+        .float => v.payload.float,
+        .short_string, .long_string => switch (number.parse(v.asString().bytes()) orelse return null) {
+            .int => |i| @floatFromInt(i),
+            .float => |f| f,
+        },
+        else => null,
+    };
+}
+
+/// A number value for `v`: itself, or the number a string converts to
+/// (`luaV_tonumber_` keeping the subtype).
+pub fn toNumberValue(v: Value) ?Value {
+    return switch (v.tag) {
+        .int, .float => v,
+        .short_string, .long_string => switch (number.parse(v.asString().bytes()) orelse return null) {
+            .int => |i| .int(i),
+            .float => |f| .float(f),
+        },
+        else => null,
+    };
+}
+
+/// The decimal text of a number, as `tostring` writes it.
+pub fn formatNumber(buf: *[number.max_len]u8, v: Value) []const u8 {
+    return if (v.tag == .int) number.formatInt(buf, v.payload.int) else number.formatFloat(buf, v.payload.float);
+}
+
+/// A number as a new string.
+pub fn numberToString(state: *State, v: Value) error{OutOfMemory}!*String {
+    var buf: [number.max_len]u8 = undefined;
+    return state.newString(formatNumber(&buf, v));
+}
+
+/// `luaL_tolstring`: `__tostring`'s result, or the default text for `v`.
+/// The result is not anchored; store it before anything that can collect.
+pub fn tolstring(th: *Thread, v: Value) Error!*String {
+    const state = th.state;
+    if (metafield(state, v, "__tostring")) |h| {
+        const r = try call1(th, h, &.{v});
+        if (r.isString()) return r.asString();
+        if (r.isNumber()) return numberToString(state, r);
+        return raise(th, "'__tostring' must return a string", .{});
+    }
+    switch (v.tag) {
+        .int, .float => return numberToString(state, v),
+        .short_string, .long_string => return v.asString(),
+        .nil => return state.newString("nil"),
+        .bool_false => return state.newString("false"),
+        .bool_true => return state.newString("true"),
+        else => {
+            const kind = if (metafield(state, v, "__name")) |n|
+                (if (n.isString()) n.asString().bytes() else v.typeOf().name())
+            else
+                v.typeOf().name();
+            var out: Writer.Allocating = .init(state.heap.allocator());
+            defer out.deinit();
+            out.writer.print("{s}: ", .{kind}) catch return error.OutOfMemory;
+            writePointer(&out.writer, toPointer(v)) catch return error.OutOfMemory;
+            return state.newString(out.written());
+        },
+    }
+}
+
+/// `lua_topointer`: the address behind a function, userdata, or other
+/// object, or null for values that have none.
+pub fn toPointer(v: Value) ?usize {
+    return switch (v.tag) {
+        .native_fn, .light_userdata => if (v.payload.ptr) |p| @intFromPtr(p) else null,
+        .userdata => @intFromPtr(userdataBytes(v.asUserdata()).ptr),
+        else => if (v.isCollectable()) @intFromPtr(v.payload.gc) else null,
+    };
+}
+
+/// A userdata's raw memory.
+/// TODO(core): `Userdata.bytes` does not compile (its pointer arithmetic
+/// loses the 16-byte alignment and needs an `@alignCast`); this repeats its
+/// layout until that is fixed.
+pub fn userdataBytes(u: *Userdata) []align(16) u8 {
+    const off = std.mem.alignForward(usize, @sizeOf(Userdata) + @as(usize, u.nuvalue) * @sizeOf(Value), 16);
+    const p: [*]u8 = @ptrCast(u);
+    return @alignCast((p + off)[0..u.len]);
+}
+
+/// A pointer as glibc's `%p` writes it.
+fn writePointer(w: *Writer, p: ?usize) Writer.Error!void {
+    if (p) |addr| try w.print("0x{x}", .{addr}) else try w.writeAll("(nil)");
+}
+
+// ---------------------------------------------------------------------------
+// Operations with metamethods, for natives (lapi.c)
+// ---------------------------------------------------------------------------
+
+/// Calls `f` with `args` for one result, which is returned unanchored.
+pub fn call1(th: *Thread, f: Value, args: []const Value) Error!Value {
+    try th.ensureStack(@intCast(args.len + 1));
+    const func = th.top;
+    th.push(f);
+    for (args) |v| th.push(v);
+    try vm.call(th, func, 1);
+    const r = th.stack[func];
+    th.top = func;
+    return r;
+}
+
+/// `lua_gettable`: `t[k]` with `__index`.
+pub fn index(th: *Thread, t_in: Value, k: Value) Error!Value {
+    var t = t_in;
+    for (0..max_tag_loop) |_| {
+        var h: Value = undefined;
+        if (t.tag == .table) {
+            const tbl = t.asTable();
+            const v = tbl.get(k);
+            if (!v.isNil()) return v;
+            h = th.state.fastTm(tbl.metatable, .index) orelse return .nil;
+        } else {
+            h = th.state.tmOf(t, .index) orelse return typeError(th, t, "index");
+        }
+        if (h.isFunction()) return call1(th, h, &.{ t, k });
+        t = h;
+    }
+    return th.runError("'__index' chain too long; possible loop", .{});
+}
+
+/// `lua_settable`: `t[k] = v` with `__newindex`.
+pub fn setIndex(th: *Thread, t_in: Value, k: Value, v: Value) Error!void {
+    var t = t_in;
+    for (0..max_tag_loop) |_| {
+        var h: Value = undefined;
+        if (t.tag == .table) {
+            const tbl = t.asTable();
+            if (tbl.get(k).isNil()) {
+                if (th.state.fastTm(tbl.metatable, .newindex)) |mm| {
+                    h = mm;
+                } else return rawSet(th, tbl, k, v);
+            } else return rawSet(th, tbl, k, v);
+        } else {
+            h = th.state.tmOf(t, .newindex) orelse return typeError(th, t, "index");
+        }
+        if (h.isFunction()) {
+            try th.ensureStack(4);
+            const func = th.top;
+            th.push(h);
+            th.push(t);
+            th.push(k);
+            th.push(v);
+            try vm.call(th, func, 0);
+            th.top = func;
+            return;
+        }
+        t = h;
+    }
+    return th.runError("'__newindex' chain too long; possible loop", .{});
+}
+
+fn rawSet(th: *Thread, t: *Table, k: Value, v: Value) Error!void {
+    t.set(th.heap(), k, v) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.IndexIsNil => th.runError("index is nil", .{}),
+        error.IndexIsNaN => th.runError("index is NaN", .{}),
+    };
+}
+
+/// `lua_geti`: `t[i]`, raw when the slot is present or `t` has no
+/// `__index`.
+pub inline fn getI(th: *Thread, t: Value, i: i64) Error!Value {
+    if (t.tag == .table) {
+        const tbl = t.asTable();
+        const v = tbl.getInt(i);
+        if (!v.isNil() or tbl.metatable == null) return v;
+    }
+    return index(th, t, .int(i));
+}
+
+/// `lua_seti`: `t[i] = v`, raw when the slot is present or `t` has no
+/// `__newindex`.
+pub inline fn setI(th: *Thread, t: Value, i: i64, v: Value) Error!void {
+    if (t.tag == .table) {
+        const tbl = t.asTable();
+        if (tbl.metatable == null or !tbl.getInt(i).isNil()) return tbl.setInt(th.heap(), i, v);
+    }
+    return setIndex(th, t, .int(i), v);
+}
+
+/// `lua_len`: `#v` with `__len`.
+pub fn len(th: *Thread, v: Value) Error!Value {
+    switch (v.tag) {
+        .short_string, .long_string => return .int(@intCast(v.asString().len)),
+        .table => {
+            const t = v.asTable();
+            const h = th.state.fastTm(t.metatable, .len) orelse return .int(@bitCast(t.length()));
+            return call1(th, h, &.{ v, v });
+        },
+        else => {
+            const h = th.state.tmOf(v, .len) orelse return typeError(th, v, "get length of");
+            return call1(th, h, &.{ v, v });
+        },
+    }
+}
+
+/// `luaL_len`: `#v` as an integer.
+pub fn lenInt(th: *Thread, v: Value) Error!i64 {
+    if (v.tag == .table and v.asTable().metatable == null) return @bitCast(v.asTable().length());
+    return toInteger(try len(th, v)) orelse raise(th, "object length is not an integer", .{});
+}
+
+/// `lua_compare(L, a, b, LUA_OPLT)`: `a < b` with `__lt`.
+pub fn lessThan(th: *Thread, a: Value, b: Value) Error!bool {
+    if (a.tag == .int and b.tag == .int) return a.payload.int < b.payload.int;
+    if (a.isNumber() and b.isNumber()) return numLess(a, b);
+    if (a.isString() and b.isString()) return std.mem.order(u8, a.asString().bytes(), b.asString().bytes()) == .lt;
+    const h = th.state.tmOf(a, .lt) orelse th.state.tmOf(b, .lt) orelse {
+        const ta = objTypeName(th.state, a);
+        const tb = objTypeName(th.state, b);
+        if (std.mem.eql(u8, ta, tb)) return th.runError("attempt to compare two {s} values", .{ta});
+        return th.runError("attempt to compare {s} with {s}", .{ ta, tb });
+    };
+    return !(try call1(th, h, &.{ a, b })).isFalsy();
+}
+
+fn numLess(a: Value, b: Value) bool {
+    if (a.tag == .int) {
+        return if (b.tag == .int) a.payload.int < b.payload.int else number.ltIntFloat(a.payload.int, b.payload.float);
+    }
+    return if (b.tag == .float) a.payload.float < b.payload.float else number.ltFloatInt(
+        a.payload.float,
+        b.payload.int,
+    );
+}
+
+/// `lua_compare(L, a, b, LUA_OPEQ)`: `a == b` with `__eq`.
+pub fn equal(th: *Thread, a: Value, b: Value) Error!bool {
+    if (Value.rawEquals(a, b)) return true;
+    if (a.tag != b.tag or (a.tag != .table and a.tag != .userdata)) return false;
+    const h = th.state.fastTm(th.state.metatableOf(a), .eq) orelse
+        th.state.fastTm(th.state.metatableOf(b), .eq) orelse return false;
+    return !(try call1(th, h, &.{ a, b })).isFalsy();
+}
+
+/// `luaG_typeerror` without variable names: natives have none to give.
+fn typeError(th: *Thread, v: Value, comptime what: []const u8) Error {
+    return th.runError("attempt to " ++ what ++ " a {s} value", .{objTypeName(th.state, v)});
+}
+
+// ---------------------------------------------------------------------------
+// Building strings
+// ---------------------------------------------------------------------------
+
+/// A string buffer, `luaL_Buffer`: a writer whose first `inline_len` bytes
+/// live in the struct, so short results never touch the heap, and which
+/// grows through the state's allocator past that. Initialize it in place
+/// with `init`; it must not move afterwards.
+pub const Buffer = struct {
+    writer: Writer,
+    gpa: std.mem.Allocator,
+    on_heap: bool,
+    small: [inline_len]u8,
+
+    /// `LUAL_BUFFERSIZE` on a 64-bit build.
+    pub const inline_len = 1024;
+
+    const vtable: Writer.VTable = .{ .drain = drain, .rebase = rebase };
+
+    pub fn init(b: *Buffer, state: *State) void {
+        b.gpa = state.heap.allocator();
+        b.on_heap = false;
+        b.writer = .{ .vtable = &vtable, .buffer = &b.small };
+    }
+
+    pub fn deinit(b: *Buffer) void {
+        if (b.on_heap) b.gpa.free(b.writer.buffer);
+        b.* = undefined;
+    }
+
+    pub fn written(b: *Buffer) []const u8 {
+        return b.writer.buffered();
+    }
+
+    /// The contents as a Lua string. The buffer stays usable.
+    pub fn toString(b: *Buffer, state: *State) error{OutOfMemory}!*String {
+        return state.newString(b.written());
+    }
+
+    fn ensureUnused(b: *Buffer, n: usize) error{WriteFailed}!void {
+        const w = &b.writer;
+        if (w.buffer.len - w.end >= n) return;
+        const need = std.math.add(usize, w.end, n) catch return error.WriteFailed;
+        const cap = @max(need, w.buffer.len * 2);
+        if (b.on_heap) {
+            w.buffer = b.gpa.realloc(w.buffer, cap) catch return error.WriteFailed;
+        } else {
+            const mem = b.gpa.alloc(u8, cap) catch return error.WriteFailed;
+            @memcpy(mem[0..w.end], w.buffer[0..w.end]);
+            w.buffer = mem;
+            b.on_heap = true;
+        }
+    }
+
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const b: *Buffer = @fieldParentPtr("writer", w);
+        const pattern = data[data.len - 1];
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |d| total += d.len;
+        const splat_len = std.math.mul(usize, pattern.len, splat) catch return error.WriteFailed;
+        try b.ensureUnused(std.math.add(usize, total, splat_len) catch return error.WriteFailed);
+        const start = w.end;
+        for (data[0 .. data.len - 1]) |d| {
+            @memcpy(w.buffer[w.end..][0..d.len], d);
+            w.end += d.len;
+        }
+        for (0..splat) |_| {
+            @memcpy(w.buffer[w.end..][0..pattern.len], pattern);
+            w.end += pattern.len;
+        }
+        return w.end - start;
+    }
+
+    fn rebase(w: *Writer, preserve: usize, capacity: usize) Writer.Error!void {
+        _ = preserve;
+        const b: *Buffer = @fieldParentPtr("writer", w);
+        try b.ensureUnused(capacity);
+    }
+};
+
+/// A string of a length known in advance, filled in place: short ones in
+/// the struct and then interned, long ones directly in the new string.
+pub const Sized = struct {
+    short: [String.max_short_len]u8,
+    long: ?*String,
+    len: usize,
+
+    /// The bytes to fill. The struct must not move until `finish`.
+    pub fn init(sb: *Sized, state: *State, n: usize) error{OutOfMemory}![]u8 {
+        sb.len = n;
+        if (n <= String.max_short_len) {
+            sb.long = null;
+            return sb.short[0..n];
+        }
+        const s = try String.createLong(&state.heap, state.seed, n);
+        sb.long = s;
+        return s.mutableBytes();
+    }
+
+    pub fn finish(sb: *Sized, state: *State) error{OutOfMemory}!*String {
+        return sb.long orelse state.newString(sb.short[0..sb.len]);
+    }
+};
+
+/// A library table with these natives, by name.
+pub fn newLib(state: *State, comptime funcs: anytype) error{OutOfMemory}!*Table {
+    const t = try state.newTable(0, funcs.len);
+    inline for (funcs) |f| try setField(state, t, f[0], .native(f[1]));
+    return t;
+}
+
+/// `t[name] = v`, raw.
+pub fn setField(state: *State, t: *Table, name: []const u8, v: Value) error{OutOfMemory}!void {
+    try t.setStr(&state.heap, try state.newString(name), v);
+}
+
+// ---------------------------------------------------------------------------
+// Test harness
+// ---------------------------------------------------------------------------
+
+/// Helpers for the libraries' tests: call a native the way Lua would, from
+/// the base frame, in protected mode.
+pub const testing = struct {
+    const t = std.testing;
+
+    pub fn newState() !*State {
+        return State.create(t.allocator, .{ .seed = 1 });
+    }
+
+    pub fn str(state: *State, b: []const u8) !Value {
+        return .string(try state.newString(b));
+    }
+
+    pub const Outcome = union(enum) {
+        ok: []Value,
+        err: Value,
+    };
+
+    /// Calls `f` with `args` from the main thread's base frame. The results
+    /// stay on the stack until the next call.
+    pub fn call(state: *State, f: Value, args: []const Value) !Outcome {
+        const th = state.main;
+        th.top = 1;
+        try th.ensureStack(@intCast(args.len + 1));
+        th.push(f);
+        for (args) |v| th.push(v);
+        if (!vm.pcall(th, 1, -1)) return .{ .err = th.stack[1] };
+        return .{ .ok = th.stack[1..th.top] };
+    }
+
+    /// Calls `f` with `args` through a Lua function, `function(f, ...)
+    /// return f(...) end` from chunk "=test", all on line 7, so errors that
+    /// natives raise get the caller's position.
+    pub fn callFromLua(state: *State, f: Value, args: []const Value) !Outcome {
+        const p = try Proto.create(&state.heap);
+        const gpa = state.heap.allocator();
+        p.code = try gpa.dupe(u32, &.{
+            opcodes.abc(.varargprep, 1, 0, 0, false),
+            opcodes.abc(.move, 1, 0, 0, false),
+            opcodes.abc(.vararg, 2, 0, 0, false),
+            opcodes.abc(.call, 1, 0, 0, false),
+            opcodes.abc(.@"return", 1, 0, 2, false),
+        });
+        p.lineinfo = try gpa.dupe(u32, &.{ 7, 7, 7, 7, 7 });
+        p.numparams = 1;
+        p.flags.vararg = true;
+        p.maxstacksize = 4;
+        p.source = try state.newString("=test");
+        const cl = try Proto.LuaClosure.create(&state.heap, p, 0);
+        var all: [16]Value = undefined;
+        all[0] = f;
+        @memcpy(all[1..][0..args.len], args);
+        return call(state, .luaClosure(cl), all[0 .. args.len + 1]);
+    }
+
+    /// Like `call`, expecting success.
+    pub fn ok(state: *State, f: Value, args: []const Value) ![]Value {
+        switch (try call(state, f, args)) {
+            .ok => |r| return r,
+            .err => |e| {
+                std.debug.print("unexpected error: {s}\n", .{if (e.isString()) e.asString().bytes() else "?"});
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    /// Like `call`, expecting an error with exactly this message.
+    pub fn expectError(state: *State, want: []const u8, f: Value, args: []const Value) !void {
+        switch (try call(state, f, args)) {
+            .ok => return error.TestExpectedError,
+            .err => |e| try t.expectEqualStrings(want, e.asString().bytes()),
+        }
+    }
+
+    /// The results as `print` would show them, tab-separated, for comparing
+    /// with the reference's output. Tables and functions show their type.
+    pub fn show(state: *State, f: Value, args: []const Value) ![]const u8 {
+        const S = struct {
+            var buf: [8192]u8 = undefined;
+        };
+        var w: Writer = .fixed(&S.buf);
+        switch (try call(state, f, args)) {
+            .ok => |r| for (r, 0..) |v, i| {
+                if (i > 0) try w.writeByte('\t');
+                try showValue(&w, v);
+            },
+            .err => |e| {
+                try w.writeAll("error: ");
+                try showValue(&w, e);
+            },
+        }
+        return w.buffered();
+    }
+
+    pub fn showValue(w: *Writer, v: Value) !void {
+        var nb: [number.max_len]u8 = undefined;
+        switch (v.tag) {
+            .int, .float => try w.writeAll(formatNumber(&nb, v)),
+            .short_string, .long_string => try w.writeAll(v.asString().bytes()),
+            .nil => try w.writeAll("nil"),
+            .bool_false => try w.writeAll("false"),
+            .bool_true => try w.writeAll("true"),
+            else => try w.writeAll(v.typeOf().name()),
+        }
+    }
+
+    /// Calls `f` and expects `show` to give `want`.
+    pub fn expectShow(state: *State, want: []const u8, f: Value, args: []const Value) !void {
+        try t.expectEqualStrings(want, try show(state, f, args));
+    }
+
+    /// Lua values for a tuple of Zig ones: integers, floats, booleans, null
+    /// for nil, string literals, `Value`s, `.{ .kv = .{ .{ k, v }, ... } }`
+    /// for a new table, `.empty_table`, and `.native_function` for a native
+    /// function. The slice is reused by
+    /// the next call.
+    pub fn vals(state: *State, args: anytype) ![]Value {
+        const S = struct {
+            var buf: [64]Value = undefined;
+        };
+        inline for (args, 0..) |x, i| S.buf[i] = try toValue(state, x);
+        return S.buf[0..args.len];
+    }
+
+    fn toValue(state: *State, x: anytype) !Value {
+        const T = @TypeOf(x);
+        if (T == Value) return x;
+        return switch (@typeInfo(T)) {
+            .comptime_int, .int => .int(x),
+            .comptime_float, .float => .float(x),
+            .bool => .boolean(x),
+            .null => .nil,
+            .pointer => str(state, x),
+            .@"struct" => blk: {
+                // `.{ .kv = .{ .{ key, value }, ... } }`: a table.
+                const tbl = try state.newTable(0, 0);
+                inline for (x.kv) |pair| {
+                    try tbl.set(&state.heap, try toValue(state, pair[0]), try toValue(state, pair[1]));
+                }
+                break :blk .table(tbl);
+            },
+            .enum_literal => switch (x) {
+                .empty_table => .table(try state.newTable(0, 0)),
+                .native_function => .native(&nop),
+                else => @compileError("unknown test value"),
+            },
+            else => @compileError("unsupported test value type " ++ @typeName(T)),
+        };
+    }
+
+    fn nop(_: *Thread, _: u32) Error!u32 {
+        return 0;
+    }
+
+    /// Runs generated cases `.{ "lib.name", .{ args... }, "expected" }`,
+    /// where the expected text is what `show` gives for the reference's
+    /// results.
+    pub fn expectCases(state: *State, comptime cases: anytype) !void {
+        @setEvalBranchQuota(100_000);
+        var failed: usize = 0;
+        inline for (cases, 0..) |c, i| {
+            const got = try show(state, try global(state, c[0]), try vals(state, c[1]));
+            if (!std.mem.eql(u8, got, c[2])) {
+                std.debug.print("case {d}, {s}: expected \"{f}\", got \"{f}\"\n", .{
+                    i,
+                    c[0],
+                    std.zig.fmtString(c[2]),
+                    std.zig.fmtString(got),
+                });
+                failed += 1;
+            }
+        }
+        try t.expectEqual(@as(usize, 0), failed);
+    }
+
+    /// A Lua global or library field, by dotted name ("string.rep").
+    pub fn global(state: *State, comptime path: []const u8) !Value {
+        var v: Value = .table(state.globals);
+        var it = std.mem.splitScalar(u8, path, '.');
+        while (it.next()) |part| v = v.asTable().getStr(try state.newString(part));
+        return v;
+    }
+};
+
+test "Buffer keeps short output inline and grows on the heap" {
+    const state = try testing.newState();
+    defer state.destroy();
+    var b: Buffer = undefined;
+    b.init(state);
+    defer b.deinit();
+    try b.writer.writeAll("abc");
+    try std.testing.expect(!b.on_heap);
+    try b.writer.splatByteAll('x', 3000);
+    try b.writer.print("{d}", .{42});
+    try std.testing.expect(b.on_heap);
+    try std.testing.expectEqual(@as(usize, 3005), b.written().len);
+    try std.testing.expectEqualStrings("abcxx", b.written()[0..5]);
+    try std.testing.expectEqualStrings("x42", b.written()[3002..]);
+}

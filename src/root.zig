@@ -38,4 +38,9 @@ test {
     _ = @import("lib/format.zig");
     _ = @import("lib/pack.zig");
     _ = @import("lib/libm.zig");
+    _ = @import("lib/auxlib.zig");
+    _ = @import("lib/string.zig");
+    _ = @import("lib/table.zig");
+    _ = @import("lib/math.zig");
+    _ = @import("lib/utf8.zig");
 }
