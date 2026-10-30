@@ -61,7 +61,8 @@ the plan left open and what was measured. Numbers are in
   5.5's random increments.
 - There is no slot-pointer API. The VM's store fast path is "table without
   a metatable: raw set". A table with a metatable does a raw get, then
-  checks `__newindex`'s cached absence; measure an inline variant later.
+  checks `__newindex`'s cached absence. Wave 2 added an in-place store for
+  a present short-string key (`vm.md`).
 - The metamethod cache: `Table.flags` bit e set means event e (`__index`
   through `__eq`) is absent. New tables start with all bits set; any store
   that adds a key or refills a nil value clears them.
@@ -112,11 +113,8 @@ the plan left open and what was measured. Numbers are in
 
 ### Numbers
 
-`vm.zig` has private, minimal versions of floor division, modulo, shifts,
-exact int/float comparison, and float-to-int with rounding, each marked
-`TODO(number.zig)`. `CONCAT` formats floats with Zig's shortest round-trip
-`{d}` and ".0" for integral values; PUC-Rio's exponent form ("1e+100")
-waits for `number.zig`.
+Wave 1 had private versions of the number helpers; wave 2 moved the VM onto
+`number.zig` (see `vm.md`).
 
 ## Measured
 
@@ -131,13 +129,10 @@ waits for `number.zig`.
 
 ## Not done
 
-- `__concat`, to-be-closed variables (`TBC`, `__close`, the closing value in
-  `TFORPREP`), and named vararg tables (`VARARG` with k, `PF_VATAB`) raise
-  "not implemented yet" errors.
-- Coroutines: `Thread.status` exists, resume and yield do not.
+Wave 2 finished concatenation, to-be-closed variables, vararg tables,
+coroutines, variable names in messages, `number.zig` arithmetic, message
+handlers, and stack shrinking; `vm.md` records how and what is still open.
+Left from this list:
+
 - Weak tables, ephemerons, finalizers, incremental and generational modes.
-- Variable names in error messages ("(global 'x')") need the debug
-  information the parser will emit.
-- A `GETTABUP` inline cache, string coercion in arithmetic (the string
-  library's metamethods), stack shrinking after an overflow, and message
-  handlers for `xpcall`.
+- A `GETTABUP` inline cache.

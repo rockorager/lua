@@ -71,7 +71,9 @@ reference.
    `xpcall`, `dofile`, the `table`/`string` functions that call metamethods)
    take a continuation, like `lua_callk`, so yields cross them. Yields across a
    native function without a continuation raise "attempt to yield across a
-   C-call boundary", as in PUC-Rio.
+   C-call boundary", as in PUC-Rio. Landed: `vm.callk`/`vm.pcallk` with
+   `Value.KFn` continuations, `lib/coroutine.zig`, and yieldable `pcall`
+   and `xpcall`; `vm.md` has the details.
 7. **Strings.** Short strings (40 bytes or fewer) are interned in a hash set
    owned by the `State`, so equality is pointer equality. Long strings are not
    interned and hash lazily. A string is one allocation: header, hash, length,
@@ -198,8 +200,7 @@ from the core are in `stdlib.md`.
 Landed from wave 2: the compiler (`Parser.zig`, `Code.zig`), the base
 library (`lib/base.zig`), `lib/init.zig`'s `openLibs`, and the standalone
 `lua` (`main.zig`, lua.c without the traceback). `just diff` runs
-`test/diff/*.lua` on both interpreters; `vm_errors.lua` there lists the VM's
-messages that still differ. The package, io, and os libraries
+`test/diff/*.lua` on both interpreters. The package, io, and os libraries
 (`lib/package.zig`, `lib/io.zig`, `lib/os.zig`) landed too, with `require`;
 `main.zig` hands them the environment and `-E` through the registry until
 `Host` carries them. Coverage, verification, and what they need from the core
@@ -208,6 +209,13 @@ are in `io-os-package.md`. Most suite files now stop on `require "debug"`.
 Landed from wave 3: `string.dump` and binary chunks (`dump.zig`,
 `undump.zig`, decision 16); all.lua now runs main.lua through its dump
 round trip and stops on `require "debug"`.
+
+Landed from wave 2, the VM (`vm.md`): `number.zig` arithmetic, `__concat`,
+to-be-closed variables, vararg tables, coroutines and continuations
+(`lib/coroutine.zig`), error messages with variable names, stack overflow
+handling, and the debug library without hooks (`lib/debug.zig`). Still
+open there: hooks, and the
+standalone `lua` running its chunk from a native frame.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes, then the measured decisions above.

@@ -61,8 +61,7 @@ differ from the reference in the last bit for about 3% (sin, cos, tan, atan)
 to 17% (atan2) of random arguments. `asin` and `acos` out of range give the
 wrapper's positive NaN, as the reference prints `nan`, not `-nan`.
 
-The VM's `^` should call `libm.pow` so `2^0.5` and `math.exp`-style results
-agree with the reference; that is the core's file.
+The VM's `^` calls `libm.pow`, so `2^0.5` agrees with the reference too.
 
 ## Verification
 
@@ -86,23 +85,12 @@ ReleaseSafe build: 0 mismatches.
 
 ## Requests for the core
 
-`auxlib.zig` holds private versions, marked `TODO(core)`, of what belongs in
-the core's files:
-
-- `raise`: `luaL_error`, positioned at the Lua function that called the
-  native. `Thread.runError` positions at the running frame, right for
-  `luaG_runerror` only.
-- Metamethod-aware `index`, `setIndex`, `getI`, `setI`, `len`, `lessThan`,
-  `equal`, and `tolstring` (`luaL_tolstring`) callable from a native, plus
-  `toInteger`/`toNumber` with string coercion (`lua_tointegerx`).
-- Calling a Lua function from a native (`call1`, over `vm.call`) for `sort`'s
-  comparator and `gsub`'s function replacement. These calls are not yieldable;
-  5.5 lets `sort` and `gsub` callbacks yield only through `lua_callk`, which
-  needs continuations in `vm`.
-- Call-site function names for "bad argument" messages: the reference says
-  "'f'" after `local f = string.rep` and drops `self` from method-call
-  argument numbers. Every message here uses the library's own name.
-- `Userdata.bytes` does not compile (the pointer arithmetic needs an
-  `@alignCast`); `auxlib.userdataBytes` repeats its layout.
-- The VM's `^` and its number conversions should use `libm.pow` and the same
-  coercions, so a value computed by an operator matches the library's.
+Landed in wave 2's VM work (`vm.md`): `auxlib.raise` and `Args.argError` are
+`debuginfo.raise` and `debuginfo.argError`, with call-site names and method
+calls not counting `self`; `index`, `setIndex`, `len`, `lessThan`, `equal`,
+`toInteger`, `toNumber`, and the number formatting are `vm`'s; `Userdata.bytes`
+compiles. Sort's comparator and gsub's replacement function stay plain
+`vm.call`s, which cannot yield, as `lua_call` in the reference; `vm.callk`
+exists for a native that should let its callback yield. Bitwise operators
+on strings raise an error in the reference 5.5.1 too, so the VM does not
+convert them.
