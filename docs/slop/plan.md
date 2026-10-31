@@ -259,6 +259,13 @@ reference.
 - The suite: `just suite` runs `all.lua` with `_U=true` on our binary. A file
   or case that cannot pass yet is listed in the suite driver with the reason.
   `docs/slop/suite-status.md` tracks which files pass.
+- Fuzzing: `just fuzz` runs the fuzzers in `test/fuzz/` (the compiler on
+  mutated and generated source, the binary loader on corrupted dumps,
+  generated programs and bytecode listings against the reference, and an
+  allocation-failure sweep over programs and the API) in ReleaseSafe;
+  `just fuzz-stress` under collector stress, `just fuzz-zig` through Zig's
+  coverage-guided fuzzer. Design, findings, and known limits are in
+  `fuzz.md`.
 
 ## Benchmarks
 
