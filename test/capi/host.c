@@ -596,6 +596,7 @@ static void t_results (void) {
   run(L, "print('  ENOENT:', fileresult(2, false, 'some/file'))");
   run(L, "print('  no name:', fileresult(13, false))");
   run(L, "print('  no errno:', fileresult(0, false, 'x'))");
+  run(L, "local r, m, e = fileresult(2, false, ('d/'):rep(400) .. 'f') print('  long name:', r, #m, m:sub(-32), e)");
   lua_close(L);
 }
 

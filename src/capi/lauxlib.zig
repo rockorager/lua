@@ -12,6 +12,7 @@ const aux = @import("../lib/auxlib.zig");
 const base = @import("../lib/base.zig");
 const capi = @import("capi.zig");
 const va = @import("va.zig");
+const liolib = @import("liolib.zig");
 
 const Error = Value.Error;
 // The headers' type names, as in capi.zig.
@@ -246,34 +247,15 @@ fn lauxFileresult(L: *lua_State, stat: c_int, fname: ?[*:0]const u8) callconv(.c
     capi.luaPushnil(L);
     const msg = if (en != 0) span(strerror(en)) else "(no extra info)";
     if (fname) |f| {
-        var buf: [512]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{s}: {s}", .{ span(f), msg }) catch buf[0..];
-        _ = capi.luaPushlstring(L, s.ptr, s.len);
+        // `lua_pushfstring(L, "%s: %s", fname, msg)`, whatever the length.
+        _ = capi.luaPushstring(L, f);
+        _ = capi.luaPushlstring(L, ": ", 2);
+        _ = capi.luaPushlstring(L, msg.ptr, msg.len);
+        capi.luaConcat(L, 3);
     } else {
         _ = capi.luaPushlstring(L, msg.ptr, msg.len);
     }
     capi.luaPushinteger(L, en);
-    return 3;
-}
-
-/// `luaL_execresult` for the status of `system` or `pclose`: true or
-/// fail, "exit" or "signal", and the code, as `l_inspectstat` reads it
-/// on POSIX.
-fn lauxExecresult(L: *lua_State, stat_in: c_int) callconv(.c) c_int {
-    if (stat_in != 0 and std.c._errno().* != 0) return lauxFileresult(L, 0, null);
-    var stat = stat_in;
-    var what: [*:0]const u8 = "exit";
-    // glibc's WIFEXITED, WEXITSTATUS, WIFSIGNALED, and WTERMSIG.
-    const sig = stat & 0x7f;
-    if (sig == 0) {
-        stat = (stat >> 8) & 0xff;
-    } else if (sig != 0x7f) {
-        stat = sig;
-        what = "signal";
-    }
-    if (what[0] == 'e' and stat == 0) capi.luaPushboolean(L, 1) else capi.luaPushnil(L);
-    _ = capi.luaPushstring(L, what);
-    capi.luaPushinteger(L, stat);
     return 3;
 }
 
@@ -595,7 +577,8 @@ comptime {
     @export(if (va.native) &lauxError else &va.Entry(&lauxErrorv).entry, .{ .name = "luaL_error" });
     @export(&lauxCheckoption, .{ .name = "luaL_checkoption" });
     @export(&lauxFileresult, .{ .name = "luaL_fileresult" });
-    @export(&lauxExecresult, .{ .name = "luaL_execresult" });
+    // io's, which `pclose` uses: one `luaL_execresult` for both.
+    @export(&liolib.execResult, .{ .name = "luaL_execresult" });
     @export(&lauxRef, .{ .name = "luaL_ref" });
     @export(&lauxUnref, .{ .name = "luaL_unref" });
     @export(&lauxLoadfilex, .{ .name = "luaL_loadfilex" });

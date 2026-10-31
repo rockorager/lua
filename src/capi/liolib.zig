@@ -163,8 +163,8 @@ fn raise(L: *lua_State, parts: []const []const u8) noreturn {
     unreachable;
 }
 
-/// `luaL_execresult` for `pclose`'s status. lauxlib.c's, which the C API's
-/// `luaL_execresult` must equal.
+/// lauxlib.c's `luaL_execresult`, for `pclose`'s status; `lauxlib.zig`
+/// exports it under that name.
 pub fn execResult(L: *lua_State, stat_in: c_int) callconv(.c) c_int {
     if (stat_in != 0 and errno().* != 0) return luaL_fileresult(L, 0, null);
     var stat = stat_in;
