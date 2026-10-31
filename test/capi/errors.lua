@@ -175,6 +175,39 @@ show("gsub", T.gsub("a.b.c", ".", "::"))
 show("fstring", T.fstring())
 show("sameptr", T.sameptr())
 show("placeholder", T.placeholder)
+print "-- hooks, locals, upvalues, to-be-closed slots, dumps, warnings"
+show("hooked", T.hooked(function (n) local s = 0 for i = 1, n do s = s + i end return s end, 100))
+debug.sethook(function () end, "l")
+show("rehook", T.rehook(), debug.gethook() ~= nil)
+debug.sethook()
+local function withlocals (a)
+  local first, second = a, "two"
+  show("locals", T.locals())
+  show("after setlocal", a, first, second)
+end
+withlocals(1)
+local up1, up2 = 0, 0
+local function fa () up1 = up1 + 1 return up1 end
+local function fb () return up1 end
+local function fc () up2 = up2 + 10 return up2 end
+show("upvalueid", T.upvalueid(fa, 1) == debug.upvalueid(fa, 1), T.upvalueid(fa, 1) == T.upvalueid(fb, 1), T.upvalueid(fa, 1) == T.upvalueid(fc, 1))
+T.upvaluejoin(fc, 1, fa, 1)
+show("upvaluejoin", fa(), fc(), fb())
+local closer = setmetatable({}, {__close = function (_, e) print("closed with", e) end})
+show("toclose", T.toclose(closer))
+try("toclose error", T.toclose, closer, true)
+try("toclose non-closable", T.toclose, {})
+local function dumped (a) return a * 3 end
+local d, st = T.dump(dumped)
+show("dump", st, d == string.dump(dumped), load(d)(14))
+d, st = T.dump(dumped, true)
+show("dump stripped", st, d == string.dump(dumped, true))
+show("warnings", T.warnings(warn, "a", "b"))
+show("gcmodes", T.gcmodes())
+show("allocf", T.allocf())
+show("execresult", T.execresult("exit 7"))
+show("execresult ok", T.execresult("true"))
+
 T.newT(-3)
 collectgarbage()
 collectgarbage()

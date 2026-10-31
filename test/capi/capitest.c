@@ -5,6 +5,9 @@
 ** which load this same library built against include/, and compares.
 */
 
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "lua.h"
@@ -407,6 +410,166 @@ static int t_sameptr (lua_State *L) {
   return 2;
 }
 
+
+/* ---------------------------------------------------------------------
+** The rest of lua.h and lauxlib.h, on the standalone lua's own state.
+** ------------------------------------------------------------------- */
+
+static int hookcount = 0;
+
+static void counthook (lua_State *L, lua_Debug *ar) {
+  (void)L;
+  if (ar->event == LUA_HOOKCOUNT)
+    hookcount++;
+}
+
+/* hooked(f): calls f with a count hook set; the hook's view of itself. */
+static int t_hooked (lua_State *L) {
+  int mask, count, same;
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  hookcount = 0;
+  lua_sethook(L, counthook, LUA_MASKCOUNT, 3);
+  same = lua_gethook(L) == counthook;
+  mask = lua_gethookmask(L);
+  count = lua_gethookcount(L);
+  lua_call(L, lua_gettop(L) - 1, 1);
+  lua_sethook(L, NULL, 0, 0);
+  lua_pushboolean(L, hookcount > 0);
+  lua_pushinteger(L, mask);
+  lua_pushinteger(L, count);
+  lua_pushboolean(L, same && lua_gethook(L) == NULL);
+  return 5;
+}
+
+/* rehook(): lua_gethook of the debug library's hook, set back. */
+static int t_rehook (lua_State *L) {
+  lua_Hook h = lua_gethook(L);
+  int mask = lua_gethookmask(L), count = lua_gethookcount(L);
+  lua_sethook(L, NULL, 0, 0);
+  lua_sethook(L, h, mask, count);
+  lua_pushboolean(L, h != NULL);
+  return 1;
+}
+
+/* locals(): the caller's locals as name=value. */
+static int t_locals (lua_State *L) {
+  lua_Debug ar;
+  const char *name;
+  int i;
+  luaL_Buffer b;
+  if (!lua_getstack(L, 1, &ar))
+    return 0;
+  luaL_buffinit(L, &b);
+  for (i = 1; (name = lua_getlocal(L, &ar, i)) != NULL; i++) {
+    lua_pushfstring(L, "%s=%s ", name, luaL_tolstring(L, -1, NULL));
+    lua_remove(L, -2);
+    lua_remove(L, -2);
+    luaL_addvalue(&b);
+  }
+  luaL_pushresult(&b);
+  /* Locals change: the first one becomes "changed". */
+  lua_pushliteral(L, "changed");
+  lua_pushstring(L, lua_setlocal(L, &ar, 1));
+  return 2;
+}
+
+static int t_upvalueid (lua_State *L) {
+  lua_pushlightuserdata(L, lua_upvalueid(L, 1, (int)luaL_checkinteger(L, 2)));
+  return 1;
+}
+
+static int t_upvaluejoin (lua_State *L) {
+  lua_upvaluejoin(L, 1, (int)luaL_checkinteger(L, 2), 3, (int)luaL_checkinteger(L, 4));
+  return 0;
+}
+
+static int t_toclose (lua_State *L) {
+  int fail = lua_toboolean(L, 2);
+  lua_settop(L, 1);
+  lua_toclose(L, 1);
+  lua_pushvalue(L, 1);
+  lua_toclose(L, 2);
+  lua_closeslot(L, 2);
+  if (fail)
+    return luaL_error(L, "after toclose");
+  lua_pushliteral(L, "done");
+  return 1;
+}
+
+static int bufwriter (lua_State *L, const void *p, size_t sz, void *ud) {
+  (void)L;
+  if (p != NULL)
+    luaL_addlstring((luaL_Buffer *)ud, (const char *)p, sz);
+  return 0;
+}
+
+/* dump(f, strip): lua_dump into a buffer. */
+static int t_dump (lua_State *L) {
+  luaL_Buffer b;
+  int st;
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  lua_settop(L, 2);
+  lua_pushvalue(L, 1);
+  luaL_buffinit(L, &b);
+  /* The function to dump must be on top: move the buffer's slot below. */
+  lua_insert(L, -2);
+  st = lua_dump(L, bufwriter, &b, lua_toboolean(L, 2));
+  lua_pop(L, 1);
+  luaL_pushresult(&b);
+  lua_pushinteger(L, st);
+  return 2;
+}
+
+static char warned[512];
+
+static void collectwarn (void *ud, const char *msg, int tocont) {
+  size_t n = strlen(warned);
+  (void)ud;
+  snprintf(warned + n, sizeof(warned) - n, "%s%s", msg, tocont ? "" : "|");
+}
+
+/* warnings(f): calls f with warnings collected; returns them. */
+static int t_warnings (lua_State *L) {
+  warned[0] = 0;
+  lua_setwarnf(L, collectwarn, NULL);
+  lua_call(L, lua_gettop(L) - 1, 0);
+  lua_warning(L, "from ", 1);
+  lua_warning(L, "C", 0);
+  lua_setwarnf(L, NULL, NULL);
+  lua_pushstring(L, warned);
+  return 1;
+}
+
+static int t_gcmodes (lua_State *L) {
+  int first = lua_gc(L, LUA_GCINC);
+  int second = lua_gc(L, LUA_GCGEN);
+  int pause = lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE, 180);
+  int now = lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE, pause);
+  lua_pushinteger(L, first);
+  lua_pushinteger(L, second);
+  lua_pushinteger(L, pause);
+  lua_pushinteger(L, now);
+  lua_pushinteger(L, lua_gc(L, LUA_GCSTEP, (size_t)0) >= 0);
+  return 5;
+}
+
+static int t_allocf (lua_State *L) {
+  void *ud;
+  lua_Alloc f = lua_getallocf(L, &ud);
+  void *p = f(ud, NULL, 0, 100);
+  memset(p, 1, 100);
+  p = f(ud, p, 100, 1000);
+  f(ud, p, 1000, 0);
+  lua_setallocf(L, f, ud);
+  lua_pushboolean(L, lua_getallocf(L, NULL) == f);
+  return 1;
+}
+
+static int t_execresult (lua_State *L) {
+  errno = 0;
+  return luaL_execresult(L, system(luaL_checkstring(L, 1)));
+}
+
 static const luaL_Reg T_methods[] = {
   {"get", T_get},
   {NULL, NULL}
@@ -456,6 +619,17 @@ static const luaL_Reg funcs[] = {
   {"gsub", t_gsub},
   {"fstring", t_fstring},
   {"sameptr", t_sameptr},
+  {"hooked", t_hooked},
+  {"rehook", t_rehook},
+  {"locals", t_locals},
+  {"upvalueid", t_upvalueid},
+  {"upvaluejoin", t_upvaluejoin},
+  {"toclose", t_toclose},
+  {"dump", t_dump},
+  {"warnings", t_warnings},
+  {"gcmodes", t_gcmodes},
+  {"allocf", t_allocf},
+  {"execresult", t_execresult},
   {"placeholder", NULL},
   {NULL, NULL}
 };
