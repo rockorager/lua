@@ -2,6 +2,7 @@
 //! as reference Lua's linit.c does. Each library is a file in this
 //! directory with an `open` function that sets its globals.
 
+const std = @import("std");
 const Value = @import("../Value.zig");
 const State = @import("../State.zig");
 const Thread = @import("../Thread.zig");
@@ -17,8 +18,10 @@ pub const table = @import("table.zig");
 pub const math = @import("math.zig");
 pub const utf8 = @import("utf8.zig");
 
-/// The libraries `openLibs` opens, in linit.c's order, by the global each
-/// one sets.
+/// A standard library, by the global it sets, in linit.c's order.
+pub const Lib = enum { base, package, coroutine, debug, io, math, os, string, table, utf8 };
+
+/// Each library's global and `open`, indexed by `Lib`.
 const libs = [_]struct { []const u8, *const fn (*Thread) Value.Error!void }{
     .{ "_G", base.open },
     .{ "package", package.open },
@@ -31,6 +34,10 @@ const libs = [_]struct { []const u8, *const fn (*Thread) Value.Error!void }{
     .{ "table", onState(table.open) },
     .{ "utf8", onState(utf8.open) },
 };
+
+comptime {
+    std.debug.assert(libs.len == @typeInfo(Lib).@"enum".fields.len);
+}
 
 /// Adapts a library whose `open` takes the state.
 fn onState(comptime open: fn (*State) Value.Error!void) fn (*Thread) Value.Error!void {
@@ -45,10 +52,16 @@ fn onState(comptime open: fn (*State) Value.Error!void) fn (*Thread) Value.Error
 /// records each in `package.loaded`, as `luaL_requiref` does. `host`
 /// supplies their I/O and must outlive the state.
 pub fn openLibs(th: *Thread, host: *base.Host) Value.Error!void {
+    return openSome(th, host, .initFull());
+}
+
+/// `openLibs` for the libraries in `which` only, in linit.c's order.
+pub fn openSome(th: *Thread, host: *base.Host, which: std.EnumSet(Lib)) Value.Error!void {
     try base.setHost(th, host);
     const state = th.state;
     const loaded = try package.registryTable(state, package.loaded_key);
-    for (libs) |lib| {
+    for (libs, 0..) |lib, i| {
+        if (!which.contains(@enumFromInt(i))) continue;
         try lib[1](th);
         const name = try state.newString(lib[0]);
         try loaded.setStr(&state.heap, name, state.globals.getStr(name));
