@@ -191,15 +191,17 @@ reference.
     luafilesystem passing their own tests, errors unwound by a protected
     call per C function. The default build is unchanged; without the
     option `package.loadlib` and the C searchers keep the reference's
-    "dynamic libraries not enabled" answer. Still to decide: full
-    coverage (hooks, `lua_newstate` for a `liblua.so`) and whether the
-    C-API build becomes a release artifact. Landed in wave 11: io
-    handles are `luaL_Stream` on C's stdio in C-API builds
-    (`capi/liolib.zig`, liolib.c ported; luafilesystem's `setmode` and
-    `lock` and luaposix's `fileno` and `fdopen` work), C libraries close
-    with the state in 5.5.1's order, and aarch64 Linux (`jmp.zig`'s
-    pair, `va.zig` for the `...` functions Zig refuses there), tested
-    under qemu-user (`c-api.md`, `results/c-api-io-20261031.md`).
+    "dynamic libraries not enabled" answer. Wave 11 finished it: all 156
+    functions of `lua.h`, `lauxlib.h`, and `lualib.h`, and `liblua.a`,
+    `liblua.so`, and `lua5.5.pc` for C hosts, with the differences listed
+    in `c-api.md` (`results/capi-full-20261031.md`); io handles are
+    `luaL_Stream` on C's stdio in C-API builds (`capi/liolib.zig`,
+    liolib.c ported; luafilesystem's `setmode` and `lock` and luaposix's
+    `fileno` and `fdopen` work), C libraries close with the state in
+    5.5.1's order, and aarch64 Linux (`jmp.zig`'s pair, `va.zig` for the
+    `...` functions Zig refuses there), tested under qemu-user
+    (`results/c-api-io-20261031.md`). Still to decide: whether the C-API
+    build becomes a release artifact.
     Landed: `src/api.zig`, exported at the
     module's root (`lua.State`, `lua.Value`, `lua.Ref`, ...), with the engine
     under `lua.internal` for the tools. `State` is an opaque
@@ -440,9 +442,7 @@ nesting level to 176). The default build's loop is byte for byte
 wave 9's. The comparison with the reference at the end of wave 10 is
 `results/bench-compare-wave10-20261031.md`.
 
-Wave 11: full C API coverage, in two parts. The rest of the API and a
-`liblua` (`capi.zig`, `lauxlib.zig`, `loadlib.zig`) is another
-owner's. This part: io handles as `luaL_Stream` on C's stdio in C-API
+Wave 11: full C API coverage, in two parts. The io part: io handles as `luaL_Stream` on C's stdio in C-API
 builds (`src/capi/liolib.zig`, `base.Host.cstdout`), `dlclose` with
 the state (`loadlib.closeLibs` from `State.destroy`), and aarch64
 (`src/capi/jmp.zig`, `src/capi/va.zig`, `just capi-test
@@ -454,4 +454,25 @@ the `...` functions of `capi.zig` and `lauxlib.zig`. The default
 build's loop is byte for byte wave 10's
 (`results/c-api-io-20261031.md`).
 
-Next: the rest of `c-api.md`'s missing list.
+The API part (decision 16, `c-api.md`,
+`results/capi-full-20261031.md`): owner of `src/capi/` but `jmp.zig`,
+`va.zig`, and `liolib.zig`, of `include/`, `test/capi/`, the C-API parts
+of `build.zig` and the justfile, and `test/fuzz/capifuzz.c`; small edits
+to `Thread.zig` (the prefix grows to 24 bytes for the C hook), `vm.zig`
+(`closeLevel` and `CloseMode` public), `lib/debug.zig` (`findLocal`,
+`upvalueId`, `hookf` public; "external hook"), `lib/base.zig` (`warn`
+through the state's warning function in C-API builds), and
+`capi/liolib.zig` (its `execResult` is the exported `luaL_execresult`;
+`read("a")` lost its `statx` hint). `liblua` for C hosts (`lua_newstate`
+with the host's `lua_Alloc`), hooks and the whole `lua_Debug` interface,
+to-be-closed slots, `lua_dump`, `lua_setwarnf`, and every `lua_gc`
+option; `capi-coverage` compares the headers' declarations with each
+binary's exports (156 of 156), and `test/capi/host.c` runs on our
+`liblua.so` and `liblua.a` and the reference's, on x86-64 and aarch64.
+`src/capi/unwind.zig` checks the unwinding invariant in a test, and
+`just fuzz-capi` sweeps allocation failures through a C module and
+compares generated C-API workloads with the reference. `luaL_Buffer`'s
+box reallocates in place, and capi's index lookup returns a pointer
+(C → Lua calls −21%, `io.write` loops −15%). The default build's
+`.text` is byte for byte 3e3d9b8's; the C-API build's loop is too, and
+its floor is level after `just order`.

@@ -1,11 +1,13 @@
-# The C API (prototype)
+# The C API
 
 Plan item 16 had "no C API, no `.so` loading" as settled. The owner reopened
 it to find out whether compiled Lua C modules (lpeg, lua-cjson,
 luafilesystem, ...) can load unmodified without giving up the speed and memory
-lead. This is the prototype's design, how the risky parts were proven, what it
-covers, and what full coverage would take. The numbers are in
-`results/c-api-20261031.md`.
+lead. Wave 8 built the prototype; wave 11 finished it: every function of
+`lua.h`, `lauxlib.h`, and `lualib.h`, and `liblua` for C hosts. This is the
+design, how the risky parts were proven, what it covers, and where it
+differs. The numbers are in `results/c-api-20261031.md` (wave 8) and
+`results/capi-full-20261031.md` (wave 11).
 
 ## Shape
 
@@ -13,11 +15,13 @@ covers, and what full coverage would take. The numbers are in
   `b.dependency("lua", ...)`) sets `lua_options.c_api`. Only then do the
   module and `lua` link libc, `lua` link `-rdynamic` (C modules bind to its
   `lua_*` symbols as they do to lua.c's `-Wl,-E`), `src/capi/` compile, and
-  `include/` install to `zig-out/include`. The default build is libc-free,
-  static, and its two `runLoop` instances are byte-identical to the base's
-  with addresses masked.
+  `include/` install to `zig-out/include`, and `liblua.a`, `liblua.so`, and
+  `lua5.5.pc` build (below). The default build is libc-free, static, and
+  its two `runLoop` instances are byte-identical to the base's with
+  addresses masked; after wave 11 its whole `.text` is.
 - **Our code stays Zig.** Every API function is `export fn ... callconv(.c)`
-  in `src/capi/capi.zig` (lua.h) and `src/capi/lauxlib.zig` (lauxlib.h).
+  in `src/capi/capi.zig` (lua.h), `src/capi/lauxlib.zig` (lauxlib.h), and
+  `src/capi/state.zig` (states for C hosts and lualib.h).
   `src/capi/loadlib.zig` is loadlib.c's `LUA_USE_DLOPEN` half on `dlopen`
   from libc (`std.c.dlopen`: Zig's libc-free ElfDynLib does no relocations or
   `DT_NEEDED`, so it cannot load real modules).
@@ -42,12 +46,15 @@ covers, and what full coverage would take. The numbers are in
 ## `lua_State *` and the extra space
 
 A `lua_State *` is the `*Thread` itself: no API call translates it. In a C-API
-build `Thread.create` allocates `Thread.prefix_len` (16) bytes in front of the
-thread: 8 for this file's per-thread data pointer (`ThreadData`: the C
-continuations by frame, and on the main thread the table of light C
-functions), then `LUA_EXTRASPACE`, so `lua_getextraspace(L)`, which is
-`(char *)L - sizeof(void *)`, lands in memory we own. `prefix_len` is 0 in
-the default build, where `create` and `destroy` compile to what they were.
+build `Thread.create` allocates `Thread.prefix_len` (24) bytes in front of the
+thread: 8 for its C hook (`lua_sethook`'s function), 8 for this file's
+per-thread data pointer (`ThreadData`: the C continuations by frame, and on
+the main thread the table of light C functions, the warning, panic, and
+allocation functions), then `LUA_EXTRASPACE`, so `lua_getextraspace(L)`,
+which is `(char *)L - sizeof(void *)`, lands in memory we own.
+`lua_newthread` copies the main thread's extra space into the new thread's,
+as 5.5.1 does. `prefix_len` is 0 in the default build, where `create` and
+`destroy` compile to what they were.
 
 ## C functions are natives
 
@@ -104,7 +111,35 @@ own protected call. The API function throwing has no pending `defer` or
 userdata on the stack instead: `Box` for `lua_load`'s chunk and for
 `luaL_Buffer`'s heap part, which the collector frees if a jump abandons it).
 Zig natives (our libraries) never call a throwing export; `loadlib.zig`
-uses `lightCFunction`, not `lua_pushcfunction`, for that reason.
+uses `lightCFunction`, not `lua_pushcfunction`, for that reason. Wave 11
+made this a test, below.
+
+Every place Zig calls C code goes through a protected call of its own:
+the trampoline for C functions, `cK` for continuations, and `protect` for
+the rest, so an error a callback raises stops at the Zig frame that called
+it: `lua_load`'s reader (`readShim`), `lua_dump`'s writer (`writeShim`),
+hooks (`cHook`), the warning function (`cWarn`, which drops the error, as
+the collector warns from deep in Zig code), and `lua_closeslot`'s and
+`lua_settop`'s `__close` calls through the VM. A `lua_Alloc` must not
+raise, as in the reference.
+
+### The invariant, checked
+
+`src/capi/unwind.zig` reads the sources with Zig's tokenizer and fails
+`zig build test -Dc-api=true` on a violation. A function may throw if it
+calls `capi.throw`, a function that may throw, or C code directly (a
+function-typed value, or a field of a callback type such as `lua_Writer`);
+a call through `protect` is not a call. In `src/capi/`, no call that may
+throw may follow a pending `defer` or `errdefer`, or sit inside one, and
+no code outside `src/capi/` may call a C-API function that may throw. The
+test runs over the tree (and checks it is not vacuous: `check`,
+`luaCallk`, `luaSettop`, `readShim`, `lauxError` throw, `luaLoad`,
+`trampoline`, `cWarn`, `loadFunc` do not) and over sources seeded with each
+kind of violation, which it must report by line. A call to a sibling in
+the same struct resolves to it; an `extern fn` named `lua*` (`liolib.zig`
+calls the API by its C names) counts as C code, other externs as libc.
+It found `cWarn` calling the warning function directly; it now goes
+through `protect`.
 
 An error raised on another Lua thread than the protected call's (a coroutine
 resumed from C) moves its error object to the catching thread first.
@@ -210,18 +245,17 @@ What follows from being the reference's code on the reference's libc:
   it), and C modules writing to `stdout` all go through its one buffer, so
   their output stays in order. `State.stdout()` with an embedder's writer
   flushes the C stream into it first. `stdin` and `stderr` are C's.
-- `luaL_execresult` is not exported yet; `liolib.execResult` is
-  lauxlib.c's, for `pclose`. The C API's must equal it.
+- `liolib.execResult` is lauxlib.c's `luaL_execresult`, for `pclose`,
+  and `lauxlib.zig` exports it under that name: one function for both.
 - `read_line` reads with glibc's `getc_unlocked` macro inlined (the
   stream's read pointer, `__uflow` at the end of the buffer), as liolib.c
   compiles on glibc; other libcs call the function.
-- One departure from liolib.c: `read("a")` on a regular file first sizes
-  its buffer to what is left of the file (`statx`, or `fstat` off Linux).
-  lauxlib's box grows by copying into a new userdata, which the collector
-  frees later, where the reference's `realloc`s in place (glibc `mremap`s
-  large blocks); without the hint reading 20.6 MB whole took 3.1× the
-  reference's time and 1.7× its memory, with it 1.5× and the same memory.
-  A box that reallocates in place would make the hint unnecessary.
+- `read("a")` is liolib.c's. Before the API part of wave 11 it sized
+  its buffer to what was left of a regular file first (`statx`), as
+  lauxlib's box then grew by copying into a new userdata; reading 20.6
+  MB whole took 3.1× the reference's time without the hint. The box now
+  reallocates in place (`capi.Box`, below), and the hint no longer paid
+  (`results/capi-full-20261031.md`), so it went.
 - `lib/io.zig`'s tests run on this io in a C-API build (they only run Lua
   chunks), and `just capi-test` runs `files.lua` and every `test/diff`
   case on the C-API `lua` against the reference.
@@ -331,38 +365,134 @@ What macOS (arm64 and x86-64) still needs, untested here:
 
 ## Coverage
 
-`lua.h` and `lauxlib.h` declare 156 functions; 128 are implemented. Enough for
-the suite's `libs/` (lib1, lib11, lib2, lib21, lib22: attrib.lua's C-module
-`require` tests run, "testing external strings" included), lpeg 1.1.0, lua-cjson
-2.1.0.10, and luafilesystem 1.9.0 with their own tests. `package.loadlib` and the C
-searchers (cpath, `luaopen_a_b` for `a.b`, the part before `-`, the all-in-one
-loader, `"*"` for global symbols) give the reference's messages.
+All 156 functions `lua.h`, `lauxlib.h`, and `lualib.h` declare are
+exported, from `lua` and from `liblua`. `just capi-coverage BINARY...`
+(the end of `just capi-test`) takes every declaration from the headers
+(`LUA_API`, `LUALIB_API`, `LUAMOD_API`, the name in parentheses) and every
+defined dynamic symbol named `lua_*`, `luaL_*`, or `luaopen_*` from each
+binary, and fails on one missing from either side: "156 of 156" for
+`liblua.so` and `lua`, nothing extra. Every function has a differential
+case run on both interpreters or both libraries: `capitest.c` with
+`errors.lua` for C modules, `host.c` for C hosts.
 
-Missing, and what each needs:
+The suite's `libs/` (lib1, lib11, lib2, lib21, lib22), lpeg 1.1.0,
+lua-cjson 2.1.0.10, and luafilesystem 1.9.0 pass with their own tests.
+`package.loadlib` and the C searchers (cpath, `luaopen_a_b` for `a.b`, the
+part before `-`, the all-in-one loader, `"*"` for global symbols) give the
+reference's messages.
 
-- `lua_newstate`, `luaL_newstate`, `lua_close`, `luaL_openselectedlibs`,
-  `luaopen_*` (10): only for C programs embedding us, which is a different
-  product (a `liblua.so`). Straightforward over `api.State.init`.
-- `lua_setallocf`: our heap does not route through a `lua_Alloc`;
-  `lua_getallocf` returns a shim over the state's allocator.
-- `lua_sethook`, `lua_gethook*`, `lua_getlocal`, `lua_setlocal`,
-  `lua_upvalueid`, `lua_upvaluejoin`: over the debug library's internals.
-- `lua_toclose`, `lua_closeslot`: over the VM's to-be-closed list.
-- `lua_dump`: over `dump.zig` with a `lua_Writer`.
-- `lua_setwarnf`, `luaL_execresult` (io uses `liolib.execResult`, which
-  the export should be).
-- `luaL_Stream`: done in wave 11, "io handles are `luaL_Stream`" above.
-- `lua_newthread` zeroes the new thread's extra space; 5.5.1 copies the
-  main thread's.
-- `lua_gc` covers stop, restart, collect, count, countb, step, isrunning;
-  not the mode switches and parameters.
-- x86-64 System V and aarch64 Linux (wave 11, "aarch64" above); macOS
-  untested.
-- Libraries close with the state since wave 11.
+### liblua for C hosts
 
-Full coverage is roughly the size of the prototype again: most missing
-functions are thin, the hooks and `luaL_Stream` are the real work, and every
-function needs a differential case in `capitest.c`.
+With `-Dc-api=true` the build installs `lib/liblua.a`,
+`lib/liblua.so.5.5.1` (soname `liblua.so.5`, as Zig sets only the major
+version; the reference's is `liblua.so.5.5`), and `lib/pkgconfig/lua5.5.pc`.
+Both bundle compiler-rt, link no UBSan runtime, and export only the API
+(`src/capi/liblua.map`). A static host links with `-Wl,-z,noexecstack`, as
+the archive's objects carry no GNU-stack note.
+
+- `lua_newstate(f, ud, seed)` (5.5's signature) makes a state whose every
+  byte goes through the host's `lua_Alloc`: its heap's backing allocator
+  is an adapter over `f` (`state.zig`'s `CState`), which also holds what
+  the libraries need from a host. `lua_Alloc` gives malloc's alignment, so
+  the adapter refuses alignments over 16; `resize` succeeds only in place
+  and `remap` is the realloc. `lua_close` closes the state, flushes the
+  standard streams, and frees everything through `f`; `host.c` counts the
+  bytes and finds none left. It goes through `State.destroy`, so C
+  libraries the state loaded close after every finalizer, the last loaded
+  first (`host.c` loads unload.c's two modules and closes).
+- `luaL_newstate` is lauxlib's: `realloc`/`free`, a seed from
+  `luaL_makeseed`, the panic function that prints "PANIC: unprotected
+  error in call to Lua API (...)", and warnings on.
+- `lua_atpanic` is per state. An error with no protected call runs the
+  panic function, then aborts, as `luaD_throw` does; with none set (a bare
+  `lua_newstate`), it aborts.
+- `luaL_openselectedlibs(L, load, preload)` follows linit.c, and each
+  `luaopen_*` opens its library and returns its table, as the reference's
+  do when a host calls them with `luaL_requiref`.
+- The libraries' I/O is one process-wide `std.Io.Threaded`, with the
+  vtable trimmed to what they call, as `main.zig` does; `os.getenv` and
+  `package`'s paths read libc's `environ` when those libraries open.
+- `lua_setallocf` on a state from `lua_newstate` switches the function
+  for later blocks, which must free what the old one allocated, as in the
+  reference.
+
+`test/capi/host.c` embeds the library and runs allocators (a counting
+`lua_Alloc` and a failing one), states and libraries, the panic path in a
+child process, hooks, the debug interface, to-be-closed slots, dumps,
+warnings, `luaL_execresult` and `luaL_fileresult`, every `lua_gc` option,
+threads and their extra space. `just capi-test` builds it against the
+reference's `liblua.so`, our `liblua.so`, and our `liblua.a`, and the
+three outputs must be the same.
+
+### Hooks and the debug interface
+
+`lua_sethook` keeps the C hook in the thread's prefix and sets the
+thread's `Thread.Hook` to `cHook`, the engine's existing machinery
+(`vm.md`, wave 3), so events, masks, counts, and inheritance by new
+coroutines are `debug.sethook`'s. `cHook` fills a `lua_Debug` with the
+event, the line, and the frame, and calls the C hook through `protect`.
+`lua_sethook` and `debug.sethook` replace each other; `debug.gethook`
+answers "external hook" for a C hook, and `lua_gethook` answers a C
+function that runs debug's hook when `debug.sethook` set it.
+`lua_getinfo` takes every option (`r` reads the transfer of the hooked
+frame); `lua_getlocal` and `lua_setlocal` use the debug library's
+`findLocal`, and `lua_upvalueid` and `lua_upvaluejoin` its upvalue
+identities.
+
+### The rest
+
+- `lua_toclose` marks a slot in the VM's to-be-closed list;
+  `lua_closeslot` and `lua_settop` close what they pop, and a C function
+  that returns with marked slots has them closed by the trampoline (or
+  `cK`) through `vm.closeLevel`.
+- `lua_dump` streams `string.dump`'s writer to the C `lua_Writer`;
+  `lua_setwarnf` replaces the state's warning function, which `warn` and
+  the collector call; `lua_gc` takes every option, the mode switches and
+  `LUA_GCPARAM` included.
+- `lua_load` and `luaL_loadbufferx`/`luaL_loadfilex` never raise: a reader
+  that raises, a syntax error, or no memory comes back as the status.
+- `luaL_Buffer`'s box and `lua_load`'s chunk live in `capi.Box`, lauxlib.c's
+  box: a userdata holding a pointer to memory from the state's heap, which
+  grows with `realloc` (in place where the allocator can; large blocks
+  `mremap`), with a `__gc` that frees it if an error abandons the box.
+  `luaL_pushresult` and `lua_load` free it at once. Wave 8's box was the
+  bytes in a userdata, copied into a new one at each growth, the old ones
+  left to the collector. While the state closes, finalizers no longer
+  register, so a box made then is the old kind.
+- `luaL_fileresult` and `luaL_execresult` are lauxlib.c's: "(no extra
+  info)" for errno 0, and the file name and message whole, however long.
+
+### Where it differs
+
+- **Hooks cannot yield.** `lua_yield` in a line or count hook raises
+  "attempt to yield across a C-call boundary"; the reference suspends the
+  coroutine.
+- **`lua_load` reads the whole chunk** before compiling it, as the
+  compiler takes a buffer; the reference parses as it reads.
+- **A yield inside the `__close` of a returning C function's marked
+  slot** is not supported.
+- **The stack of a coroutine an error killed**, below the error object,
+  is not the reference's: `lua_gettop` on it can differ by a slot.
+  `capi-diff` found it; the error object on top and every status match.
+- **`lua_setallocf` on our `lua`** (a state the Zig API made) changes only
+  what `lua_getallocf` answers: `lua_Alloc` carries no alignment, so the
+  engine's blocks cannot be freed through it.
+- **`liblua.so`'s soname** is `liblua.so.5`.
+- x86-64 and aarch64 Linux; macOS untested ("aarch64" above).
+
+### Fuzzing
+
+`just fuzz-capi SECONDS` builds the fuzz driver, `lua`, and
+`test/fuzz/capifuzz.c` with `-Dc-api=true` into `zig-out/fuzz-capi`.
+capifuzz's `run(ops)` reads four bytes per operation and makes one or a
+few C-API calls for each, on eight registers that persist, noting what
+they return (`test/fuzz/README.md`). `run capi` sweeps generated
+workloads with the Nth allocation failing, once and from then on, for
+every N, through `require` and the module's calls: "not enough memory",
+no leak, no crash, the state usable after. `capi-diff` runs generated
+workloads on our `lua` and the reference with the same `capifuzz.so`.
+It found `lua_rawset`'s nil-key message ("index is nil" for "table index
+is nil") and the dead coroutine's stack above.
 
 ## Costs, in brief
 
