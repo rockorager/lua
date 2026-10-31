@@ -107,8 +107,14 @@ reference.
    variation (a power-of-two node array, collisions chained through free nodes),
    because `next` must survive assignment to existing keys during traversal.
    Cache `__index`/`__newindex` and friends' absence in a per-table flag byte, as
-   PUC-Rio does, so the common case skips the metatable lookup. **Measure** the
-   hash part against an open-addressing table once the suite passes.
+   PUC-Rio does, so the common case skips the metatable lookup. Settled in
+   wave 5: the chained table stays. Linear probing and Robin Hood, each
+   growing at 7/8 load or full, were 2.5 to 9.9% slower on the geomean
+   (hash_string +19% to +162%, hash_int +13% to +17%), and the ones growing
+   at 7/8 peaked up to 4.3% higher (binary_trees). With Brent's variation
+   most keys sit in their main position, so a hit at load 0.76 looks at
+   about 1.4 nodes against linear probing's 2.6, and the chain link fits
+   in the node's padding (`results/table-hash-20261031.md`).
 9. **Collector.** Precise and non-moving. Every collectable object starts with a
    common header (next pointer, tag, mark bits). Start stop-the-world
    mark-and-sweep, but call the write barrier at every store into a table,
@@ -156,7 +162,10 @@ reference.
     load on the reference. `just dump` checks that our dump of every suite
     and bench file is `luac -o`'s byte for byte, plain and stripped, and
     that luac's chunks load and dump back unchanged: 98 of 98. Details and
-    the one line-info case that can differ are in `dump.md`.
+    the one line-info case that can differ are in `dump.md`. Unlike
+    lundump.c, the loader rejects an opcode outside the set ("bad binary
+    format (invalid opcode)"), which is what lets the loop's dispatch go
+    unchecked in safe builds (`results/opcode-check-20261031.md`).
 15. **Library host.** The libraries reach I/O and state the core does not keep
     (warning mode, the collector's mode and parameters) through
     `lib.base.Host`, which the embedder owns and `lib.openLibs` stores in the
@@ -197,10 +206,17 @@ reference.
   it is 33% slower than ReleaseFast and still faster than the reference.
   Half of that and all of its extra peak memory is the standard allocator
   interface writing 0xAA over every allocation and free; then
-  `string.format`'s `auxlib.Buffer` declared `undefined` (a 1 KiB memset
-  per call) and `SmpAllocator`'s own safe build. The loop's checks are
-  spread thin (`results/release-safe-20261031.md`). Measure it with
-  `just optimize=ReleaseSafe bench-compare`.
+  `SmpAllocator`'s own safe build. The loop's checks are spread thin
+  (`results/release-safe-20261031.md`). Measure it with
+  `just optimize=ReleaseSafe bench-compare`. Landed in wave 5: a
+  `Buffer` is declared `.init(state)`, not `undefined`, which a safe
+  build fills with 0xAA, 1 KiB per `string.format` (format −21 to −28%
+  in ReleaseSafe, `results/buffer-init-20261031.md`); never declare a
+  large local `undefined` on a hot path. The loop switches on
+  `Dispatch`, a non-exhaustive copy of `OpCode`, so safe builds do not
+  check the opcode before each jump (fib −12%, spectral_norm −10% in
+  ReleaseSafe; ReleaseFast's loop is byte for byte the same,
+  `results/opcode-check-20261031.md`).
 
 ## Testing
 
@@ -280,6 +296,11 @@ modes (landed, `gc.md`), then the measured decisions above.
 
 Wave 4 measured the decisions still open: the value representation
 (decision 1, kept), dispatch (decision 3, kept), the global-access cache
-(landed), and the cost of ReleaseSafe. Still open: the hash part against
-open addressing (decision 8). The comparison with the reference at the end
-of wave 4 is `results/bench-compare-wave4-20261031.md`.
+(landed), and the cost of ReleaseSafe. The comparison with the reference at
+the end of wave 4 is `results/bench-compare-wave4-20261031.md`.
+
+Wave 5: `auxlib.Buffer` without the safe build's memset, opcodes checked
+by the loader instead of before each dispatch (both under the hot-path
+rules), and the hash part against open addressing (decision 8, kept). The
+comparison with the reference at the end of wave 5 is
+`results/bench-compare-wave5-20261031.md`.
