@@ -301,22 +301,31 @@ inline fn isPseudo(idx: c_int) bool {
 }
 
 /// The value at an acceptable index, or null for none.
-fn at(th: *Thread, idx: c_int) ?Value {
+/// The value at an index, or null for a non-valid one. A pointer, not a
+/// `?Value`: returned through memory, that cost a store-forwarding stall
+/// on every load of its fields (docs/slop/results/capi-full-20261031.md).
+/// The registry's comes from a per-thread scratch slot.
+fn at(th: *Thread, idx: c_int) ?*const Value {
     if (idx > 0) {
         const i = funcSlot(th) + @as(u32, @intCast(idx));
-        return if (i < th.top) th.stack[i] else null;
+        return if (i < th.top) &th.stack[i] else null;
     }
-    if (!isPseudo(idx)) return th.stack[th.top - @as(u32, @intCast(-idx))];
-    if (idx == registry_index) return .table(th.state.registry);
+    if (!isPseudo(idx)) return &th.stack[th.top - @as(u32, @intCast(-idx))];
+    if (idx == registry_index) {
+        registry_scratch = .table(th.state.registry);
+        return &registry_scratch;
+    }
     const n: u32 = @intCast(registry_index - idx);
     const f = th.stack[funcSlot(th)];
     if (f.tag != .native_closure) return null;
     const ups = f.asNativeClosure().upvalues();
-    return if (n <= ups.len) ups[n - 1] else null;
+    return if (n <= ups.len) &ups[n - 1] else null;
 }
 
+threadlocal var registry_scratch: Value = .nil;
+
 inline fn get(th: *Thread, idx: c_int) Value {
-    return at(th, idx) orelse .nil;
+    return if (at(th, idx)) |p| p.* else .nil;
 }
 
 /// Stores `v` at a valid index, an upvalue with its barrier.
@@ -338,7 +347,7 @@ inline fn top(th: *Thread, n: u32) Value {
     return th.stack[th.top - n];
 }
 
-fn typeCode(v: ?Value) c_int {
+fn typeCode(v: ?*const Value) c_int {
     return if (v) |x| @intFromEnum(x.typeOf()) else lua_tnone;
 }
 
@@ -590,14 +599,14 @@ pub fn luaArith(L: *lua_State, op: c_int) callconv(.c) void {
 }
 
 pub fn luaRawequal(L: *lua_State, idx1: c_int, idx2: c_int) callconv(.c) c_int {
-    const a = at(L, idx1) orelse return 0;
-    const b = at(L, idx2) orelse return 0;
+    const a = (at(L, idx1) orelse return 0).*;
+    const b = (at(L, idx2) orelse return 0).*;
     return @intFromBool(Value.rawEquals(a, b));
 }
 
 pub fn luaCompare(L: *lua_State, idx1: c_int, idx2: c_int, op: c_int) callconv(.c) c_int {
-    const a = at(L, idx1) orelse return 0;
-    const b = at(L, idx2) orelse return 0;
+    const a = (at(L, idx1) orelse return 0).*;
+    const b = (at(L, idx2) orelse return 0).*;
     const r = switch (op) {
         0 => check(L, vm.equal(L, a, b)),
         1 => check(L, vm.lessThan(L, a, b)),

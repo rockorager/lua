@@ -60,6 +60,7 @@ All notable changes to lua are recorded here. The format follows
 - Release builds of the standalone `lua` no longer install Zig's segfault handler or its 256 KiB signal stack, so `lua -e ''` peaks at 1.2 MiB instead of 1.45 MiB; Debug builds keep both.
 - Release builds of the standalone `lua` are 38% smaller and keep the code a run needs together, so `lua -e ''` peaks at 0.55 MiB instead of 1.2 MiB (with `-Dc-api=true`, 1.9 MiB instead of 2.7, below the reference's 2.5) and small scripts peak a third to a half lower; a panic in a release build prints its message without a stack trace.
 - In builds with `-Dc-api=true`, a call from Lua to a C function is about 2.3 ns faster (an empty one 12.1 ns per call in a loop instead of 14.4).
+- In builds with `-Dc-api=true`, C functions read their arguments and call back into Lua faster: a C function that calls a Lua function with `lua_call` about 20% faster, an `io.write` loop about 15%; `luaL_Buffer` grows a large buffer in place.
 - `state.call` of a Lua function held in a `lua.Ref` is 12 to 18% faster.
 
 ### Fixed
