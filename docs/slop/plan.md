@@ -15,7 +15,7 @@ State: one per Lua universe (heap, string table, registry, globals, metatables f
 Thread: one per coroutine (value stack, call frames, open upvalues, status)
 vm.zig: the interpreter loop over one Thread's frames
 lib/: the standard library, written against the internal API
-main.zig: the standalone `lua` program, which the suite runs
+main.zig: the standalone `lua` program, which the suite runs, on the embedding API
 ```
 
 One pass from source to bytecode, as PUC-Rio does: the parser emits code as it
@@ -177,12 +177,23 @@ reference.
     `package.loadlib` and the C searchers keep the reference's "dynamic
     libraries not enabled" answer. Landed: `src/api.zig`, exported at the
     module's root (`lua.State`, `lua.Value`, `lua.Ref`, ...), with the engine
-    under `lua.internal` for `main.zig` and the tools. `State` is an opaque
+    under `lua.internal` for the tools. `State` is an opaque
     handle to a `Thread`; values cross as Zig types; calls from the top level
     are protected and calls inside Zig functions propagate; userdata
     metatables are found by a per-type number in an array, not a registry
     hash. Against the internal path the API is 7.7% faster on geomean, with
-    equal peak memory (`api.md`, `results/api-20261031.md`).
+    equal peak memory (`api.md`, `results/api-20261031.md`). Wave 5 added
+    `Values` (results kept on the stack, recorded in the calling frame,
+    no allocator), `Table.rawGet`/`rawSet`, bound functions
+    (`State.function(ctx, f)`, a native closure), `State.pcall`,
+    `Coroutine` with Zig functions yielding in tail position,
+    `DecodeOptions.unknown_keys`, and `Options.stdout` (`base.Host.stdout`
+    is a `*std.Io.Writer`); `vm.pcallMsgh` reports `vm.Status`, so a Lua
+    `error("not enough memory")` is `error.Runtime`. `main.zig` runs on the
+    API alone, nothing left internal. The existing API paths cost what they
+    did (geomean +0.3%; `zig_calls_lua` +2.2%, layout-sized); `lua` on the API
+    matches `lua` on the engine (−0.26% time, +0.01% peak RSS)
+    (`results/api-wave5-20261031.md`).
 
 ## Hot-path rules
 

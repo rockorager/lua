@@ -29,10 +29,13 @@ defer state.close();
 
 - `libs`: the standard libraries to open, a `lua.Libs` set. By default every library when `io` is set, and `lua.safe_libs` when it is not.
 - `io`: the `std.Io` for `print`, `dofile`, `loadfile`, and the `io`, `os`, and `package` libraries. Leave it out to sandbox: then `print` prints nothing, no file opens, and only `lua.safe_libs` (`base`, `coroutine`, `math`, `string`, `table`, `utf8`) can be opened.
-- `environ`: the environment `os.getenv` and `package` see.
+- `stdout`: a `*std.Io.Writer` that `print` and `io.write` write to instead of the process's standard output, with or without `io`; a GUI host captures script output here. `state.stdout()` returns the writer in use, so the host's own output stays in order with the script's.
+- `environ`: the environment `os.getenv` and `package` see; `noenv` makes `package.path` and `package.cpath` ignore `LUA_PATH` and `LUA_CPATH`, as `lua -E` does.
 - `context`: a pointer to your own data, which Zig functions get back with `state.context(T)`.
 - `traceback`: record a traceback when a call fails (on by default).
 - `seed`, `strings`: a fixed hash seed, and a separate allocator for strings.
+- `gc_mode`: start the collector in `.generational` mode, as the standalone `lua` does.
+- `gc_stress`: collect at every safe point (`.full`) or take an incremental step at each (`.step`). Slow; use it in tests to catch a host holding a borrowed value too long.
 
 A state is used from one thread at a time.
 
@@ -46,9 +49,17 @@ const f = try state.load(source, .{ .name = "=config" });
 try state.doFile(void, "init.lua", .text);
 ```
 
-`load` compiles without running and returns a `lua.Function`. The `name` option names the chunk in messages: `"=name"` as is, `"@file"` as a file. Binary chunks (`string.dump`, `luac` output) load only with `.mode = .binary` or `.any`. Like reference Lua, the engine trusts binary chunks, so load them only from trusted sources.
+`load` compiles without running and returns a `lua.Function`. The `name` option names the chunk in messages: `"=name"` as is, `"@file"` as a file. `loadFile(null, ...)` reads standard input. Binary chunks (`string.dump`, `luac` output) load only with `.mode = .binary` or `.any`. Like reference Lua, the engine trusts binary chunks, so load them only from trusted sources.
 
-The type you pass says what comes back: `void` for nothing, a tuple type for several results, or one type for one result.
+The type you pass says what comes back: `void` for nothing, a tuple type for several results, `lua.Values` for all of them however many there are, or one type for one result.
+
+```zig
+const results = try state.doString(lua.Values, "return 1, 'two', nil", .{});
+for (results) |v| std.debug.print("{s}\n", .{v.typeOf().name()});
+const sum = try state.call(i64, add_all, results); // pass them on as arguments
+```
+
+`lua.Values` is a slice borrowed from the state, with no allocation: it stays valid until the next call that runs Lua code (`call`, `pcall`, `doString`, `doFile`, a coroutine's `resume`), and reading it with `decode` and the other API functions in between is fine. Passing it where the arguments go, in place of a tuple, passes each value.
 
 ## Errors
 
@@ -63,7 +74,7 @@ state.doString(void, script, .{ .name = "@init.lua" }) catch |err| switch (err) 
 };
 ```
 
-`errorMessage` is the error as text, `errorValue` the error object itself (Lua can raise any value), and `errorTraceback` the message with a stack traceback, as the standalone `lua` prints it. The state stays usable after any error.
+`errorMessage` is the error as text, `errorValue` the error object itself (Lua can raise any value), and `errorTraceback` the message with a stack traceback, as the standalone `lua` prints it. The state stays usable after any error. `error.OutOfMemory` means an allocation failed; a script that raises the string "not enough memory" itself is an ordinary `error.Runtime`.
 
 ## Values
 
@@ -95,10 +106,14 @@ const Config = struct {
 };
 var arena: std.heap.ArenaAllocator = .init(gpa);
 defer arena.deinit();
-const config = try state.decodeAlloc(Config, arena.allocator(), try state.getGlobal(lua.Value, "config"));
+const config = try state.decodeAlloc(Config, arena.allocator(), try state.getGlobal(lua.Value, "config"), .{
+    .unknown_keys = .reject,
+});
 ```
 
 `decode` reads without allocating; its strings point into Lua's memory. `decodeAlloc` copies strings and builds slices from sequences, from the allocator you pass; use an arena, since a decode that fails partway does not free what it allocated.
+
+Both take `lua.DecodeOptions`. Keys a struct has no field for are ignored unless `.unknown_keys = .reject`, which fails with the key's path, such as `unknown key 'keybinds[2].acton'`, to catch typos in a configuration.
 
 ### How long values live
 
@@ -122,7 +137,7 @@ try state.setField(t, "count", 3);
 const sum = try state.call(i64, try state.getGlobal(lua.Function, "add"), .{ 1, 2 });
 ```
 
-`getField` and `setField` index any value with `__index` and `__newindex`, as Lua code does. A table's `iterator()` visits its keys and values raw, and `len()` is its raw length. `toString` converts any value as `tostring` does.
+`getField` and `setField` index any value with `__index` and `__newindex`, as Lua code does; a table's `rawGet` and `rawSet` skip them (`try t.rawGet(state, i64, "count")`). A table's `iterator()` visits its keys and values raw, and `len()` is its raw length. `toString` converts any value as `tostring` does, and `state.warn` emits a warning as `warn` does.
 
 ## Zig functions
 
@@ -148,7 +163,29 @@ fn divmod(a: i64, b: i64) !struct { i64, i64 } {
 }
 ```
 
-Inside a Zig function, an error from a call into Lua propagates to Lua's caller when you `try` it, so Lua's `pcall` sees it as usual; catch it to handle it yourself. At the top level, outside any call from Lua, every call into Lua is protected.
+Inside a Zig function, an error from a call into Lua propagates to Lua's caller when you `try` it, so Lua's `pcall` sees it as usual. To handle it in Zig instead, call with `state.pcall`, which is protected wherever it runs and fills in `errorMessage` and `errorTraceback`; do not catch an error from `call` and carry on. At the top level, outside any call from Lua, every call into Lua is protected.
+
+A function returning `lua.Values` returns each value, so a function can pass along what a call returned:
+
+```zig
+fn retry(state: *lua.State, f: lua.Function) !lua.Values {
+    return state.pcall(lua.Values, f, .{}) catch try state.call(lua.Values, f, .{});
+}
+```
+
+### Functions with their own state
+
+`state.function(ctx, f)` makes a Lua function that hands `ctx` to `f` as its first parameter on every call. A pointer is kept as it is, so it must outlive the function; any other value is copied into memory the function owns, and `f` takes the copy by value or by pointer to change it:
+
+```zig
+fn bump(count: *i64, by: ?i64) i64 {
+    count.* += by orelse 1;
+    return count.*;
+}
+
+try state.setGlobal("next_id", try state.function(@as(i64, 0), bump)); // a counter of its own
+try state.setGlobal("log", try state.function(&editor, Editor.log)); // the host's editor
+```
 
 ## Userdata
 
@@ -189,3 +226,27 @@ print(c:get(), tostring(c))
 ```
 
 `newUserdata` stores the value in memory the collector owns and gives it the type's metatable: `__name` is `.name`, `__index` is a table of `.methods`, and `.meta` holds metamethods. A parameter `*Counter` accepts only a `Counter` userdata, and anything else raises `bad argument #1 to 'get' (Counter expected, got table)`. `__gc` runs when the collector frees the userdata, and at `close` for those still alive. The type's alignment can be at most 16.
+
+## Coroutines
+
+`state.newCoroutine(f)` makes a coroutine, as `coroutine.create` does, and its `resume` runs it until it yields or returns. The result type converts the values as `call` does:
+
+```zig
+const gen = try state.newCoroutine(try state.getGlobal(lua.Function, "numbers"));
+while (true) switch (try gen.@"resume"(state, ?i64, .{})) {
+    .yielded => |n| std.debug.print("{?d}\n", .{n}),
+    .returned => break,
+};
+```
+
+`resume` is a Zig keyword, hence `@"resume"`. The arguments go to the body on the first resume, and come back from `coroutine.yield` after that. An error inside the coroutine ends it and returns `error.Runtime`, with `errorTraceback` showing the coroutine's stack; resuming a dead coroutine fails the same way. A `lua.Coroutine` is borrowed like any value, and converts to and from Lua's threads.
+
+A Zig function yields by returning `state.yield(values)`, with a tuple or `lua.Values`, from a function that returns an error union. When the coroutine is resumed, the function returns the values the resume passed:
+
+```zig
+fn ask(state: *lua.State, question: []const u8) !lua.Values {
+    return state.yield(.{question});
+}
+```
+
+It must be the function's last act, as with C's `lua_yield`; there are no continuations. Yielding outside a coroutine, or from inside a call the host made with `call`, raises the reference's errors ("attempt to yield across a C-call boundary").
