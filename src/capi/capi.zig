@@ -210,7 +210,12 @@ fn unprotected(th: *Thread, e: Error) noreturn {
         th.err.asString().bytes()
     else
         "error object is not a string";
-    std.debug.print("PANIC: unprotected error in call to Lua API ({s})\n", .{msg});
+    // Written directly: `std.debug.print` goes through std's debug `Io`,
+    // whose table keeps all of `std.Io.Threaded` in the executable.
+    const prefix = "PANIC: unprotected error in call to Lua API (";
+    _ = std.c.write(2, prefix, prefix.len);
+    _ = std.c.write(2, msg.ptr, msg.len);
+    _ = std.c.write(2, ")\n", 2);
     std.process.abort();
 }
 

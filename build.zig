@@ -29,11 +29,16 @@ pub fn build(b: *std.Build) void {
     // optimized builds: the interpreter loop needs every register
     // (docs/slop/results/frame-pointer-20261030.md).
     const omit_fp: ?bool = if (optimize == .Debug) null else true;
+    // Nor unwind tables: only Debug's stack traces read them, and they
+    // are 50 KiB of read-only data mapped next to the constants
+    // (docs/slop/results/lean-20261031.md).
+    const unwind: ?std.builtin.UnwindTables = if (optimize == .Debug) null else .none;
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .omit_frame_pointer = omit_fp,
+        .unwind_tables = unwind,
         .link_libc = if (c_api) true else null,
     });
     exe_mod.addOptions("lua_options", lua_options);
@@ -44,6 +49,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .omit_frame_pointer = omit_fp,
+            .unwind_tables = unwind,
             .imports = &.{.{ .name = "lua", .module = exe_mod }},
         }),
     });

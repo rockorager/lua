@@ -23,6 +23,20 @@ pub const std_options: std.Options = if (builtin.mode == .Debug) .{} else .{
     .signal_stack_size = null,
 };
 
+/// Release builds print a panic's message without a stack trace: the
+/// trace needs std's DWARF reader, ELF loader, and decompressor, a third
+/// of the executable's code (`docs/slop/results/lean-20261031.md`).
+pub const panic = std.debug.FullPanic(if (builtin.mode == .Debug) std.debug.defaultPanic else releasePanic);
+
+fn releasePanic(msg: []const u8, _: ?usize) noreturn {
+    @branchHint(.cold);
+    const write = std.posix.system.write;
+    _ = write(2, "lua: panic: ", 12);
+    _ = write(2, msg.ptr, msg.len);
+    _ = write(2, "\n", 1);
+    std.process.abort();
+}
+
 const copyright = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio";
 
 /// The most slots a Lua stack holds, the engine's `LUAI_MAXSTACK`: past
@@ -394,17 +408,69 @@ fn pmain(it: *Interp, state: *lua.State) lua.Error!bool {
     return true;
 }
 
-pub fn main(init: std.process.Init) u8 {
+/// `std.Io.Threaded`'s functions minus the ones nothing in `lua` calls:
+/// sockets and name lookup, memory maps, file locks, owners and
+/// permissions, links, futures and groups. Its full table keeps every
+/// one of them in the executable, 60 KiB of code that is mapped at
+/// startup (`docs/slop/results/lean-20261031.md`). An entry left out
+/// aborts with its name.
+const io_vtable: std.Io.VTable = blk: {
+    const full = std.Io.Threaded.global_single_threaded.io().vtable.*;
+    const unused = [_][]const u8{
+        "async",                   "concurrent",            "await",                 "cancel",
+        "groupAsync",              "groupConcurrent",       "groupAwait",            "groupCancel",
+        "dirCreateDirPath",        "dirCreateDirPathOpen",  "dirCreateFileAtomic",   "dirRenamePreserve",
+        "dirSymLink",              "dirReadLink",           "dirSetOwner",           "dirSetFileOwner",
+        "dirSetPermissions",       "dirSetFilePermissions", "dirSetTimestamps",      "dirHardLink",
+        "fileWriteFilePositional", "fileSetOwner",          "fileSetPermissions",    "fileSetTimestamps",
+        "fileLock",                "fileTryLock",           "fileUnlock",            "fileDowngradeLock",
+        "fileRealPath",            "fileHardLink",          "fileMemoryMapCreate",   "fileMemoryMapDestroy",
+        "fileMemoryMapSetLength",  "fileMemoryMapRead",     "fileMemoryMapWrite",    "processExecutableOpen",
+        "processExecutablePath",   "processSetCurrentDir",  "processSetCurrentPath", "processReplace",
+        "processReplacePath",      "progressParentFile",    "netListenIp",           "netAccept",
+        "netBindIp",               "netConnectIp",          "netListenUnix",         "netConnectUnix",
+        "netSocketCreatePair",     "netSend",               "netRead",               "netWrite",
+        "netWriteFile",            "netClose",              "netShutdown",           "netInterfaceNameResolve",
+        "netInterfaceName",        "netLookup",             "lockStderr",            "tryLockStderr",
+        "unlockStderr",
+    };
+    var v = full;
+    for (unused) |name| @field(v, name) = @ptrCast(&Unsupported(name).f);
+    break :blk v;
+};
+
+fn Unsupported(comptime name: []const u8) type {
+    return struct {
+        fn f() noreturn {
+            @panic("std.Io." ++ name ++ " is not in lua's table");
+        }
+    };
+}
+
+pub fn main(init: std.process.Init.Minimal) u8 {
     // Debug builds keep the leak-checking allocator; the others use a fast
     // general-purpose one.
-    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
-    const io = init.io;
-    const args = init.minimal.args.toSlice(init.arena.allocator()) catch {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer if (builtin.mode == .Debug) {
+        _ = debug_allocator.deinit();
+    };
+    const gpa = if (builtin.mode == .Debug) debug_allocator.allocator() else std.heap.smp_allocator;
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    var threaded: std.Io.Threaded = .init(gpa, .{ .argv0 = .init(init.args), .environ = init.environ });
+    defer threaded.deinit();
+    const io: std.Io = .{ .userdata = &threaded, .vtable = &io_vtable };
+    var environ_map = std.process.Environ.createMap(init.environ, gpa) catch {
+        std.Io.File.stderr().writeStreamingAll(io, "lua: not enough memory\n") catch return 1;
+        return 1;
+    };
+    defer environ_map.deinit();
+    const args = init.args.toSlice(arena.allocator()) catch {
         std.Io.File.stderr().writeStreamingAll(io, "lua: not enough memory\n") catch return 1;
         return 1;
     };
     const progname: []const u8 = if (args.len > 0 and args[0].len > 0) args[0] else "lua";
-    var it: Interp = .{ .io = io, .environ = init.environ_map, .args = args, .progname = progname };
+    var it: Interp = .{ .io = io, .environ = &environ_map, .args = args, .progname = progname };
     it.flags = collectArgs(args, &it.script);
     if (it.flags == Flags.has_error) {
         printUsage(&it, args[it.script]);
@@ -417,7 +483,7 @@ pub fn main(init: std.process.Init) u8 {
     defer small.deinit();
     const state = lua.State.init(gpa, .{
         .io = io,
-        .environ = init.environ_map,
+        .environ = &environ_map,
         .noenv = it.flags & Flags.has_upper_e != 0,
         .strings = small.allocator(),
         .gc_mode = .generational,
