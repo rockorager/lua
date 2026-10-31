@@ -69,6 +69,14 @@ pub fn build(b: *std.Build) void {
         exe.rdynamic = true;
         b.installDirectory(.{ .source_dir = b.path("include"), .install_dir = .header, .install_subdir = "" });
     }
+    // Optimized builds put the functions a short run calls first ahead of
+    // the rest (src/order.ld, from `just order`): the kernel maps code
+    // 64 KiB around each page that faults, so scattered first calls kept
+    // nearly all of it resident (docs/slop/results/lean-20261031.md).
+    if (optimize != .Debug) {
+        exe.link_function_sections = true;
+        exe.setLinkerScript(b.path("src/order.ld"));
+    }
     b.installArtifact(exe);
     const run_exe = b.addRunArtifact(exe);
     if (b.args) |args| run_exe.addArgs(args);
@@ -85,6 +93,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("listing", "Build the bytecode lister").dependOn(&b.addInstallArtifact(listing, .{}).step);
+
+    // The tracer `just order` writes src/order.ld with (test/order/main.zig).
+    const order = b.addExecutable(.{
+        .name = "order",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/order/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.step("order", "Build the startup-order tracer").dependOn(&b.addInstallArtifact(order, .{}).step);
 
     // The fuzz driver `just fuzz` runs (test/fuzz/main.zig).
     const fuzz = b.addExecutable(.{

@@ -1001,6 +1001,9 @@ inline fn nextSkip(
 /// `fresh` returned, and true to switch instances, with the running
 /// frame's `pc` saved at the next instruction.
 fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
+    // A cold hooked instance has a section of its own, `.text.unlikely.`,
+    // which keeps it out of the code `src/order.ld` puts first.
+    @branchHint(if (hooked) .cold else .none);
     // The inline prongs instantiate many inline calls at compile time.
     @setEvalBranchQuota(10_000);
     var ci: *Frame = th.frame();

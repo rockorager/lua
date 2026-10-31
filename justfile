@@ -268,6 +268,30 @@ bench-capi ROUNDS="10" N="10000000":
         echo "native stack per C -> Lua level, $arm: $(cd bench/capi && "${bin[$arm]}" calls.lua stack 100) bytes" | tee -a "$out/benchstat.txt"
     done
 
+[doc("Regenerate src/order.ld, the order of lua's code: trace the functions it calls first in `lua -e ''` and test/order/sample.lua, in the default and C-API ReleaseFast builds and the ReleaseSafe build")]
+[group("bench")]
+order:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=zig-out/order
+    rm -rf "$out" && mkdir -p "$out"
+    zig build order -Doptimize=ReleaseFast
+    zig build -Doptimize=ReleaseFast --prefix "$out/default"
+    zig build -Doptimize=ReleaseFast -Dc-api=true --prefix "$out/capi"
+    zig build -Doptimize=ReleaseSafe --prefix "$out/safe"
+    # Startup in every build first, then the sample script in every build.
+    runs=()
+    for args in "-e ''" test/order/sample.lua; do
+        for arm in default capi safe; do
+            eval "runs+=(-- $out/$arm/bin/lua $args)"
+        done
+    done
+    # In the dev shell's environment: dozens of variables, as a login
+    # has, and LUA_PATH and LUA_CPATH ";;", so startup expands the default
+    # paths as many installs do.
+    zig-out/bin/order src/order.ld "${runs[@]}" > /dev/null
+    echo "src/order.ld: $(grep -c '^    \*' src/order.ld) functions"
+
 # The build modes `just bench-compare` times our lua in, one arm each:
 # `just optimize=ReleaseSafe bench-compare`, or "ReleaseFast ReleaseSafe".
 # A mode with a `-capi` suffix builds with -Dc-api=true.
