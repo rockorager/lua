@@ -53,6 +53,13 @@ pub inline fn setUserValue(u: *Userdata, heap: *gc.Heap, i: usize, v: Value) voi
     gc.barrier(heap, &u.header, v);
 }
 
+/// The userdata whose `bytes()` start at `p`, for one with no user values:
+/// the inverse of `bytes`.
+pub inline fn fromBytes(p: *anyopaque) *Userdata {
+    const b: [*]u8 = @ptrCast(p);
+    return @ptrCast(@alignCast(b - bytesOffset(0)));
+}
+
 /// The raw memory.
 pub inline fn bytes(u: *Userdata) []align(16) u8 {
     const p: [*]align(16) u8 = @ptrCast(@alignCast(u));

@@ -1,7 +1,7 @@
 # lua: Lua 5.5 in Zig, with no C. `just --list` shows the recipes.
 # AGENTS.md holds the working conventions.
 
-markdown := "README.md AGENTS.md CHANGELOG.md THIRD_PARTY.md bench/README.md docs/slop .github"
+markdown := "README.md AGENTS.md CHANGELOG.md THIRD_PARTY.md bench/README.md docs/embedding.md docs/slop .github"
 
 # The files all.lua runs, in its order, for `just suite BIN each`.
 suite_files := "main gc db calls strings literals tpack attrib gengc locals constructs code big cstack nextvar pm utf8 api memerr events vararg closure coroutine goto errors math sort bitwise verybig files"

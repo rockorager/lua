@@ -8,7 +8,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const lua = @import("lua");
+const lua = @import("lua").internal;
+const SmallAllocator = @import("lua").SmallAllocator;
 const build_options = @import("build_options");
 
 const Value = lua.Value;
@@ -505,7 +506,7 @@ pub fn main(init: std.process.Init) u8 {
     const stress = std.meta.stringToEnum(@FieldType(State.Options, "gc_stress"), build_options.gc_stress).?;
     // One state on one thread: strings get an allocator without locks and
     // with size classes 8 bytes apart.
-    var small: lua.SmallAllocator = .init(gpa);
+    var small: SmallAllocator = .init(gpa);
     defer small.deinit();
     const state = State.create(gpa, .{ .gc_stress = stress, .strings = small.allocator() }) catch {
         host.writeStderr(progname);

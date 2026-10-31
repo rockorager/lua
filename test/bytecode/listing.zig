@@ -3,7 +3,7 @@
 //! reference luac over the suite and the benchmarks.
 
 const std = @import("std");
-const lua = @import("lua");
+const lua = @import("lua").internal;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
