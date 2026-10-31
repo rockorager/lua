@@ -1,126 +1,84 @@
 //! The standalone interpreter, `lua`, as reference Lua 5.5.1's lua.c
 //! behaves: a script with its `arg` table, `-e`, `-l`, `-i`, `-v`, `-E`,
 //! `-W`, `--`, `-` for stdin, `LUA_INIT`, and an interactive loop when
-//! stdin is a terminal. Everything runs inside a native function called
-//! in protected mode, as lua.c's `pmain`, so a traceback ends in its
+//! stdin is a terminal. Everything runs inside a Zig function called in
+//! protected mode, as lua.c's `pmain`, so a traceback ends in its
 //! "[C]: in ?". Errors print as "lua: message" and a traceback on stderr,
 //! and the exit status is 1.
+//!
+//! It is written against the embedding API alone, as a test of it.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const lua = @import("lua").internal;
-const SmallAllocator = @import("lua").SmallAllocator;
+const lua = @import("lua");
 const build_options = @import("build_options");
-
-const Value = lua.Value;
-const State = lua.State;
-const Thread = lua.Thread;
-const vm = lua.vm;
-const base = lua.lib.base;
 
 const copyright = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio";
 
 const Interp = struct {
-    th: *Thread,
-    host: *base.Host,
-    environ: *std.process.Environ.Map,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    args: []const [:0]const u8,
     /// Null in interactive mode, where messages have no program name.
     progname: ?[]const u8,
-    use_env: bool = true,
+    flags: u8 = 0,
+    /// The index of the script in `args`, or 0 for none.
+    script: usize = 0,
     stdin: ?std.Io.File.Reader = null,
     stdin_buf: [512]u8 = undefined,
 
+    fn writeStderr(it: *Interp, bytes: []const u8) void {
+        std.Io.File.stderr().writeStreamingAll(it.io, bytes) catch return;
+    }
+
     fn message(it: *Interp, msg: []const u8) void {
         if (it.progname) |p| {
-            it.host.writeStderr(p);
-            it.host.writeStderr(": ");
+            it.writeStderr(p);
+            it.writeStderr(": ");
         }
-        it.host.writeStderr(msg);
-        it.host.writeStderr("\n");
+        it.writeStderr(msg);
+        it.writeStderr("\n");
     }
 
-    /// Prints the error object on top of the stack, as `report` does, and
-    /// pops it.
-    fn report(it: *Interp) void {
-        const th = it.th;
-        const v = th.stack[th.top - 1];
-        const s = vm.toLString(th.state, v) catch null;
-        it.message(if (s) |m| m.bytes() else "(error message not a string)");
-        th.top -= 1;
+    /// Prints a failure as `report` does: the message handler's text for
+    /// a chunk that ran, or the error message.
+    fn report(it: *Interp, state: *lua.State, e: lua.Error) void {
+        it.message(switch (e) {
+            error.OutOfMemory => "not enough memory",
+            error.Runtime => state.errorTraceback() orelse state.errorMessage(),
+            error.Syntax => state.errorMessage(),
+        });
     }
 
-    /// The text of an error object: a string or number as is, a `__tostring`
-    /// result, or a description of its type, as lua.c's message handler.
-    fn errorText(it: *Interp, v: Value, buf: *[number_len]u8) []const u8 {
-        if (v.isString()) return v.asString().bytes();
-        if (v.isNumber()) {
-            const s = base.numberToString(it.th.state, v) catch return "not enough memory";
-            return s.bytes();
-        }
-        if (base.getMetafield(it.th, v, "__tostring") != null) {
-            const s = base.toStringValue(it.th, v) catch null;
-            if (s) |sv| return sv.asString().bytes();
-        }
-        return std.fmt.bufPrint(buf, "(error object is a {s} value)", .{v.typeOf().name()}) catch unreachable;
-    }
-
-    /// Calls the function below `narg` arguments on top in protected
-    /// mode, with `msghandler` adding a traceback to the error message.
-    /// On failure the error object is left on top.
-    fn docall(it: *Interp, narg: u32, nres: i16) bool {
-        const th = it.th;
-        th.ensureStack(1) catch {
-            th.push(.string(th.state.memerr));
+    /// Runs `f` with no arguments in protected mode, with the traceback
+    /// handler, and reports a failure.
+    fn docall(it: *Interp, state: *lua.State, f: lua.Function) bool {
+        state.pcall(void, f, .{}) catch |e| {
+            it.report(state, e);
             return false;
         };
-        const func = th.top - narg - 1;
-        @memmove(th.stack[func + 1 .. th.top + 1], th.stack[func..th.top]);
-        th.stack[func] = .native(&msghandler);
-        th.top += 1;
-        const ok = vm.pcallMsgh(th, func + 1, nres, func) == .ok;
-        @memmove(th.stack[func .. th.top - 1], th.stack[func + 1 .. th.top]);
-        th.top -= 1;
-        return ok;
-    }
-
-    /// Pushes the result of a load, or its error object, and says which.
-    fn pushLoad(it: *Interp, result: Value.Error!Value) bool {
-        const th = it.th;
-        th.ensureStack(1) catch return false;
-        const f = result catch |e| {
-            th.push(switch (e) {
-                error.LuaError => th.err,
-                error.OutOfMemory => .string(th.state.memerr),
-            });
-            th.err = .nil;
-            return false;
-        };
-        th.push(f);
         return true;
     }
 
-    fn dochunk(it: *Interp, loaded: bool) bool {
-        if (loaded and it.docall(0, 0)) return true;
-        it.report();
-        return false;
+    fn dofile(it: *Interp, state: *lua.State, name: ?[]const u8) bool {
+        const f = state.loadFile(name, .any) catch |e| {
+            it.report(state, e);
+            return false;
+        };
+        return it.docall(state, f);
     }
 
-    fn dofile(it: *Interp, name: ?[]const u8) bool {
-        return it.dochunk(it.pushLoad(base.loadFile(it.th, name, "bt")));
-    }
-
-    fn dostring(it: *Interp, s: []const u8, name: []const u8) bool {
-        const gpa = it.th.heap().allocator();
-        const z = gpa.dupeZ(u8, s) catch return it.dochunk(it.pushLoad(error.OutOfMemory));
-        defer gpa.free(z);
-        return it.dochunk(it.pushLoad(base.loadChunk(it.th, z, name, "t")));
+    fn dostring(it: *Interp, state: *lua.State, s: []const u8, name: []const u8) bool {
+        const f = state.load(s, .{ .name = name }) catch |e| {
+            it.report(state, e);
+            return false;
+        };
+        return it.docall(state, f);
     }
 
     /// `globname = require(modname)` for `-l globname[=modname]`; without
     /// `=`, a suffix after '-' is cut from the global name.
-    fn dolibrary(it: *Interp, spec: []const u8) bool {
-        const th = it.th;
-        const state = th.state;
+    fn dolibrary(it: *Interp, state: *lua.State, spec: []const u8) lua.Error!bool {
         var globname = spec;
         var modname = spec;
         if (std.mem.findScalar(u8, spec, '=')) |eq| {
@@ -129,61 +87,55 @@ const Interp = struct {
         } else if (std.mem.findScalar(u8, spec, '-')) |dash| {
             globname = spec[0..dash];
         }
-        const ok = blk: {
-            th.ensureStack(2) catch break :blk false;
-            const req = state.newString("require") catch break :blk false;
-            th.push(state.globals.getStr(req));
-            th.push(.string(state.newString(modname) catch break :blk false));
-            break :blk it.docall(1, 1);
-        };
-        if (!ok) {
-            it.report();
+        const require = try state.getGlobal(lua.Value, "require");
+        const v = state.pcall(lua.Value, require, .{modname}) catch |e| {
+            it.report(state, e);
             return false;
-        }
-        th.top -= 1;
-        const name = state.newString(globname) catch return false;
-        state.globals.setStr(&state.heap, name, th.stack[th.top]) catch return false;
+        };
+        try state.setGlobal(globname, v);
         return true;
     }
 
-    fn handleScript(it: *Interp, args: []const [:0]const u8, script: usize) bool {
-        const th = it.th;
-        var fname: ?[]const u8 = args[script];
-        if (std.mem.eql(u8, args[script], "-") and !std.mem.eql(u8, args[script - 1], "--")) fname = null;
-        if (!it.pushLoad(base.loadFile(th, fname, "bt"))) {
-            it.report();
+    fn handleScript(it: *Interp, state: *lua.State) lua.Error!bool {
+        const args = it.args;
+        var fname: ?[]const u8 = args[it.script];
+        if (std.mem.eql(u8, args[it.script], "-") and !std.mem.eql(u8, args[it.script - 1], "--")) fname = null;
+        const f = state.loadFile(fname, .any) catch |e| {
+            it.report(state, e);
             return false;
-        }
-        // The script's arguments: arg[1] .. arg[#arg].
-        const state = th.state;
-        const argname = state.newString("arg") catch return false;
-        const argv = state.globals.getStr(argname);
-        if (argv.tag != .table) {
-            th.push(.string(state.newString("'arg' is not a table") catch return false));
-            it.report();
+        };
+        // Reading `arg` may run a metamethod.
+        const chunk = try state.ref(f);
+        defer state.unref(chunk);
+        // The script's arguments: arg[1] .. arg[#arg]. These failures are
+        // raised, as lua.c's `pushargs` raises them.
+        const argv = try state.getGlobal(lua.Value, "arg");
+        if (argv.typeOf() != .table) return state.raise("'arg' is not a table", .{});
+        const t = try state.decode(lua.Table, argv, .{});
+        const gpa = std.heap.smp_allocator;
+        const vals = gpa.alloc(lua.Value, @intCast(t.len())) catch return error.OutOfMemory;
+        defer gpa.free(vals);
+        for (vals, 1..) |*v, i| v.* = try t.rawGet(state, lua.Value, i);
+        state.pcall(void, chunk, @as(lua.Values, vals)) catch |e| {
+            it.report(state, e);
             return false;
-        }
-        const n: u32 = @intCast(argv.asTable().length());
-        th.ensureStack(n + 3) catch return false;
-        for (1..n + 1) |i| th.push(argv.asTable().getInt(@intCast(i)));
-        if (it.docall(n, -1)) return true;
-        it.report();
-        return false;
+        };
+        return true;
     }
 
     fn getenv(it: *Interp, name: []const u8) ?[]const u8 {
-        if (!it.use_env) return null;
+        if (it.flags & Flags.has_upper_e != 0) return null;
         return it.environ.get(name);
     }
 
-    fn handleLuaInit(it: *Interp) bool {
+    fn handleLuaInit(it: *Interp, state: *lua.State) bool {
         var name: []const u8 = "=LUA_INIT_5_5";
         const init = it.getenv(name[1..]) orelse blk: {
             name = "=LUA_INIT";
             break :blk it.getenv(name[1..]) orelse return true;
         };
-        if (init.len > 0 and init[0] == '@') return it.dofile(init[1..]);
-        return it.dostring(init, name);
+        if (init.len > 0 and init[0] == '@') return it.dofile(state, init[1..]);
+        return it.dostring(state, init, name);
     }
 
     // The interactive loop.
@@ -191,137 +143,93 @@ const Interp = struct {
     /// Writes the prompt (`_PROMPT` or `_PROMPT2` through `tostring`, or
     /// the default), then reads a line as `fgets` would into lua.c's
     /// 512-byte buffer, without its newline. Null at the end of input.
-    fn readLine(it: *Interp, firstline: bool, line: *std.ArrayList(u8)) ?void {
-        const th = it.th;
-        const state = th.state;
-        const pname = state.newString(if (firstline) "_PROMPT" else "_PROMPT2") catch return null;
-        const pv = state.globals.getStr(pname);
-        if (pv.isNil()) {
-            it.host.writeStdout(if (firstline) "> " else ">> ");
-        } else if (base.toStringValue(th, pv)) |s| {
-            it.host.writeStdout(s.asString().bytes());
-        } else |_| {
-            th.err = .nil;
-        }
-        it.host.flushStdout();
-        if (it.stdin == null) it.stdin = std.Io.File.stdin().readerStreaming(it.host.io, &it.stdin_buf);
+    fn readLine(it: *Interp, state: *lua.State, firstline: bool, line: *std.ArrayList(u8)) lua.Error!?void {
+        const pv = try state.getGlobal(lua.Value, if (firstline) "_PROMPT" else "_PROMPT2");
+        writeOut(state, if (pv.isNil()) (if (firstline) "> " else ">> ") else try state.toString(pv));
+        if (it.stdin == null) it.stdin = std.Io.File.stdin().readerStreaming(it.io, &it.stdin_buf);
         const r = &it.stdin.?.interface;
         line.clearRetainingCapacity();
-        const gpa = th.heap().allocator();
+        const gpa = std.heap.smp_allocator;
         while (line.items.len < 511) {
             const c = r.takeByte() catch break;
-            line.append(gpa, c) catch return null;
+            line.append(gpa, c) catch return error.OutOfMemory;
             if (c == '\n') break;
         }
         if (line.items.len == 0) return null;
         if (line.items[line.items.len - 1] == '\n') line.items.len -= 1;
     }
 
-    /// Whether the error object on top is a syntax error for an incomplete
+    /// Whether a failed load is a syntax error for an incomplete
     /// statement, ending in "<eof>".
-    fn incomplete(it: *Interp) bool {
-        const v = it.th.stack[it.th.top - 1];
-        return v.isString() and std.mem.endsWith(u8, v.asString().bytes(), "<eof>");
+    fn incomplete(state: *lua.State, e: lua.Error) bool {
+        return e == error.Syntax and std.mem.endsWith(u8, state.errorMessage(), "<eof>");
     }
 
-    fn loadText(it: *Interp, text: []const u8) bool {
-        const gpa = it.th.heap().allocator();
-        const z = gpa.dupeZ(u8, text) catch return it.pushLoad(error.OutOfMemory);
-        defer gpa.free(z);
-        return it.pushLoad(base.loadChunk(it.th, z, "=stdin", "t"));
-    }
+    const Loaded = union(enum) { ok: lua.Function, err: lua.Error };
 
     /// Reads and compiles one statement: first as "return line;", then as
     /// a statement, reading more lines while it is incomplete. Null at the
-    /// end of input; otherwise the function or the error is on top.
-    fn loadLine(it: *Interp, line: *std.ArrayList(u8)) ?bool {
-        const gpa = it.th.heap().allocator();
-        it.readLine(true, line) orelse return null;
+    /// end of input.
+    fn loadLine(it: *Interp, state: *lua.State, line: *std.ArrayList(u8)) lua.Error!?Loaded {
+        const gpa = std.heap.smp_allocator;
+        try it.readLine(state, true, line) orelse return null;
         var ret: std.ArrayList(u8) = .empty;
         defer ret.deinit(gpa);
-        ret.print(gpa, "return {s};", .{line.items}) catch return null;
-        if (it.loadText(ret.items)) return true;
-        it.th.top -= 1;
+        ret.print(gpa, "return {s};", .{line.items}) catch return error.OutOfMemory;
+        if (state.load(ret.items, .{ .name = "=stdin" })) |f| return .{ .ok = f } else |_| {}
         const trimmed = std.mem.trimStart(u8, line.items, " \t");
         if (std.mem.startsWith(u8, trimmed, "local") and trimmed.len > 5 and (trimmed[5] == ' ' or trimmed[5] == '\t'))
-            it.host.writeStderr("warning: locals do not survive across lines in interactive mode\n");
+            it.writeStderr("warning: locals do not survive across lines in interactive mode\n");
         var more: std.ArrayList(u8) = .empty;
         defer more.deinit(gpa);
         while (true) {
-            if (it.loadText(line.items)) return true;
-            if (!it.incomplete()) return false;
-            it.readLine(false, &more) orelse return false;
-            it.th.top -= 1;
-            line.append(gpa, '\n') catch return null;
-            line.appendSlice(gpa, more.items) catch return null;
+            const e = if (state.load(line.items, .{ .name = "=stdin" })) |f| return .{ .ok = f } else |e| e;
+            if (!incomplete(state, e)) return .{ .err = e };
+            try it.readLine(state, false, &more) orelse return .{ .err = e };
+            line.append(gpa, '\n') catch return error.OutOfMemory;
+            line.appendSlice(gpa, more.items) catch return error.OutOfMemory;
         }
     }
 
-    fn doRepl(it: *Interp) void {
-        const th = it.th;
+    fn doRepl(it: *Interp, state: *lua.State) lua.Error!void {
         const old = it.progname;
         it.progname = null;
         var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(th.heap().allocator());
-        const bottom = th.top;
-        while (it.loadLine(&line)) |loaded| {
-            if (loaded and it.docall(0, -1)) {
-                it.printResults(bottom);
-            } else {
-                it.report();
-            }
-            th.top = bottom;
+        defer line.deinit(std.heap.smp_allocator);
+        while (try it.loadLine(state, &line)) |loaded| {
+            const f = switch (loaded) {
+                .ok => |f| f,
+                .err => |e| {
+                    it.report(state, e);
+                    continue;
+                },
+            };
+            const results = state.pcall(lua.Values, f, .{}) catch |e| {
+                it.report(state, e);
+                continue;
+            };
+            try it.printResults(state, results);
         }
-        th.top = bottom;
-        it.host.writeStdout("\n");
-        it.host.flushStdout();
+        writeOut(state, "\n");
         it.progname = old;
     }
 
-    /// Prints the values above `bottom` with the global `print`.
-    fn printResults(it: *Interp, bottom: u32) void {
-        const th = it.th;
-        const n = th.top - bottom;
-        if (n == 0) return;
-        th.ensureStack(1) catch return;
-        const pname = th.state.newString("print") catch return;
-        @memmove(th.stack[bottom + 1 .. th.top + 1], th.stack[bottom..th.top]);
-        th.stack[bottom] = th.state.globals.getStr(pname);
-        th.top += 1;
-        if (!vm.pcall(th, bottom, 0)) {
-            var buf: [number_len]u8 = undefined;
-            const text = it.errorText(th.stack[th.top - 1], &buf);
+    /// Prints a line's results with the global `print`, `l_print`.
+    fn printResults(it: *Interp, state: *lua.State, results: lua.Values) lua.Error!void {
+        if (results.len == 0) return;
+        const print = try state.getGlobal(lua.Value, "print");
+        state.pcall(void, print, results) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            // lua.c formats `lua_tostring`'s NULL for an error object
+            // that is not a string or number.
             var msg: [512]u8 = undefined;
+            const t = state.errorValue().typeOf();
+            const text = if (t == .string or t == .number) state.errorMessage() else "(null)";
             const shown = text[0..@min(text.len, 400)];
             it.message(std.fmt.bufPrint(&msg, "error calling 'print' ({s})", .{shown}) catch text);
-        }
+        };
     }
 };
-
-const number_len = 128;
-
-/// The message handler of every chunk the interpreter runs: the message
-/// and a traceback, or a non-string error object's `__tostring`, as
-/// lua.c's `msghandler`.
-fn msghandler(th: *Thread, b: u32) Value.Error!u32 {
-    const v = th.stack[b];
-    var buf: [number_len]u8 = undefined;
-    const msg = if (try vm.toLString(th.state, v)) |s| s.bytes() else blk: {
-        if (base.getMetafield(th, v, "__tostring") != null) {
-            const s = try base.toStringValue(th, v);
-            if (s.isString()) {
-                th.push(s);
-                return 1;
-            }
-        }
-        break :blk std.fmt.bufPrint(&buf, "(error object is a {s} value)", .{v.typeOf().name()}) catch unreachable;
-    };
-    var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
-    defer aw.deinit();
-    lua.debuginfo.traceback(&aw.writer, th, msg, 1) catch return error.OutOfMemory;
-    th.push(.string(try th.state.newString(aw.written())));
-    return 1;
-}
 
 const Flags = struct {
     const has_error = 1;
@@ -373,21 +281,20 @@ fn collectArgs(args: []const [:0]const u8, first: *usize) u8 {
 }
 
 fn printUsage(it: *Interp, badoption: []const u8) void {
-    const h = it.host;
-    h.writeStderr(it.progname.?);
-    h.writeStderr(": ");
+    it.writeStderr(it.progname.?);
+    it.writeStderr(": ");
     if (badoption.len > 1 and (badoption[1] == 'e' or badoption[1] == 'l')) {
-        h.writeStderr("'");
-        h.writeStderr(badoption);
-        h.writeStderr("' needs argument\n");
+        it.writeStderr("'");
+        it.writeStderr(badoption);
+        it.writeStderr("' needs argument\n");
     } else {
-        h.writeStderr("unrecognized option '");
-        h.writeStderr(badoption);
-        h.writeStderr("'\n");
+        it.writeStderr("unrecognized option '");
+        it.writeStderr(badoption);
+        it.writeStderr("'\n");
     }
-    h.writeStderr("usage: ");
-    h.writeStderr(it.progname.?);
-    h.writeStderr(
+    it.writeStderr("usage: ");
+    it.writeStderr(it.progname.?);
+    it.writeStderr(
         \\ [options] [script [args]]
         \\Available options are:
         \\  -e stat   execute string 'stat'
@@ -403,9 +310,10 @@ fn printUsage(it: *Interp, badoption: []const u8) void {
     );
 }
 
-/// Runs `-e`, `-l`, and `-W` in order. False when a chunk fails.
-fn runArgs(it: *Interp, args: []const [:0]const u8, n: usize) bool {
-    base.warnf(it.host, "@off", false);
+/// Runs `-e`, `-l`, and `-W` in order, up to `n`. False when a chunk
+/// fails.
+fn runArgs(it: *Interp, state: *lua.State, n: usize) lua.Error!bool {
+    const args = it.args;
     var i: usize = 1;
     while (i < n) : (i += 1) {
         const a = args[i];
@@ -416,79 +324,53 @@ fn runArgs(it: *Interp, args: []const [:0]const u8, n: usize) bool {
                     i += 1;
                     extra = args[i];
                 }
-                const ok = if (a[1] == 'e') it.dostring(extra, "=(command line)") else it.dolibrary(extra);
+                const ok = if (a[1] == 'e')
+                    it.dostring(state, extra, "=(command line)")
+                else
+                    try it.dolibrary(state, extra);
                 if (!ok) return false;
             },
-            'W' => base.warnf(it.host, "@on", false),
+            'W' => state.warn("@on", false),
             else => {},
         }
     }
     return true;
 }
 
-fn createArgTable(th: *Thread, args: []const [:0]const u8, script: usize) Value.Error!void {
-    const state = th.state;
-    const narg = args.len - (script + 1);
-    const t = try state.newTable(@intCast(narg), @intCast(script + 1));
-    for (args, 0..) |a, i| {
-        try t.setInt(&state.heap, @as(i64, @intCast(i)) - @as(i64, @intCast(script)), .string(try state.newString(a)));
-    }
-    try state.globals.setStr(&state.heap, try state.newString("arg"), .table(t));
+fn createArgTable(state: *lua.State, args: []const [:0]const u8, script: usize) lua.Error!void {
+    const t = try state.newTable();
+    for (args, 0..) |a, i| try t.rawSet(state, @as(i64, @intCast(i)) - @as(i64, @intCast(script)), a);
+    try state.setGlobal("arg", t);
 }
 
-fn writeVersion(host: *base.Host) void {
-    host.writeStdout(copyright ++ "\n");
-    host.flushStdout();
+/// Writes to the state's standard output and flushes, ignoring failures
+/// as lua.c's `lua_writestring` and `fflush` do.
+fn writeOut(state: *lua.State, bytes: []const u8) void {
+    const out = state.stdout();
+    out.writeAll(bytes) catch return;
+    out.flush() catch return;
 }
 
-/// The body of the interpreter, `pmain`. False when something failed.
-fn pmain(it: *Interp, args: []const [:0]const u8) Value.Error!bool {
-    var script: usize = 0;
-    const flags = collectArgs(args, &script);
-    const optlim = if (script > 0) script else args.len;
-    if (flags == Flags.has_error) {
-        printUsage(it, args[script]);
-        return false;
-    }
-    if (flags & Flags.has_v != 0) writeVersion(it.host);
-    if (flags & Flags.has_upper_e != 0) {
-        it.use_env = false;
-        it.host.noenv = true;
-    }
-    it.host.environ = it.environ;
-    try lua.lib.openLibs(it.th, it.host);
-    try createArgTable(it.th, args, script);
-    // lua.c's pmain runs the collector in generational mode.
-    lua.gc.changeMode(it.th, .gen_minor);
-    if (!it.handleLuaInit()) return false;
-    if (!runArgs(it, args, optlim)) return false;
-    if (script > 0 and !it.handleScript(args, script)) return false;
-    if (flags & Flags.has_i != 0) {
-        it.doRepl();
-    } else if (script < 1 and flags & (Flags.has_e | Flags.has_v) == 0) {
-        if (std.Io.File.stdin().isTty(it.host.io) catch false) {
-            writeVersion(it.host);
-            it.doRepl();
+/// The body of the interpreter, `pmain`, run in protected mode. False
+/// when something failed and was reported.
+fn pmain(it: *Interp, state: *lua.State) lua.Error!bool {
+    const optlim = if (it.script > 0) it.script else it.args.len;
+    if (it.flags & Flags.has_v != 0) writeOut(state, copyright ++ "\n");
+    try createArgTable(state, it.args, it.script);
+    if (!it.handleLuaInit(state)) return false;
+    if (!try runArgs(it, state, optlim)) return false;
+    if (it.script > 0 and !try it.handleScript(state)) return false;
+    if (it.flags & Flags.has_i != 0) {
+        try it.doRepl(state);
+    } else if (it.script < 1 and it.flags & (Flags.has_e | Flags.has_v) == 0) {
+        if (std.Io.File.stdin().isTty(it.io) catch false) {
+            writeOut(state, copyright ++ "\n");
+            try it.doRepl(state);
         } else {
-            _ = it.dofile(null);
+            _ = it.dofile(state, null);
         }
     }
     return true;
-}
-
-/// What `main` hands `pmainNative`, through a light userdata.
-const Main = struct {
-    it: *Interp,
-    args: []const [:0]const u8,
-};
-
-/// `pmain` as a native function, which `main` calls in protected mode.
-/// Returns whether everything succeeded.
-fn pmainNative(th: *Thread, b: u32) Value.Error!u32 {
-    const m: *Main = @ptrCast(@alignCast(th.stack[b].asLightUserdata().?));
-    const ok = try pmain(m.it, m.args);
-    th.push(.boolean(ok));
-    return 1;
 }
 
 pub fn main(init: std.process.Init) u8 {
@@ -500,44 +382,54 @@ pub fn main(init: std.process.Init) u8 {
         std.Io.File.stderr().writeStreamingAll(io, "lua: not enough memory\n") catch return 1;
         return 1;
     };
-    var host: base.Host = undefined;
-    host.init(io);
     const progname: []const u8 = if (args.len > 0 and args[0].len > 0) args[0] else "lua";
-    const stress = std.meta.stringToEnum(@FieldType(State.Options, "gc_stress"), build_options.gc_stress).?;
+    var it: Interp = .{ .io = io, .environ = init.environ_map, .args = args, .progname = progname };
+    it.flags = collectArgs(args, &it.script);
+    if (it.flags == Flags.has_error) {
+        printUsage(&it, args[it.script]);
+        return 1;
+    }
     // One state on one thread: strings get an allocator without locks and
-    // with size classes 8 bytes apart.
-    var small: SmallAllocator = .init(gpa);
+    // with size classes 8 bytes apart. lua.c's pmain runs the collector in
+    // generational mode.
+    var small: lua.SmallAllocator = .init(gpa);
     defer small.deinit();
-    const state = State.create(gpa, .{ .gc_stress = stress, .strings = small.allocator() }) catch {
-        host.writeStderr(progname);
-        host.writeStderr(": cannot create state: not enough memory\n");
+    const state = lua.State.init(gpa, .{
+        .io = io,
+        .environ = init.environ_map,
+        .noenv = it.flags & Flags.has_upper_e != 0,
+        .strings = small.allocator(),
+        .gc_mode = .generational,
+        .gc_stress = std.meta.stringToEnum(@FieldType(lua.Options, "gc_stress"), build_options.gc_stress).?,
+    }) catch {
+        it.message("cannot create state: not enough memory");
         return 1;
     };
-    defer state.destroy();
-    var it: Interp = .{ .th = state.main, .host = &host, .environ = init.environ_map, .progname = progname };
-    var m: Main = .{ .it = &it, .args = args };
-    const th = it.th;
+    // `lua_close` runs pending to-be-closed variables and finalizers,
+    // which may still write, then flushes, as C's `exit` flushes every
+    // stream.
+    defer state.close();
     const ok = blk: {
-        th.ensureStack(2) catch {
-            it.message("not enough memory");
+        const body = state.function(&it, pmain) catch |e| {
+            it.report(state, e);
             break :blk false;
         };
-        const func = th.top;
-        th.push(.native(&pmainNative));
-        th.push(Value.lightUserdata(&m));
-        if (!vm.pcall(th, func, 1)) {
-            // Opening the libraries or building `arg` failed.
-            it.report();
+        // lua.c passes `argc` and `argv`, and with the traceback handler
+        // below this occupies as many stack slots, so a stack overflow
+        // counts the same levels.
+        break :blk state.call(bool, body, .{args.len}) catch |e| {
+            // An error `pmain` raised rather than reported: lua.c's `main`
+            // prints the error object, with no traceback.
+            const v = state.errorValue();
+            const t = v.typeOf();
+            it.message(if (e == error.OutOfMemory)
+                "not enough memory"
+            else if (t == .string or t == .number)
+                state.errorMessage()
+            else
+                "(error message not a string)");
             break :blk false;
-        }
-        th.top -= 1;
-        break :blk !th.stack[th.top].isFalsy();
+        };
     };
-    // `lua_close`: pending to-be-closed variables and finalizers, which may
-    // still write. Then open files flush, as C's `exit` flushes every
-    // stream.
-    vm.closeState(state);
-    lua.lib.io.flushAll(it.th);
-    host.flushStdout();
     return if (ok) 0 else 1;
 }

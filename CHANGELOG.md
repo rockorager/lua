@@ -42,6 +42,7 @@ All notable changes to lua are recorded here. The format follows
 - `state.decode` and `state.decodeAlloc` take a `lua.DecodeOptions` last; pass `.{}` for the old behavior.
 - A script that raises "not enough memory" itself now returns `error.Runtime`; `error.OutOfMemory` means an allocation failed.
 - `state.errorTraceback()` for an error object whose `__tostring` returns a string is that string, as the standalone `lua` prints it.
+- The standalone `lua` is built on the embedding API. An error in `_PROMPT`'s `__tostring` now ends it, a non-string error from `print` in the interactive loop shows as "(null)", and a `__tostring` that returns a non-string gives "(error object is a table value)" and a traceback, as with the reference.
 
 ### Fixed
 
