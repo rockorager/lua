@@ -56,6 +56,7 @@ All notable changes to lua are recorded here. The format follows
 - "C stack overflow" is raised when nested calls between native code and Lua, or the compiler's nesting, use 192 KiB of native stack below the host's call into Lua, as well as at 200 levels, so a host thread with 256 KiB of stack gets a Lua error instead of a crash on any script. Each level takes a third to a quarter of the stack it did (200 nested `pcall`s need 136 KiB instead of 400); nested `string.gsub` replacement functions stop at about 74 levels, where the reference allows 197.
 - Release builds of the standalone `lua` no longer install Zig's segfault handler or its 256 KiB signal stack, so `lua -e ''` peaks at 1.2 MiB instead of 1.45 MiB; Debug builds keep both.
 - In builds with `-Dc-api=true`, a call from Lua to a C function is about 2.3 ns faster (an empty one 12.1 ns per call in a loop instead of 14.4).
+- `state.call` of a Lua function held in a `lua.Ref` is 12 to 18% faster.
 
 ### Fixed
 

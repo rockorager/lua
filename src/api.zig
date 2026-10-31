@@ -1194,9 +1194,19 @@ fn newRef(th: *Thread, v: IValue) Error!Ref {
     return @enumFromInt(r);
 }
 
+/// One payload and one tag variable: with a return for `.nil` and one for
+/// the lookup, LLVM chose between the two values in memory, written in
+/// pieces and read in one 16-byte load, which stalled store forwarding on
+/// every call through a reference (`results/lean-20261031.md`).
 inline fn refValue(th: *Thread, r: Ref) IValue {
-    if (r == .nil) return .nil;
-    return th.state.registry.getInt(@intFromEnum(r));
+    var payload = IValue.nil.payload;
+    var tag = IValue.nil.tag;
+    if (r != .nil) {
+        const v = th.state.registry.getInt(@intFromEnum(r));
+        payload = v.payload;
+        tag = v.tag;
+    }
+    return .{ .payload = payload, .tag = tag };
 }
 
 // ---------------------------------------------------------------------------

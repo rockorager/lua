@@ -63,8 +63,12 @@ errfunc: u32 = 0,
 /// Set by `vm.closeSelf` while the error it raises unwinds to the resume
 /// or the `coroutine.close` that runs this thread.
 closed_self: bool = false,
-/// `vm.pcallMsgh` calls in progress, which catch every error.
-npcall: u16 = 0,
+/// `vm.pcallMsgh` calls in progress, which catch every error. 32 bits,
+/// unlike `native_calls`: two adjacent 16-bit counts let LLVM increment
+/// both with one 32-bit load across the 16-bit stores of their separate
+/// decrements, a store forwarding stall on every protected call from the
+/// host (`results/lean-20261031.md`).
+npcall: u32 = 0,
 /// Set while the error unwinding is "error in error handling", so the
 /// protected call that catches it reports `vm.Status.handler`
 /// (`LUA_ERRERR`); every other raise clears it.
