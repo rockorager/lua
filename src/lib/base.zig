@@ -488,8 +488,9 @@ fn getmetatable(th: *Thread, base: u32) Error!u32 {
 }
 
 fn setmetatable(th: *Thread, base: u32) Error!u32 {
-    const mtv = get(th, base, 2);
     const t = try checkTable(th, base, 1, "setmetatable");
+    // An absent metatable is "no value", not nil, as in lbaselib.c.
+    const mtv = opt(th, base, 2) orelse return typeError(th, base, 2, "setmetatable", "nil or table");
     if (mtv.tag != .nil and mtv.tag != .table) return typeError(th, base, 2, "setmetatable", "nil or table");
     if (getMetafield(th, .table(t), "__metatable") != null)
         return raise(th, "cannot change a protected metatable", .{});

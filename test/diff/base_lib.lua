@@ -40,3 +40,5 @@ print(pcall(collectgarbage, "bogus"), pcall(collectgarbage, "param", "bogus"))
 print(getmetatable({}), getmetatable(setmetatable({}, {__metatable = false})))
 print(pcall(setmetatable, 1), pcall(setmetatable, {}, 1))
 print(pcall(error)); print(xpcall(error, function(m) return type(m) end)); print(xpcall(error, function() end))
+-- An absent metatable is "no value", not nil (found by fuzzing).
+print(pcall(setmetatable, {}))
