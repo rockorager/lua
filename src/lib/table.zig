@@ -161,8 +161,7 @@ fn concat(th: *Thread, base: u32) Error!u32 {
     const sep = try a.optString(2, "");
     var i = try a.optInteger(3, 1);
     last = try a.optInteger(4, last);
-    var b: auxlib.Buffer = undefined;
-    b.init(th.state);
+    var b: auxlib.Buffer = .init(th.state);
     defer b.deinit();
     const w = &b.writer;
     while (i < last) : (i += 1) {

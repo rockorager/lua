@@ -91,8 +91,7 @@ fn setPath(state: *State, pkg: *Table, field: []const u8, comptime envname: []co
         const p = path orelse break :blk try state.newString(dft);
         if (noEnv(state)) break :blk try state.newString(dft);
         const mark = std.mem.find(u8, p, ";;") orelse break :blk try state.newString(p);
-        var b: aux.Buffer = undefined;
-        b.init(state);
+        var b: aux.Buffer = .init(state);
         defer b.deinit();
         const w = &b.writer;
         if (mark > 0) {
@@ -146,15 +145,13 @@ fn searchPath(
     const rep = cstr(rep_in);
     const path = cstr(path_in);
     var name = cstr(name_in);
-    var nb: aux.Buffer = undefined;
-    nb.init(state);
+    var nb: aux.Buffer = .init(state);
     defer nb.deinit();
     if (sep.len > 0 and std.mem.findScalar(u8, name, sep[0]) != null) {
         try writeGsub(&nb.writer, name, sep, rep);
         name = nb.written();
     }
-    var pb: aux.Buffer = undefined;
-    pb.init(state);
+    var pb: aux.Buffer = .init(state);
     defer pb.deinit();
     try writeGsub(&pb.writer, path, "?", name);
     const names = pb.written();
@@ -162,8 +159,7 @@ fn searchPath(
     while (it.next()) |file| {
         if (readable(th, file)) return .{ .found = try state.newString(file) };
     }
-    var eb: aux.Buffer = undefined;
-    eb.init(state);
+    var eb: aux.Buffer = .init(state);
     defer eb.deinit();
     eb.writer.writeAll("no file '") catch return error.OutOfMemory;
     try writeGsub(&eb.writer, names, ";", "'\n\tno file '");
@@ -210,8 +206,7 @@ fn searcherPreload(th: *Thread, b: u32) Error!u32 {
     const preload = try registryTable(th.state, preload_key);
     const v = try aux.index(th, .table(preload), .string(name));
     if (v.isNil()) {
-        var buf: aux.Buffer = undefined;
-        buf.init(th.state);
+        var buf: aux.Buffer = .init(th.state);
         defer buf.deinit();
         buf.writer.print("no field package.preload['{s}']", .{cstr(name.bytes())}) catch return error.OutOfMemory;
         th.push(.string(try buf.toString(th.state)));
@@ -303,8 +298,7 @@ fn findLoader(th: *Thread, b: u32, name: *String) Error!void {
     try th.ensureStack(3);
     th.push(searchers);
     const searchers_slot = th.top - 1;
-    var msg: aux.Buffer = undefined;
-    msg.init(state);
+    var msg: aux.Buffer = .init(state);
     defer msg.deinit();
     const w = &msg.writer;
     w.writeAll("\n\t") catch return error.OutOfMemory;

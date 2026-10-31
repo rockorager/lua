@@ -208,8 +208,7 @@ fn dump(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "dump");
     const f = a.get(1);
     if (f.tag != .lua_closure) return a.argError(1, "Lua function expected", .{});
-    var b: auxlib.Buffer = undefined;
-    b.init(th.state);
+    var b: auxlib.Buffer = .init(th.state);
     defer b.deinit();
     dump_engine.dump(th.heap().allocator(), &b.writer, f.asLuaClosure().proto, !a.get(2).isFalsy()) catch
         return error.OutOfMemory;
@@ -362,8 +361,7 @@ fn gsub(th: *Thread, base: u32) Error!u32 {
     const p = (try a.checkString(2)).bytes();
     const repl = a.get(3);
     const max_n = try a.optInteger(4, @intCast(src.len() + 1));
-    var b: auxlib.Buffer = undefined;
-    b.init(th.state);
+    var b: auxlib.Buffer = .init(th.state);
     defer b.deinit();
     var m: pattern.Matcher = .init(src.bytes(), p);
     const res = switch (repl.typeOf()) {
@@ -439,8 +437,7 @@ fn format(th: *Thread, base: u32) Error!u32 {
     try th.ensureStack(1);
     const scratch = th.top;
     th.push(.nil);
-    var b: auxlib.Buffer = undefined;
-    b.init(th.state);
+    var b: auxlib.Buffer = .init(th.state);
     defer b.deinit();
     var diag: fmt_engine.Diagnostic = .{};
     fmt_engine.format(
@@ -490,8 +487,7 @@ fn pack(th: *Thread, base: u32) Error!u32 {
     try th.ensureStack(1);
     th.push(.nil);
     const a: Args = .init(th, base, "pack");
-    var b: auxlib.Buffer = undefined;
-    b.init(th.state);
+    var b: auxlib.Buffer = .init(th.state);
     defer b.deinit();
     var diag: pack_engine.Diagnostic = .{};
     pack_engine.pack(&b.writer, fmt, PackArgs{ .a = a }, &diag) catch |e| switch (e) {

@@ -151,8 +151,7 @@ fn encode(buf: *[8]u8, code_in: u32) []const u8 {
 /// `utf8.char(...)`: the characters with these code points.
 fn char(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "char");
-    var b: auxlib.Buffer = undefined;
-    b.init(th.state);
+    var b: auxlib.Buffer = .init(th.state);
     defer b.deinit();
     var i: u32 = 1;
     while (i <= a.count()) : (i += 1) {

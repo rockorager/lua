@@ -882,8 +882,7 @@ fn date(th: *Thread, b: u32) Error!u32 {
         try setAllFields(th, .table(tbl), &tm, true);
         return 1;
     }
-    var buf: aux.Buffer = undefined;
-    buf.init(th.state);
+    var buf: aux.Buffer = .init(th.state);
     defer buf.deinit();
     const w = &buf.writer;
     var i: usize = 0;

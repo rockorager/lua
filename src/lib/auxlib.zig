@@ -297,16 +297,16 @@ pub const equal = vm.equal;
 
 /// A string buffer, `luaL_Buffer`: a writer whose first `inline_len` bytes
 /// live in the struct, so short results never touch the heap, and which
-/// grows through the state's allocator past that. Initialize it in place
-/// with `init`; it must not move afterwards.
+/// grows through the state's allocator past that. Declare it with
+/// `var b: Buffer = .init(state)`; it must not move once written to.
 pub const Buffer = struct {
     writer: Writer,
     gpa: std.mem.Allocator,
     on_heap: bool,
     /// Past `inline_len`: room for a `String` header, the bytes, and a
     /// trailing zero, so a long result becomes its string in place.
-    block: []align(String.alignment.toByteUnits()) u8,
-    small: [inline_len]u8,
+    block: []align(String.alignment.toByteUnits()) u8 = undefined,
+    small: [inline_len]u8 = undefined,
 
     /// `LUAL_BUFFERSIZE` on a 64-bit build.
     pub const inline_len = 1024;
@@ -315,15 +315,24 @@ pub const Buffer = struct {
 
     const vtable: Writer.VTable = .{ .drain = drain, .rebase = rebase };
 
-    pub fn init(b: *Buffer, state: *State) void {
-        b.gpa = state.heap.stringAllocator();
-        b.on_heap = false;
-        b.writer = .{ .vtable = &vtable, .buffer = &b.small };
+    /// An empty buffer. The writer starts with no buffer and takes `small`
+    /// on its first write, so the value can be returned and copied until
+    /// then. Initializing the fields one by one, with `small` left to its
+    /// default, keeps safe builds from writing 0xAA over the 1 KiB that
+    /// `var b: Buffer = undefined` would (`results/buffer-init-20261031.md`).
+    pub fn init(state: *State) Buffer {
+        return .{
+            .writer = .{ .vtable = &vtable, .buffer = &.{} },
+            .gpa = state.heap.stringAllocator(),
+            .on_heap = false,
+        };
     }
 
+    // No `b.* = undefined`: a safe build would write 0xAA over the 1 KiB
+    // again wherever the store outlives inlining (`package`, `io`).
+    // ziglint-ignore: Z030
     pub fn deinit(b: *Buffer) void {
         if (b.on_heap) b.gpa.free(b.block);
-        b.* = undefined;
     }
 
     pub fn written(b: *Buffer) []const u8 {
@@ -345,6 +354,10 @@ pub const Buffer = struct {
     fn ensureUnused(b: *Buffer, n: usize) error{WriteFailed}!void {
         const w = &b.writer;
         if (w.buffer.len - w.end >= n) return;
+        if (w.buffer.len == 0 and n <= inline_len) {
+            w.buffer = &b.small;
+            return;
+        }
         const need = std.math.add(usize, w.end, n) catch return error.WriteFailed;
         // Half again as much, as `luaL_Buffer` grows.
         const cap = @max(need, w.buffer.len / 2 * 3);
@@ -612,8 +625,7 @@ pub const testing = struct {
 test "Buffer keeps short output inline and grows on the heap" {
     const state = try testing.newState();
     defer state.destroy();
-    var b: Buffer = undefined;
-    b.init(state);
+    var b: Buffer = .init(state);
     defer b.deinit();
     try b.writer.writeAll("abc");
     try std.testing.expect(!b.on_heap);

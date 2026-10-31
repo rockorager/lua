@@ -124,8 +124,7 @@ pub fn fileResultErrno(th: *Thread, code: i32, fname: ?[]const u8) Error!u32 {
     const msg = if (code != 0) strerror(code) else "(no extra info)";
     th.push(.nil);
     if (fname) |f| {
-        var b: aux.Buffer = undefined;
-        b.init(th.state);
+        var b: aux.Buffer = .init(th.state);
         defer b.deinit();
         b.writer.print("{s}: {s}", .{ f, msg }) catch return error.OutOfMemory;
         th.push(.string(try b.toString(th.state)));
@@ -632,8 +631,7 @@ fn testEof(th: *Thread, s: *Stream) Error!bool {
 
 /// `read_line`: pushes the next line, without its newline when `chop`.
 fn readLine(th: *Thread, s: *Stream, chop: bool) Error!bool {
-    var b: aux.Buffer = undefined;
-    b.init(th.state);
+    var b: aux.Buffer = .init(th.state);
     defer b.deinit();
     var newline = false;
     if (s.startRead(th)) {
@@ -655,8 +653,7 @@ fn readLine(th: *Thread, s: *Stream, chop: bool) Error!bool {
 
 /// `read_all`: pushes the rest of the file.
 fn readAll(th: *Thread, s: *Stream) Error!void {
-    var b: aux.Buffer = undefined;
-    b.init(th.state);
+    var b: aux.Buffer = .init(th.state);
     defer b.deinit();
     if (s.startRead(th)) {
         while (s.rpos < s.rend or s.fill(th) > 0) {
@@ -669,8 +666,7 @@ fn readAll(th: *Thread, s: *Stream) Error!void {
 
 /// `read_chars`: pushes up to `n` bytes and says whether it read any.
 fn readChars(th: *Thread, s: *Stream, n: usize) Error!bool {
-    var b: aux.Buffer = undefined;
-    b.init(th.state);
+    var b: aux.Buffer = .init(th.state);
     defer b.deinit();
     var left = n;
     if (s.startRead(th)) {
