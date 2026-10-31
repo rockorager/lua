@@ -163,7 +163,7 @@ diff *FILES:
     done
     [ ${#failed[@]} -eq 0 ]
 
-[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, and the own tests of lpeg, lua-cjson, and luafilesystem")]
+[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, io handles shared with C (stream.c, luaposix's posix.stdio), the own tests of lpeg, lua-cjson, and luafilesystem, and the C-API build's io and os on files.lua and test/diff")]
 [group("test")]
 capi-test:
     #!/usr/bin/env bash
@@ -216,12 +216,26 @@ capi-test:
     cp -r "$LUA_CJSON_SRC" "$out/cjson" && chmod -R u+w "$out/cjson"
     (cd "$out/cjson" && cc "${cflags[@]}" -o cjson.so lua_cjson.c strbuf.c fpconv.c && cd tests && perl genutf8.pl > utf8.dat 2> /dev/null)
     run cjson "$out/cjson/tests" "grep -E ^(==>|exit)" sh -c 'LUA_PATH="../lua/?.lua;;" LUA_CPATH="../?.so" "$LUA" test.lua'
-    # luafilesystem, without `lfs.setmode` on an io file: that needs io's
-    # files to be luaL_Stream with a FILE*, which they are not.
+    # luafilesystem, whose setmode and lock read io's files as luaL_Stream.
     cp -r "$LFS_SRC" "$out/lfs" && chmod -R u+w "$out/lfs"
     (cd "$out/lfs" && cc "${cflags[@]}" -o lfs.so src/lfs.c)
-    sed -i '/-- Checking text\/binary modes/,/bad error message for setmode/d' "$out/lfs/tests/test.lua"
     run lfs "$out/lfs/tests" cat sh -c 'LUA_CPATH="../?.so" "$LUA" test.lua'
+    run lfs-lock test/capi cat sh -c 'LUA_CPATH="'"$out"'/lfs/?.so" "$LUA" lock.lua'
+    # io handles shared with C modules: stream.c, and luaposix's posix.stdio
+    # (fileno, fdopen) with the modules its cases use.
+    cc "${cflags[@]}" -o "$out/stream.so" test/capi/stream.c
+    run handles test/capi cat sh -c 'LUA_CPATH="'"$out"'/?.so" "$LUA" handles.lua'
+    p=$out/posix && mkdir -p "$p/posix/sys"
+    for m in stdio unistd fcntl sys/stat; do
+        cc "${cflags[@]}" -w -I"$LUAPOSIX_SRC/ext/include" -DPACKAGE='"luaposix"' -DVERSION='"test"' -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -o "$p/posix/$m.so" "$LUAPOSIX_SRC/ext/posix/$m.c"
+    done
+    run posix test/capi cat sh -c 'LUA_CPATH="'"$p"'/?.so" "$LUA" posix.lua'
+    # The C-API build's io is C's stdio, not the default build's: the
+    # suite's files.lua (but its clock line) and every differential test.
+    run files test/lua-5.5.1-tests "grep -v ^test.done.on" sh -c '"$LUA" -e"_U=true _soft=true _port=true _nomsg=true" files.lua'
+    for f in test/diff/*.lua; do
+        run "diff-$(basename "$f" .lua)" test/diff cat sh -c '"$LUA" '"$(basename "$f")"
+    done
     [ ${#failed[@]} -eq 0 ] || { printf 'differs: %s\n' "${failed[@]}"; exit 1; }
 
 [doc("The C API's costs (bench/capi): CPU ns per call of a C function in a tight loop (nop, add, callback, and the empty loop), our C-API lua against the reference, and startup (`lua -e ''`) wall time and peak RSS on the reference, our default build, and our C-API build, in interleaved rounds on one core, then benchstat; and the native stack bytes per level of C -> lua_call -> Lua nesting")]

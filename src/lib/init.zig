@@ -6,10 +6,14 @@ const std = @import("std");
 const Value = @import("../Value.zig");
 const State = @import("../State.zig");
 const Thread = @import("../Thread.zig");
+const lua_options = @import("lua_options");
 
 pub const base = @import("base.zig");
 pub const package = @import("package.zig");
-pub const io = @import("io.zig");
+const io_zig = @import("io.zig");
+/// C-API builds have io on C's stdio, for C modules (`capi/liolib.zig`).
+const io_c = @import("../capi/liolib.zig");
+pub const io = if (lua_options.c_api) io_c else io_zig;
 pub const os = @import("os.zig");
 pub const coroutine = @import("coroutine.zig");
 pub const debug = @import("debug.zig");
@@ -70,6 +74,7 @@ pub fn openSome(th: *Thread, host: *base.Host, which: std.EnumSet(Lib)) Value.Er
 
 test {
     _ = package;
-    _ = io;
+    // In a C-API build its tests run on `capi/liolib.zig`.
+    _ = io_zig;
     _ = os;
 }

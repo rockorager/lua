@@ -10,6 +10,7 @@
 //! messages are Lua's, from 1.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Value = @import("../Value.zig");
 const String = @import("../String.zig");
 const Table = @import("../Table.zig");
@@ -27,6 +28,7 @@ const lib = @import("init.zig");
 
 const Error = Value.Error;
 const Writer = std.Io.Writer;
+const c_api = @import("lua_options").c_api;
 
 /// What the libraries need from the program around them: I/O and the
 /// standard streams, and state the reference keeps in its `global_State`
@@ -45,6 +47,13 @@ pub const Host = struct {
     environ: ?*const std.process.Environ.Map = null,
     /// `lua -E`: `package` ignores `LUA_PATH` and `LUA_CPATH`.
     noenv: bool = false,
+    /// C-API builds: the C stream `print` and `io.stdout` write to, which C
+    /// modules share: C's `stdout`, or a stream over the embedder's writer
+    /// (`setStdout`). Its buffer is the only one in front of the file.
+    cstdout: if (c_api) *cstream.CFile else void = if (c_api) undefined else {},
+    /// C-API builds: `stdout` unless the embedder set one, a writer with no
+    /// buffer of its own that writes to `cstdout`.
+    cwriter: if (c_api) Writer else void = if (c_api) undefined else {},
 
     /// A host on the process's standard streams. Call `init` in place: the
     /// stdout writer points into the struct.
@@ -52,6 +61,31 @@ pub const Host = struct {
         host.* = .{ .io = io, .stdout = undefined, .file_stdout = undefined };
         host.file_stdout = std.Io.File.stdout().writerStreaming(io, &host.stdout_buf);
         host.stdout = &host.file_stdout.interface;
+        if (c_api) {
+            host.cstdout = cstream.stdout.*;
+            host.cwriter = .{ .buffer = &.{}, .vtable = &cstream.writer_vtable };
+            host.stdout = &host.cwriter;
+        }
+    }
+
+    /// Points `print` and `io.stdout` at `w`. In a C-API build that takes a
+    /// C stream over `w`, which `closeStdout` closes.
+    pub fn setStdout(host: *Host, w: *Writer) error{OutOfMemory}!void {
+        host.stdout = w;
+        if (c_api) host.cstdout = try cstream.over(host);
+    }
+
+    /// Closes what `setStdout` opened, flushing it.
+    pub fn closeStdout(host: *Host) void {
+        if (c_api and host.cstdout != cstream.stdout.*) _ = std.c.fclose(host.cstdout);
+    }
+
+    /// `stdout`, for the host's own output: in a C-API build with the
+    /// embedder's writer, after the C stream's buffer is flushed into it,
+    /// so the two stay in order.
+    pub fn writer(host: *Host) *Writer {
+        if (c_api and host.cstdout != cstream.stdout.*) _ = cstream.fflush(host.cstdout);
+        return host.stdout;
     }
 
     /// Writes to standard error, unbuffered, ignoring failures as C's
@@ -63,11 +97,87 @@ pub const Host = struct {
     /// Writes to the buffered standard output, ignoring failures as C's
     /// `lua_writestring` does.
     pub fn writeStdout(host: *Host, bytes: []const u8) void {
+        if (c_api) {
+            _ = std.c.fwrite(bytes.ptr, 1, bytes.len, host.cstdout);
+            return;
+        }
         host.stdout.writeAll(bytes) catch return;
     }
 
     pub fn flushStdout(host: *Host) void {
+        if (c_api) {
+            _ = cstream.fflush(host.cstdout);
+            return;
+        }
         host.stdout.flush() catch return;
+    }
+};
+
+/// C-API builds: standard output as a C stream, which `io.stdout`
+/// (`capi/liolib.zig`), `print`, and C modules share.
+const cstream = struct {
+    const CFile = std.c.FILE;
+    const darwin = builtin.os.tag.isDarwin();
+
+    /// C's `stdout`.
+    const stdout = @extern(**CFile, .{ .name = if (darwin) "__stdoutp" else "stdout" });
+
+    extern "c" fn fflush(stream: ?*CFile) c_int;
+
+    const CookieIo = extern struct {
+        read: ?*const fn (*anyopaque, [*]u8, usize) callconv(.c) isize,
+        write: ?*const fn (*anyopaque, [*]const u8, usize) callconv(.c) isize,
+        seek: ?*const fn (*anyopaque, *i64, c_int) callconv(.c) c_int,
+        close: ?*const fn (*anyopaque) callconv(.c) c_int,
+    };
+    extern "c" fn fopencookie(cookie: *anyopaque, mode: [*:0]const u8, funcs: CookieIo) ?*CFile;
+
+    /// A C stream that writes to `host.stdout` and flushes it, as the
+    /// default build's `io.stdout` flushes the embedder's writer. glibc's
+    /// `fopencookie`; macOS would need `funopen`.
+    fn over(host: *Host) error{OutOfMemory}!*CFile {
+        const io: CookieIo = .{ .read = null, .write = &cookieWrite, .seek = &cookieSeek, .close = null };
+        return fopencookie(host, "w", io) orelse error.OutOfMemory;
+    }
+
+    fn cookieWrite(cookie: *anyopaque, buf: [*]const u8, size: usize) callconv(.c) isize {
+        const host: *Host = @ptrCast(@alignCast(cookie));
+        host.stdout.writeAll(buf[0..size]) catch return failed();
+        host.stdout.flush() catch return failed();
+        return @intCast(size);
+    }
+
+    fn failed() isize {
+        std.c._errno().* = @intFromEnum(std.c.E.IO);
+        return -1;
+    }
+
+    /// The embedder's writer is not a file to seek.
+    fn cookieSeek(_: *anyopaque, _: *i64, _: c_int) callconv(.c) c_int {
+        std.c._errno().* = @intFromEnum(std.c.E.SPIPE);
+        return -1;
+    }
+
+    const writer_vtable: Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    /// `Host.cwriter`'s: everything to the C stream, which buffers.
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const host: *Host = @alignCast(@fieldParentPtr("cwriter", w));
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += try put(host, d);
+        const last = data[data.len - 1];
+        for (0..splat) |_| n += try put(host, last);
+        return n;
+    }
+
+    fn put(host: *Host, d: []const u8) Writer.Error!usize {
+        if (std.c.fwrite(d.ptr, 1, d.len, host.cstdout) < d.len) return error.WriteFailed;
+        return d.len;
+    }
+
+    fn flush(w: *Writer) Writer.Error!void {
+        const host: *Host = @alignCast(@fieldParentPtr("cwriter", w));
+        if (fflush(host.cstdout) != 0) return error.WriteFailed;
     }
 };
 

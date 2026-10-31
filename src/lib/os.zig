@@ -15,6 +15,7 @@ const Thread = @import("../Thread.zig");
 const aux = @import("auxlib.zig");
 const base = @import("base.zig");
 const iolib = @import("io.zig");
+const lib = @import("init.zig");
 const vm = @import("../vm.zig");
 const package = @import("package.zig");
 
@@ -162,7 +163,7 @@ fn exit(th: *Thread, b: u32) Error!u32 {
     // C's `exit` flushes every stream. With `close`, the reference first
     // runs `lua_close`: pending to-be-closed variables and finalizers.
     if (!a.get(2).isFalsy()) vm.closeState(th.state);
-    iolib.flushAll(th);
+    lib.io.flushAll(th);
     base.getHost(th).flushStdout();
     std.process.exit(@truncate(@as(u64, @bitCast(status))));
 }

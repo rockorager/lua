@@ -16,7 +16,7 @@ const lua = b.dependency("lua", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("lua", lua.module("lua"));
 ```
 
-To let scripts `require` compiled Lua C modules (`.so` files built against Lua 5.5.1's headers), pass `.c_api = true` to `b.dependency` and set `exe.rdynamic = true`, so the modules find the `lua_*` functions in your executable. That links libc dynamically and works on x86-64 Linux only; the C API is a prototype and not complete. The headers install with the package's own build (`zig build -Dc-api=true`) to `zig-out/include`.
+To let scripts `require` compiled Lua C modules (`.so` files built against Lua 5.5.1's headers), pass `.c_api = true` to `b.dependency` and set `exe.rdynamic = true`, so the modules find the `lua_*` functions in your executable. That links libc dynamically and works on x86-64 Linux only; the C API is a prototype and not complete. In this build the `io` library runs on C's stdio, so a file handle is the `luaL_Stream` with a `FILE *` that `lauxlib.h` describes and C modules can share files with scripts, and `print`, `io.write`, and C code write through C's `stdout` (or, with `Options.stdout`, a C stream over your writer). The headers install with the package's own build (`zig build -Dc-api=true`) to `zig-out/include`.
 
 ## A state
 

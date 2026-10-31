@@ -53,6 +53,7 @@
             LPEG_SRC = pkgs.lua5_5.pkgs.lpeg.src;
             LUA_CJSON_SRC = pkgs.lua5_5.pkgs.lua-cjson.src;
             LFS_SRC = pkgs.lua5_5.pkgs.luafilesystem.src;
+            LUAPOSIX_SRC = pkgs.lua5_5.pkgs.luaposix.src;
           };
         };
     };

@@ -409,7 +409,8 @@ pub const State = opaque {
         if (options.io == null and (libs.contains(.io) or libs.contains(.os)))
             @panic("lua: the io and os libraries need Options.io");
         extra.host.init(options.io orelse .failing);
-        if (options.stdout) |w| extra.host.stdout = w;
+        if (options.stdout) |w| try extra.host.setStdout(w);
+        errdefer extra.host.closeStdout();
         extra.host.environ = options.environ;
         extra.host.noenv = options.noenv;
         const s = try IState.create(gpa, .{
@@ -438,6 +439,7 @@ pub const State = opaque {
         lib.io.flushAll(th);
         extra.host.flushStdout();
         s.destroy();
+        extra.host.closeStdout();
         extra.trace.deinit(extra.gpa);
         extra.gpa.destroy(extra);
     }
@@ -451,7 +453,7 @@ pub const State = opaque {
     /// process's buffered standard output. Write the host's own output
     /// through it to keep it in order with the script's.
     pub fn stdout(state: *State) *std.Io.Writer {
-        return extraOf(state.thread().state).host.stdout;
+        return extraOf(state.thread().state).host.writer();
     }
 
     /// Emits a warning, as `warn` does (`lua_warning`): pieces with
