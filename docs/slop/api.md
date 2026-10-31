@@ -164,7 +164,9 @@ userdata for a pointer, or a userdata holding a copy of any other value
 `stack[b - 1]`'s upvalue, as lauxlib natives read `lua_upvalueindex(1)`.
 The unbound wrapper is `Native(f, void)`, so `lua_calls_zig` compiles as
 before. As with C closures, `debug.setupvalue` can replace the upvalue
-with something else; the debug library is not for sandboxes.
+with something else, which `boundContext` reads unchecked (a tag assert
+in safe builds, nothing in ReleaseFast); the debug library is not for
+sandboxes, and `docs/embedding.md` says so.
 
 ## Coroutines
 

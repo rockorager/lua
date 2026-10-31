@@ -187,6 +187,8 @@ try state.setGlobal("next_id", try state.function(@as(i64, 0), bump)); // a coun
 try state.setGlobal("log", try state.function(&editor, Editor.log)); // the host's editor
 ```
 
+Lua code cannot reach the context, with one exception: the function holds it as its upvalue, and `debug.setupvalue` can replace that with any other value, as it can a C closure's. `f` then reads the replacement as its context without checking it, which is undefined behavior. The `debug` library can break any invariant a host relies on; leave it out of states that run code you do not trust.
+
 ## Userdata
 
 A Zig type becomes a userdata type by declaring its Lua side:
