@@ -304,6 +304,12 @@ pure-Lua JSON encoder and decoder (`json`), templated HTML and text
 reports (`template`), a class-based simulation (`oop`), and a large
 table constructor compiled with `load` and queried (`config`).
 
+A timing moves with where the initial stack lands, which the size of
+the environment sets: bench/methods ran 8.7% slower on the same binary
+with an empty environment than in the dev shell (wave 10). A/B runs
+that compare a few percent should average over environment sizes, as
+`results/lean-20261031.md` did with 16 sizes of a padding variable.
+
 ## Order of work
 
 Files have one owner at a time. A piece of work that needs another's file asks
@@ -405,10 +411,27 @@ is `results/bench-compare-wave9-20261031.md`: ReleaseFast 28.6% faster
 on the geomean with 44.1% lower peak RSS, ReleaseSafe 18.7% faster and
 36.3% lower; wave 7's −22.7% peak RSS was floored by taskset.
 
-Next, in another orb: leanness, that is binary size and resident code
-(our text is 1.3 MB resident against the reference's 300 KB), and the
-native call path (a call of an empty C function 17 ns against the
-reference's 12; `runLoop`'s remaining frame; the embedding API's
-`getGlobal` and `Ref` paths copy a `Value` built from fields whole,
-the store-forwarding stall wave 9 took out of `Table.get`, and half of
-`zig_calls_lua`'s time in the API arm).
+Wave 10: leanness (`results/lean-20261031.md`). Release builds of
+`lua` panic without std's DWARF stack trace, build their own
+`std.Io.Threaded` vtable without the functions nothing calls, link
+without unwind tables, and format error messages at run time through
+`Thread.FormatArg` instead of one `std.fmt` instance per call site:
+text 1056 KB to 654 (C API 1141 to 724). `src/order.ld`, written by
+`just order` (`test/order/`), puts the functions a short run calls
+first at the front of the code, so the kernel's 64 KiB fault-around
+maps 136 KiB of code for `lua -e ''` instead of 844: the floor is 556
+KiB instead of 1212 (C API 1888 instead of 2688, the reference 2564).
+Regenerate it when startup changes; a stale script costs memory, not
+correctness. The hooked loop is cold, so the script leaves it out. In
+C-API builds `CALL` sends C functions (native closures) straight to
+`callNative`: an empty C call 14.4 ns to 12.1 a loop iteration (the
+reference 9.6). `api.refValue` and `Thread.npcall` lost two store
+forwarding stalls (bench-api `zig_calls_lua` −18%). `gsub` keeps its
+buffer and matcher in a heap block (`State.gsub_scratch`), so nested
+replacement functions reach the reference's 197 levels within the 192
+KiB budget, and `Parser.body` allocates its `FuncState` (416 bytes a
+nesting level to 176). The default build's loop is byte for byte
+wave 9's. The comparison with the reference at the end of wave 10 is
+`results/bench-compare-wave10-20261031.md`.
+
+Next: full C API coverage (`c-api.md`'s missing list).

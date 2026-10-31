@@ -221,12 +221,20 @@ Detail and raw output in `results/c-api-20261031.md`.
   the reference's 2.62 and the default's 1.49 (wave 9, without Zig's
   256 KiB signal stack: 2.69 and 1.22): dynamic glibc and ld.so map ~1.3 MiB the
   static build does not, and our executable's text (1.3 MB) is resident
-  where the reference's is 300 KB. Our allocators stay: glibc malloc
+  where the reference's is 300 KB. Wave 10: 1888 KiB, below the
+  reference's 2564, with the text cut to 724 KB and the code startup
+  needs first (`src/order.ld`): 156 KiB of it resident at exit instead
+  of 800 (`results/lean-20261031.md`). Our allocators stay: glibc malloc
   saves 32 KiB at the floor and costs 10 to 60% peak RSS on the
   allocation-heavy programs.
 - A call of an empty C function from Lua: 15.2 ns against 6.1 ns. About
   5 ns is the trampoline; the rest is our native call path against the
   reference's `precallC`. C → `lua_call` → Lua: 63 ns against 33.
+  Wave 10: `CALL` sends C functions straight to `callNative`, not
+  through `preCall`: an empty call 12.1 ns a loop iteration against
+  the reference's 9.6 (base 14.4); net of the loop 8.6 against 5.2, of
+  which the protected call per C function is 2.6 and `callNative` 2.8.
+  C calls Lua: 51.3 ns against 30.6 (`results/lean-20261031.md`).
 - Native stack per C → `lua_call` → Lua level: 1903 bytes against 351;
   `runLoop`'s frame is 1432 of it, the trampoline ~160. Wave 9: 656,
   with `runLoop`'s frame 272 (`results/stack-20261031.md`).
