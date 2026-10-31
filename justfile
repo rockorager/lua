@@ -1,7 +1,7 @@
 # lua: Lua 5.5 in Zig, with no C. `just --list` shows the recipes.
 # AGENTS.md holds the working conventions.
 
-markdown := "README.md AGENTS.md CHANGELOG.md THIRD_PARTY.md bench/README.md docs/embedding.md docs/slop .github"
+markdown := "README.md AGENTS.md CHANGELOG.md THIRD_PARTY.md bench/README.md docs/embedding.md docs/slop .github test/fuzz"
 
 # The files all.lua runs, in its order, for `just suite BIN each`.
 suite_files := "main gc db calls strings literals tpack attrib gengc locals constructs code big cstack nextvar pm utf8 api memerr events vararg closure coroutine goto errors math sort bitwise verybig files"
@@ -287,11 +287,53 @@ bench-api ROUNDS="10" *SCENARIOS:
     done
     benchstat internal="$out/internal.txt" api="$out/api.txt" | tee "$out/benchstat.txt"
 
+# The build mode of the fuzz recipes: ReleaseSafe, or Debug to keep the
+# 0xAA fill that catches reads of freed or uninitialized objects.
+fuzz_mode := "ReleaseSafe"
+
+[doc("Fuzz each TARGET for SECONDS (60 by default): parse, grammar, binary, or oom in process, or diff, bytecode, messages, or binary-diff against the reference; `all` runs every one. ARGS go to the driver (--seed N, --gc-stress full). `just fuzz_mode=Debug fuzz ...` builds in Debug, which keeps the 0xAA fill of freed and new objects. Findings, minimized, go to zig-out/fuzz/ and fail the recipe; test/fuzz/README.md says what each checks")]
+[group("fuzz")]
+fuzz TARGET="all" SECONDS="60" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    zig build fuzz listing -Doptimize={{ fuzz_mode }}
+    rm -f zig-out/bin/lua
+    zig build -Doptimize={{ fuzz_mode }}
+    targets=({{ TARGET }})
+    [ "${targets[*]}" = all ] && targets=(parse grammar binary oom diff bytecode messages binary-diff)
+    status=0
+    for t in "${targets[@]}"; do
+        case $t in
+            parse | grammar | binary | oom) zig-out/bin/fuzz run "$t" --seconds {{ SECONDS }} {{ ARGS }} || status=1 ;;
+            *) zig-out/bin/fuzz "$t" --seconds {{ SECONDS }} {{ ARGS }} || status=1 ;;
+        esac
+    done
+    exit $status
+
+[doc("Fuzz under collector stress for SECONDS each: grammar and oom in process with --gc-stress full, and diff on a lua built with -Dgc-stress=full. Findings go to zig-out/fuzz/stress/")]
+[group("fuzz")]
+fuzz-stress SECONDS="60" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    zig build fuzz -Doptimize={{ fuzz_mode }}
+    zig build -Doptimize={{ fuzz_mode }} -Dgc-stress=full --prefix zig-out/stress
+    status=0
+    for t in grammar oom; do
+        zig-out/bin/fuzz run $t --gc-stress full --seconds {{ SECONDS }} --out zig-out/fuzz/stress {{ ARGS }} || status=1
+    done
+    zig-out/bin/fuzz diff --ours zig-out/stress/bin/lua --seconds {{ SECONDS }} --out zig-out/fuzz/stress {{ ARGS }} || status=1
+    exit $status
+
+[doc("Zig's coverage-guided fuzzer on test/fuzz/zig_fuzz.zig (the compiler, the loader, and generated programs) for ITERATIONS inputs, in `fuzz_mode`")]
+[group("fuzz")]
+fuzz-zig ITERATIONS="200K":
+    zig build fuzz-zig -Doptimize={{ fuzz_mode }} --fuzz={{ ITERATIONS }}
+
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src build.zig build.zig.zon
+    zig fmt --check src test build.zig build.zig.zon
     nix fmt -- --ci
     oxfmt --check {{ markdown }}
     actionlint
@@ -301,7 +343,7 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src build.zig build.zig.zon
+    zig fmt src test build.zig build.zig.zon
     nix fmt
     oxfmt {{ markdown }}
     just --fmt

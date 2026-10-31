@@ -58,6 +58,33 @@ pub fn build(b: *std.Build) void {
     });
     b.step("listing", "Build the bytecode lister").dependOn(&b.addInstallArtifact(listing, .{}).step);
 
+    // The fuzz driver `just fuzz` runs (test/fuzz/main.zig).
+    const fuzz = b.addExecutable(.{
+        .name = "fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fuzz/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "lua", .module = mod }},
+        }),
+    });
+    b.step("fuzz", "Build the fuzz driver").dependOn(&b.addInstallArtifact(fuzz, .{}).step);
+
+    // Coverage-guided fuzz tests on Zig's own fuzzer: `zig build
+    // fuzz-zig --fuzz`. They need the default test runner.
+    const fuzz_tests = b.addTest(.{
+        .name = "fuzz-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fuzz/zig_fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "lua", .module = mod }},
+        }),
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    run_fuzz_tests.setCwd(b.path("."));
+    b.step("fuzz-zig", "Run the coverage-guided fuzz tests (add --fuzz to fuzz)").dependOn(&run_fuzz_tests.step);
+
     // The example host, which the embedding guide walks through.
     const example_mod = b.createModule(.{
         .root_source_file = b.path("examples/host/main.zig"),
@@ -103,4 +130,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_example_tests.step);
+    // The fuzzers build, and their Zig fuzz tests run once on their seeds.
+    test_step.dependOn(&fuzz.step);
+    test_step.dependOn(&run_fuzz_tests.step);
 }
