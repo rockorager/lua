@@ -50,6 +50,11 @@ cstack_limit: usize = 0,
 /// A message handler for a "C stack overflow" past `cstack_limit` is
 /// running, and may go past it.
 cstack_handling: bool = false,
+/// The block `string.gsub` keeps between calls for its buffer and
+/// matcher, 1.7 KB it would otherwise put on the native stack at every
+/// level of nested callbacks; a nested call takes its own. Freed with the
+/// state.
+gsub_scratch: ?[]align(16) u8 = null,
 
 /// Metamethod events, in PUC-Rio's order (`ltm.h`). The first six are the
 /// ones `Table.flags` caches the absence of.
@@ -161,6 +166,7 @@ fn fixedString(state: *State, b: []const u8) error{OutOfMemory}!*String {
 /// thread and every pending finalizer.
 pub fn destroy(state: *State) void {
     vm.closeState(state);
+    if (state.gsub_scratch) |b| state.heap.raw().free(b);
     const gpa = state.heap.backing;
     gc.freeAll(&state.heap);
     state.strings.deinit(&state.heap);

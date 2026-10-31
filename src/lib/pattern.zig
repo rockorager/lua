@@ -85,6 +85,18 @@ pub const Matcher = struct {
         };
     }
 
+    /// `init` in place, for a matcher that does not live on the stack: the
+    /// fields one by one, so the captures are not copied or filled.
+    pub fn reset(m: *Matcher, src: []const u8, pattern: []const u8) void {
+        const anchor = pattern.len > 0 and pattern[0] == '^';
+        m.src = src;
+        m.pattern = if (anchor) pattern[1..] else pattern;
+        m.anchor = anchor;
+        m.level = 0;
+        m.depth = max_depth;
+        m.diag = .{};
+    }
+
     /// The number of values `string.match`, `string.gmatch`, and a gsub
     /// callback receive: the captures, or the whole match when there are none.
     /// (`string.find` returns `level` captures after the two positions.)

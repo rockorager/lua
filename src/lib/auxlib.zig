@@ -338,6 +338,14 @@ pub const Buffer = struct {
         };
     }
 
+    /// `init` in place, for a buffer that does not live on the stack: the
+    /// fields one by one, so `small` is not copied or filled.
+    pub fn initIn(b: *Buffer, state: *State) void {
+        b.writer = .{ .vtable = &vtable, .buffer = &.{} };
+        b.gpa = state.heap.rawStrings();
+        b.on_heap = false;
+    }
+
     // No `b.* = undefined`: a safe build would write 0xAA over the 1 KiB
     // again wherever the store outlives inlining (`package`, `io`).
     // ziglint-ignore: Z030

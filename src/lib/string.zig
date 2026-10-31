@@ -355,25 +355,45 @@ const FunctionReplacement = struct {
     }
 };
 
+/// `gsub`'s buffer and matcher, which live on the heap: on the native
+/// stack they were 1.7 KB of each level of a replacement function that
+/// calls `gsub`, which stopped such nesting at 74 levels within
+/// `Thread.max_native_stack` (`results/lean-20261031.md`).
+const GsubScratch = struct {
+    b: auxlib.Buffer,
+    m: pattern.Matcher,
+};
+
 fn gsub(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "gsub");
     const src = try a.checkString(1);
     const p = (try a.checkString(2)).bytes();
     const repl = a.get(3);
     const max_n = try a.optInteger(4, @intCast(src.len() + 1));
-    var b: auxlib.Buffer = .init(th.state);
+    const state = th.state;
+    // The state's block when no other `gsub` holds it, else a new one.
+    const block = state.gsub_scratch orelse
+        try state.heap.raw().alignedAlloc(u8, .@"16", @sizeOf(GsubScratch));
+    state.gsub_scratch = null;
+    defer if (state.gsub_scratch == null) {
+        state.gsub_scratch = block;
+    } else state.heap.raw().free(block);
+    const scratch: *GsubScratch = @ptrCast(block.ptr);
+    const b = &scratch.b;
+    b.initIn(state);
     defer b.deinit();
-    var m: pattern.Matcher = .init(src.bytes(), p);
+    const m = &scratch.m;
+    m.reset(src.bytes(), p);
     const res = switch (repl.typeOf()) {
         .number, .string => blk: {
             const text = (try a.checkString(3)).bytes();
-            break :blk pattern.gsub(&m, max_n, &b.writer, pattern.StringReplacement{ .text = text });
+            break :blk pattern.gsub(m, max_n, &b.writer, pattern.StringReplacement{ .text = text });
         },
-        .table => pattern.gsub(&m, max_n, &b.writer, TableReplacement{ .th = th, .t = repl }),
-        .function => pattern.gsub(&m, max_n, &b.writer, FunctionReplacement{ .th = th, .f = repl }),
+        .table => pattern.gsub(m, max_n, &b.writer, TableReplacement{ .th = th, .t = repl }),
+        .function => pattern.gsub(m, max_n, &b.writer, FunctionReplacement{ .th = th, .f = repl }),
         else => return a.typeError(3, "string/function/table"),
-    } catch |e| return gsubError(th, &m, e);
-    th.push(if (res.changed) .string(try b.toString(th.state)) else .string(src));
+    } catch |e| return gsubError(th, m, e);
+    th.push(if (res.changed) .string(try b.toString(state)) else .string(src));
     th.push(.int(res.count));
     return 2;
 }
