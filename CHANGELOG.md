@@ -27,6 +27,7 @@ All notable changes to lua are recorded here. The format follows
 - `state.function(ctx, f)`, a Lua function that passes `ctx` (a pointer, or a copy of a value) to the Zig function `f` as its first parameter.
 - `state.pcall`, a call in protected mode inside a Zig function, so the host can handle a Lua error in Zig.
 - `Table.rawGet` and `Table.rawSet`, which skip `__index` and `__newindex`.
+- An optional C API, built with `-Dc-api=true` (or `.c_api = true` from a Zig build): Lua 5.5.1's `lua.h` and `lauxlib.h` functions exported from `lua`, the 5.5.1 headers installed to `zig-out/include`, and `package.loadlib` and the C searchers loading compiled C modules with `dlopen`, so modules such as lpeg, lua-cjson, and luafilesystem load unmodified. It links libc dynamically, covers most but not all of the API, and runs on x86-64 Linux only. The default build is unchanged and has no C.
 - `lua.Options.stdout`, a `*std.Io.Writer` for `print` and `io.write` in place of the process's standard output, and `state.stdout()`, the writer in use.
 - `lua.DecodeOptions` with `.unknown_keys = .reject`, which fails a decode on a table key the struct has no field for and names its path ("unknown key 'keybinds[2].acton'").
 - `lua.Options.noenv` (as `lua -E`), `gc_mode`, and `gc_stress`, `state.warn`, and `state.loadFile(null, mode)` for standard input.

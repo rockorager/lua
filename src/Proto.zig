@@ -13,6 +13,7 @@ const gc = @import("gc.zig");
 const Value = @import("Value.zig");
 const String = @import("String.zig");
 const opcodes = @import("opcodes.zig");
+const lua_options = @import("lua_options");
 
 header: gc.Header,
 gclist: ?*gc.Header = null,
@@ -223,6 +224,9 @@ pub const NativeClosure = struct {
     nupvalues: u8,
     gclist: ?*gc.Header = null,
     f: Value.NativeFn,
+    /// C-API builds: the `lua_CFunction` of a C function, which `f`, the
+    /// C API's trampoline, calls; null for Zig natives. Absent otherwise.
+    cfn: if (lua_options.c_api) ?*const anyopaque else void = if (lua_options.c_api) null else {},
 
     pub fn allocSize(n: usize) usize {
         return @sizeOf(NativeClosure) + n * @sizeOf(Value);

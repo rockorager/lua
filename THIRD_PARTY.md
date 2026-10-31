@@ -13,6 +13,10 @@ Adapted into Zig, function by function:
 - `src/lib/base.zig` from `lbaselib.c` and the parts of `lauxlib.c` it uses.
 - `src/main.zig` from `lua.c`.
 
+Copied unmodified, for the C API build (`-Dc-api=true`), which installs them so C modules build against them:
+
+- `include/lua.h`, `include/luaconf.h`, `include/lauxlib.h`, and `include/lualib.h`, from the tarball's `src/` (SHA-256 of the tarball: `1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce`).
+
 ## Lua 5.5 Reference Manual
 
 - Upstream: https://www.lua.org/manual/5.5/

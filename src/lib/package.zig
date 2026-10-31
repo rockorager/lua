@@ -5,11 +5,12 @@
 //! default), `package.searchers`, `package.searchpath`, `package.config`, and
 //! `package.loadlib`.
 //!
-//! There is no C, so no C library ever loads. The C searchers still search
-//! `package.cpath` and report the files they did not find, as the reference's
-//! stub build does, and a file they do find fails with its "dynamic
-//! libraries not enabled" message; `loadlib` returns that message with
-//! "absent".
+//! The default build has no C, so no C library ever loads. The C searchers
+//! still search `package.cpath` and report the files they did not find, as
+//! the reference's stub build does, and a file they do find fails with its
+//! "dynamic libraries not enabled" message; `loadlib` returns that message
+//! with "absent". A C-API build (`-Dc-api=true`) loads them with `dlopen`,
+//! as the reference's `LUA_USE_DLOPEN` build does (`../capi/loadlib.zig`).
 
 const std = @import("std");
 const Value = @import("../Value.zig");
@@ -23,6 +24,8 @@ const aux = @import("auxlib.zig");
 const base = @import("base.zig");
 const os = @import("os.zig");
 const lib = @import("init.zig");
+const lua_options = @import("lua_options");
+const dynlib = @import("../capi/loadlib.zig");
 
 const Error = Value.Error;
 const Args = aux.Args;
@@ -267,7 +270,11 @@ fn searcherC(th: *Thread, b: u32) Error!u32 {
             return 1;
         },
     };
-    return checkLoad(th, b, null, filename, dl_msg);
+    if (comptime !lua_options.c_api) return checkLoad(th, b, null, filename, dl_msg);
+    return switch (try dynlib.loadFunc(th, filename, name.bytes())) {
+        .ok => |f| checkLoad(th, b, f, filename, ""),
+        .open, .init => |msg| checkLoad(th, b, null, filename, msg),
+    };
 }
 
 fn searcherCroot(th: *Thread, b: u32) Error!u32 {
@@ -281,7 +288,23 @@ fn searcherCroot(th: *Thread, b: u32) Error!u32 {
             return 1;
         },
     };
-    return checkLoad(th, b, null, filename, dl_msg);
+    if (comptime !lua_options.c_api) return checkLoad(th, b, null, filename, dl_msg);
+    switch (try dynlib.loadFunc(th, filename, name)) {
+        .ok => |f| {
+            th.push(f);
+            th.push(.string(filename));
+            return 2;
+        },
+        .open => |msg| return checkLoad(th, b, null, filename, msg),
+        .init => {
+            var buf: aux.Buffer = .init(th.state);
+            defer buf.deinit();
+            const args = .{ name, cstr(filename.bytes()) };
+            buf.writer.print("no module '{s}' in file '{s}'", args) catch return error.OutOfMemory;
+            th.push(.string(try buf.toString(th.state)));
+            return 1;
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,8 +386,22 @@ fn require(th: *Thread, b: u32) Error!u32 {
 
 fn loadlib(th: *Thread, b: u32) Error!u32 {
     const a = Args.init(th, b, "loadlib");
-    _ = try a.checkString(1);
-    _ = try a.checkString(2);
+    const path = try a.checkString(1);
+    const init = try a.checkString(2);
+    if (comptime lua_options.c_api) {
+        const msg, const when = switch (try dynlib.lookForFunc(th, path.bytes(), init.bytes())) {
+            .ok => |f| {
+                th.push(f);
+                return 1;
+            },
+            .open => |msg| .{ msg, "open" },
+            .init => |msg| .{ msg, "init" },
+        };
+        th.push(.nil);
+        th.push(.string(try th.state.newString(msg)));
+        th.push(.string(try th.state.newString(when)));
+        return 3;
+    }
     th.push(.nil);
     th.push(.string(try th.state.newString(dl_msg)));
     th.push(.string(try th.state.newString("absent")));

@@ -4,13 +4,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The C API (lua.h and lauxlib.h, for compiled Lua C modules), off by
+    // default: `-Dc-api=true` here, `.c_api = true` from a host's
+    // build.zig. It links libc; without it the build is libc-free.
+    const c_api = (b.option(bool, "c-api", "Export Lua 5.5.1's C API and load C modules (links libc)") orelse false) or
+        (b.option(bool, "c_api", "Same as -Dc-api, under the name a dependency passes") orelse false);
+    const lua_options = b.addOptions();
+    lua_options.addOption(bool, "c_api", c_api);
+
     // The one exported module. Everything below is a developer step, so a
     // consumer's fetch graph stops at this module.
     const mod = b.addModule("lua", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = if (c_api) true else null,
     });
+    mod.addOptions("lua_options", lua_options);
 
     if (b.pkg_hash.len != 0) return;
 
@@ -24,7 +34,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .omit_frame_pointer = omit_fp,
+        .link_libc = if (c_api) true else null,
     });
+    exe_mod.addOptions("lua_options", lua_options);
     const exe = b.addExecutable(.{
         .name = "lua",
         .root_module = b.createModule(.{
@@ -41,6 +53,16 @@ pub fn build(b: *std.Build) void {
     const gc_stress = b.option([]const u8, "gc-stress", "Collector stress in the lua executable: off, full, or step");
     exe_options.addOption([]const u8, "gc_stress", gc_stress orelse "off");
     exe.root_module.addOptions("build_options", exe_options);
+    if (c_api) {
+        // C modules link against the executable's own lua_* symbols, as
+        // lua.c's `-Wl,-E` exports them, and build with the headers
+        // installed to zig-out/include. Zig builds glibc-linked code
+        // position-independent, which costs the interpreter loop a
+        // register for its jump table base
+        // (docs/slop/results/c-api-20261031.md).
+        exe.rdynamic = true;
+        b.installDirectory(.{ .source_dir = b.path("include"), .install_dir = .header, .install_subdir = "" });
+    }
     b.installArtifact(exe);
     const run_exe = b.addRunArtifact(exe);
     if (b.args) |args| run_exe.addArgs(args);

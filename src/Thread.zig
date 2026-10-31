@@ -14,8 +14,15 @@ const Value = @import("Value.zig");
 const Proto = @import("Proto.zig");
 const State = @import("State.zig");
 const vm = @import("vm.zig");
+const lua_options = @import("lua_options");
+const capi = @import("capi/capi.zig");
 
 const Error = Value.Error;
+
+/// C-API builds keep 16 bytes in front of every thread: the C API's data
+/// for it, then `lua_getextraspace`'s `LUA_EXTRASPACE`
+/// (docs/slop/c-api.md). Other builds keep none.
+pub const prefix_len: usize = if (lua_options.c_api) 16 else 0;
 const Upval = Proto.Upval;
 
 header: gc.Header,
@@ -202,7 +209,11 @@ pub fn create(state: *State) error{OutOfMemory}!*Thread {
     var frames: std.ArrayList(Frame) = .empty;
     try frames.append(gpa, baseFrame());
     errdefer frames.deinit(gpa);
-    const th = try raw.create(Thread);
+    const th: *Thread = if (prefix_len == 0) try raw.create(Thread) else blk: {
+        const mem = try raw.alignedAlloc(u8, .of(Thread), prefix_len + @sizeOf(Thread));
+        @memset(mem[0..prefix_len], 0);
+        break :blk @ptrCast(@alignCast(mem.ptr + prefix_len));
+    };
     th.* = .{ .header = undefined, .state = state, .stack = stack, .top = 1, .frames = frames };
     th.twups = th;
     state.heap.link(&th.header, .thread);
@@ -228,7 +239,10 @@ pub fn destroy(h: *gc.Heap, th: *Thread) void {
     h.raw().free(th.stack);
     th.frames.deinit(gpa);
     th.tbc.deinit(gpa);
-    h.raw().destroy(th);
+    if (prefix_len == 0) return h.raw().destroy(th);
+    capi.deinitThread(h, th);
+    const p: [*]align(@alignOf(Thread)) u8 = @ptrCast(th);
+    h.raw().free((p - prefix_len)[0 .. prefix_len + @sizeOf(Thread)]);
 }
 
 pub fn closeAllUpvals(th: *Thread) void {

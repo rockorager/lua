@@ -1,6 +1,6 @@
 # Embedding Lua in a Zig program
 
-This package runs Lua 5.5 inside a Zig program. The host extends Lua with Zig functions and Zig types; there is no C API and no loading of C modules. Everything below is in the `lua` module, and `examples/host/main.zig` is a complete host (`zig build example`).
+This package runs Lua 5.5 inside a Zig program. The host extends Lua with Zig functions and Zig types. By default there is no C API and no loading of C modules; an optional build adds them (below). Everything below is in the `lua` module, and `examples/host/main.zig` is a complete host (`zig build example`).
 
 The API is unstable while the project incubates.
 
@@ -15,6 +15,8 @@ zig fetch --save <url of a release tarball>
 const lua = b.dependency("lua", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("lua", lua.module("lua"));
 ```
+
+To let scripts `require` compiled Lua C modules (`.so` files built against Lua 5.5.1's headers), pass `.c_api = true` to `b.dependency` and set `exe.rdynamic = true`, so the modules find the `lua_*` functions in your executable. That links libc dynamically and works on x86-64 Linux only; the C API is a prototype and not complete. The headers install with the package's own build (`zig build -Dc-api=true`) to `zig-out/include`.
 
 ## A state
 

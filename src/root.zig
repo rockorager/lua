@@ -5,6 +5,13 @@ const std = @import("std");
 const testing = std.testing;
 
 const api = @import("api.zig");
+const lua_options = @import("lua_options");
+const capi = @import("capi/capi.zig");
+
+// A C-API build (`-Dc-api=true`) exports lua.h's and lauxlib.h's functions.
+comptime {
+    if (lua_options.c_api) _ = capi;
+}
 
 // The embedding API: what a host program uses. `docs/embedding.md` is the
 // guide.
@@ -53,6 +60,7 @@ test "version is the one the vendored test suite requires" {
 test {
     testing.refAllDecls(@This());
     testing.refAllDecls(internal);
+    if (lua_options.c_api) _ = capi;
     _ = @import("api_test.zig");
     _ = @import("Lexer.zig");
     _ = @import("number.zig");

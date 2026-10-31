@@ -52,6 +52,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "include",
         "LICENSE",
         "README.md",
         "THIRD_PARTY.md",
