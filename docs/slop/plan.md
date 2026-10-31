@@ -36,9 +36,15 @@ reference.
 1. **Value.** Start with a 16-byte tagged value: an 8-byte payload (i64, f64,
    pointer, bool, light userdata) and a 1-byte tag, the shape PUC-Rio uses.
    Every access goes through `Value`'s inline functions so the representation
-   can change in one file. **Measure** against NaN-boxing, which needs boxed
-   integers outside 2^47 or a separate integer tag scheme; Lua 5.5's 64-bit
-   integers make NaN-boxing a real trade, not a free win.
+   can change in one file. Settled in wave 4: the 16-byte value stays. A
+   NaN-boxing prototype (47-bit payloads, integers beyond 47 bits boxed,
+   20-byte nodes, 8-byte array slots) was 7.1% slower on the geomean and
+   peaked 9% higher: integer paths pay to unpack and range-check, and a
+   growing array part must write nil into every new slot where 5.5's compact
+   layout writes one tag byte. Only coroutines (−12%, half-size stacks) and
+   hash_int (−13% RSS) gained. A complete version would also make
+   `Value.int` need a heap and integer arithmetic allocate
+   (`results/nanbox-20261031.md`).
 2. **Instructions.** 32-bit instructions in Lua 5.4/5.5's formats (iABC with
    the k bit, iABx, iAsBx, iAx, isJ) and an opcode set modeled on 5.5's,
    including the specialized forms (`ADDI`, `ADDK`, `GETFIELD`, `GETI`,
@@ -50,8 +56,9 @@ reference.
    compiles to threaded dispatch: one indirect jump per opcode, each with its
    own branch history. Keep the hot registers (pc, base, the constant array)
    in locals of the loop function, and reload `base` only after anything that
-   can reallocate the stack. **Measure** a plain loop-and-switch once, to know
-   what threading buys.
+   can reallocate the stack. Measured in wave 4: a plain loop-and-switch (one
+   shared indirect jump) is 9.0% slower on the geomean, mandelbrot 33%, peak
+   RSS level (`results/dispatch-20261031.md`).
 4. **Calls.** A Lua-to-Lua call pushes a frame and continues the same loop: no
    Zig recursion, so deep Lua recursion costs heap, not Zig stack. Frames refer
    to the stack by index, because the stack reallocates when it grows.
@@ -172,7 +179,10 @@ reference.
 
 - No allocation on an instruction's path except where the language allocates.
 - No hash lookup for a global access that a constant key and a cached slot can
-  answer (`GETTABUP` with a constant string key: measure an inline cache).
+  answer. Landed in wave 4: `GETTABUP` and `SETTABUP` try the node in
+  `Proto.kslot[c]` for their constant key first (4 bytes per constant in
+  functions that touch globals); bench/globals.lua −8.9%, a read of an unset
+  global +4% (`results/gettabup-cache-20261031.md`).
 - Integer and float fast paths first in every arithmetic opcode; metamethods
   and coercions on the slow branch, out of line.
 - Slow paths take operands as `*const Value` and carry `@branchHint(.cold)`.
@@ -183,7 +193,14 @@ reference.
   (`results/vm-operands-20261030.md`, `vm-copies`, `vm-registers`.)
 - The interpreter loop's register allocation shifts other programs by ±5%
   with any edit; judge a change only by a full 10-round A/B.
-- `ReleaseFast` builds are the ones measured. `ReleaseSafe` runs the suite too.
+- `ReleaseFast` builds are the ones measured. `ReleaseSafe` runs the suite too;
+  it is 33% slower than ReleaseFast and still faster than the reference.
+  Half of that and all of its extra peak memory is the standard allocator
+  interface writing 0xAA over every allocation and free; then
+  `string.format`'s `auxlib.Buffer` declared `undefined` (a 1 KiB memset
+  per call) and `SmpAllocator`'s own safe build. The loop's checks are
+  spread thin (`results/release-safe-20261031.md`). Measure it with
+  `just optimize=ReleaseSafe bench-compare`.
 
 ## Testing
 
@@ -260,3 +277,9 @@ everything from a native frame with lua.c's traceback handler.
 
 Wave 3: the collector's weak tables, finalizers, incremental and generational
 modes (landed, `gc.md`), then the measured decisions above.
+
+Wave 4 measured the decisions still open: the value representation
+(decision 1, kept), dispatch (decision 3, kept), the global-access cache
+(landed), and the cost of ReleaseSafe. Still open: the hash part against
+open addressing (decision 8). The comparison with the reference at the end
+of wave 4 is `results/bench-compare-wave4-20261031.md`.
