@@ -206,6 +206,19 @@ pub const BlockCnt = struct {
 const KKey = struct {
     tag: enum(u8) { string, int, float, true, false, nil, zero },
     bits: u64,
+
+    /// Hashes the two fields as integers: the generic hash copies the
+    /// key's nine bytes into a buffer and reads them back, a store
+    /// forwarding stall on every lookup.
+    const Context = struct {
+        pub fn hash(_: Context, k: KKey) u64 {
+            return std.hash.int(k.bits ^ @as(u64, @intFromEnum(k.tag)) << 61);
+        }
+
+        pub fn eql(_: Context, a: KKey, b: KKey) bool {
+            return a.bits == b.bits and a.tag == b.tag;
+        }
+    };
 };
 
 /// A function being compiled; lparser.h's `FuncState`. Its lists move into
@@ -223,7 +236,7 @@ pub const FuncState = struct {
     protos: std.ArrayList(*Proto) = .empty,
     locvars: std.ArrayList(Proto.LocVar) = .empty,
     upvals: std.ArrayList(Proto.UpvalDesc) = .empty,
-    kcache: std.AutoHashMapUnmanaged(KKey, u32) = .empty,
+    kcache: std.HashMapUnmanaged(KKey, u32, KKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     /// The last jump target (a "label").
     lasttarget: i32 = 0,
     /// Index of the function's first active variable in the parser's list.
@@ -521,10 +534,14 @@ pub const FuncState = struct {
 
     /// The index of constant `v`, reused through the cache under `key`.
     fn k2proto(fs: *FuncState, key: KKey, v: Value) Error!i32 {
-        if (fs.kcache.get(key)) |idx| return @intCast(idx);
-        const idx = try fs.addK(v);
-        try fs.kcache.put(fs.ls.gpa, key, @intCast(idx));
-        return idx;
+        // Room first, so a new entry always gets its constant.
+        try fs.ks.ensureUnusedCapacity(fs.ls.gpa, 1);
+        const gop = try fs.kcache.getOrPut(fs.ls.gpa, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(fs.ks.items.len);
+            fs.ks.appendAssumeCapacity(v);
+        }
+        return @intCast(gop.value_ptr.*);
     }
 
     fn stringK(fs: *FuncState, s: *String) Error!i32 {

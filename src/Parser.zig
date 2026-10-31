@@ -218,17 +218,20 @@ fn leaveLevel(ls: *Parser) void {
 
 // Tokens.
 
-fn scan(ls: *Parser) Error!Token {
+/// Scans the next token into `tok`. It writes in place: a token returned
+/// by value through the error union was written field by field and read
+/// back whole by the caller, a store forwarding stall on every token.
+fn scan(ls: *Parser, tok: *Token) Error!void {
     const raw = ls.lx.next() catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.SyntaxError => return ls.fail(ls.lx.err_line, null, "{s}", .{ls.lx.errorMessage()}),
     };
-    var tok: Token = .{ .kind = raw.kind, .raw = raw };
+    tok.kind = raw.kind;
+    tok.raw = raw;
     if (raw.kind == .name or raw.kind == .string) {
         tok.ts = try ls.newString(raw.data.string);
         tok.raw.data = .{ .string = tok.ts.bytes() };
     }
-    return tok;
 }
 
 /// Reads the next token, `luaX_next`.
@@ -238,13 +241,14 @@ fn next(ls: *Parser) Error!void {
         ls.t = a;
         ls.ahead = null;
     } else {
-        ls.t = try ls.scan();
+        try ls.scan(&ls.t);
     }
 }
 
 fn lookahead(ls: *Parser) Error!Kind {
     std.debug.assert(ls.ahead == null);
-    ls.ahead = try ls.scan();
+    ls.ahead = @as(Token, undefined);
+    try ls.scan(&ls.ahead.?);
     return ls.ahead.?.kind;
 }
 
