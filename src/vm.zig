@@ -836,18 +836,30 @@ fn usesTop(i: Instruction) bool {
 // The interpreter loop
 // ---------------------------------------------------------------------------
 
-inline fn fetch(pc: *[*]const u32, i: *Instruction) opcodes.OpCode {
+inline fn fetch(pc: *[*]const u32, i: *Instruction) Dispatch {
     i.* = pc.*[0];
     pc.* += 1;
-    return op(i.*);
+    return dispatchOp(i.*);
 }
 
 /// `fetch` past the next instruction: an arithmetic fast path skipping its
 /// `MMBIN`.
-inline fn fetchSkip(pc: *[*]const u32, i: *Instruction) opcodes.OpCode {
+inline fn fetchSkip(pc: *[*]const u32, i: *Instruction) Dispatch {
     i.* = pc.*[1];
     pc.* += 2;
-    return op(i.*);
+    return dispatchOp(i.*);
+}
+
+/// `OpCode` as the loop's switch sees it: the same tags, non-exhaustive, so
+/// safe builds do not check before every dispatch that the opcode is one
+/// of the set. It always is: every instruction the loop runs comes from
+/// the compiler, whose encoders take an `OpCode`, or from `undump`, which
+/// rejects any other; a new source of code must check the same
+/// (`results/opcode-check-20261031.md`).
+const Dispatch = @Enum(u7, .nonexhaustive, std.meta.fieldNames(opcodes.OpCode), &std.simd.iota(u7, opcodes.props.len));
+
+inline fn dispatchOp(i: Instruction) Dispatch {
+    return @enumFromInt(@as(u7, @truncate(i)));
 }
 
 /// Runs Lua frames from the current one until a frame flagged `fresh`
@@ -875,7 +887,7 @@ inline fn nextOp(
     pc: *[*]const u32,
     i: *Instruction,
     base: *[*]Value,
-) Error!opcodes.OpCode {
+) Error!Dispatch {
     if (hooked) {
         try traceExec(th, pc.*);
         ci.* = th.frame();
@@ -893,7 +905,7 @@ inline fn nextSkip(
     pc: *[*]const u32,
     i: *Instruction,
     base: *[*]Value,
-) Error!opcodes.OpCode {
+) Error!Dispatch {
     if (hooked) {
         pc.* += 1;
         return nextOp(true, th, ci, pc, i, base);
@@ -1233,7 +1245,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     .addk, .subk, .mulk, .modk, .powk, .divk, .idivk => k[getC(i)],
                     else => base[getC(i)],
                 };
-                const ao: ArithOp = comptime arithOf(o);
+                const ao: ArithOp = comptime arithOf(@enumFromInt(@intFromEnum(o)));
                 if (rb.tag == .int and rc.tag == .int and ao.intOp()) {
                     const x = rb.payload.int;
                     const y = rc.payload.int;
@@ -1812,6 +1824,12 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .extraarg => unreachable,
+            // No opcode outside the set reaches the loop (`Dispatch`); a
+            // checked `unreachable` here would put the check back.
+            _ => {
+                @setRuntimeSafety(false);
+                unreachable;
+            },
         }
     }
 }
