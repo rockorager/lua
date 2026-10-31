@@ -58,6 +58,18 @@ pub fn build(b: *std.Build) void {
     });
     b.step("listing", "Build the bytecode lister").dependOn(&b.addInstallArtifact(listing, .{}).step);
 
+    // The example host, which the embedding guide walks through.
+    const example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/host/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "lua", .module = mod }},
+    });
+    const example = b.addExecutable(.{ .name = "example-host", .root_module = example_mod });
+    const run_example = b.addRunArtifact(example);
+    if (b.args) |args| run_example.addArgs(args);
+    b.step("example", "Run the example host").dependOn(&run_example.step);
+
     // Every step below needs testingx, which is lazy so a consumer never
     // fetches it. On the first configure pass it is not fetched yet, and the
     // build runner fetches it and reruns this script.
@@ -72,5 +84,10 @@ pub fn build(b: *std.Build) void {
     // Tests read the vendored suite under `test/`, so they run from the root.
     run_mod_tests.setCwd(b.path("."));
     run_mod_tests.addArg(b.fmt("--seed=0x{x}", .{b.graph.random_seed}));
-    b.step("test", "Run the unit tests").dependOn(&run_mod_tests.step);
+    const example_tests = b.addTest(.{ .root_module = example_mod, .test_runner = runner });
+    const run_example_tests = b.addRunArtifact(example_tests);
+    run_example_tests.addArg(b.fmt("--seed=0x{x}", .{b.graph.random_seed}));
+    const test_step = b.step("test", "Run the unit tests");
+    test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_example_tests.step);
 }
