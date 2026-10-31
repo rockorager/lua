@@ -316,7 +316,9 @@ bench-compare ROUNDS="10" *PROGRAMS:
     # rotates each round, so drift on the machine lands on every arm alike.
     # A row is one whole process, start to exit: its wall time, and its
     # peak RSS (getrusage's ru_maxrss, through GNU time's %M) as a second
-    # benchstat unit.
+    # benchstat unit. GNU time runs under taskset, not over it: ru_maxrss
+    # keeps the high-water mark across exec, so taskset's own 2.3 MiB would
+    # floor every arm.
     gnutime=$(type -P time)
     core=$(( $(nproc) - 1 ))
     n=${#arms[@]}
@@ -327,7 +329,7 @@ bench-compare ROUNDS="10" *PROGRAMS:
                 arm=${arms[$(( (round + i) % n ))]}
                 status=0
                 start=${EPOCHREALTIME/[.,]/}
-                "$gnutime" -f %M -o "$out/rss" taskset -c "$core" "${bin[$arm]}" "bench/$prog.lua" > "$out/stdout/$prog.$arm.$round" 2>&1 || status=$?
+                taskset -c "$core" "$gnutime" -f %M -o "$out/rss" "${bin[$arm]}" "bench/$prog.lua" > "$out/stdout/$prog.$arm.$round" 2>&1 || status=$?
                 end=${EPOCHREALTIME/[.,]/}
                 [ $status -eq 0 ] || echo "exit status $status" >> "$out/stdout/$prog.$arm.$round"
                 printf 'BenchmarkLua/%s\t1\t%d ns/op\t%d peak-RSS-KiB\n' "$prog" $(( (end - start) * 1000 )) "$(tail -n 1 "$out/rss")" >> "$out/raw-$arm.txt"
@@ -384,7 +386,7 @@ bench-api ROUNDS="10" *SCENARIOS:
         for s in "${scenarios[@]}"; do
             for i in 0 1; do
                 arm=${arms[$(( (round + i) % 2 ))]}
-                line=$("$gnutime" -f %M -o "$out/rss" taskset -c "$core" "$bin" "$arm" "$s" 2> "$out/check.$arm.$s")
+                line=$(taskset -c "$core" "$gnutime" -f %M -o "$out/rss" "$bin" "$arm" "$s" 2> "$out/check.$arm.$s")
                 printf '%s\t%d peak-RSS-KiB\n' "$line" "$(tail -n 1 "$out/rss")" >> "$out/$arm.txt"
             done
             if ! cmp -s "$out/check.internal.$s" "$out/check.api.$s"; then
