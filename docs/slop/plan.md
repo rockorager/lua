@@ -354,3 +354,5 @@ Wave 7: memory. Line information in luac's encoding (decision 13,
 `results/lineinfo-20261031.md`), which also makes `string.dump`'s line
 info luac's in every case (decision 14), and ReleaseSafe without the
 allocator's fill (the hot-path rules, `results/safe-poison-20261031.md`).
+The comparison with the reference at the end of wave 7 is
+`results/bench-compare-wave7-20261031.md`.
