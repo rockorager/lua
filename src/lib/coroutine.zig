@@ -143,9 +143,11 @@ fn yield(th: *Thread, base: u32) Error!u32 {
     return vm.yield(th, th.top - base);
 }
 
-const CoStatus = enum { running, dead, suspended, normal };
+/// What `coroutine.status` reports.
+pub const CoStatus = enum { running, dead, suspended, normal };
 
-fn coStatus(th: *Thread, co: *Thread) CoStatus {
+/// The status of `co` seen from `th`, the running thread.
+pub fn coStatus(th: *Thread, co: *Thread) CoStatus {
     if (th == co) return .running;
     return switch (co.status) {
         .yield => .suspended,

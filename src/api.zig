@@ -227,6 +227,45 @@ pub const Coroutine = struct {
         const out = try results(R, th, c.stack[first..].ptr, r.nres);
         return if (r.status == .ok) .{ .returned = out } else .{ .yielded = out };
     }
+
+    /// What a coroutine is doing, by `coroutine.status`'s names:
+    /// `suspended` (not started, or in a yield), `running` (it is the
+    /// caller), `normal` (it resumed the caller, directly or not), or
+    /// `dead` (its body returned or failed, or it was closed).
+    pub const Status = lib.coroutine.CoStatus;
+
+    /// The coroutine's status seen from `state`, the caller, as
+    /// `coroutine.status` reports it.
+    pub fn status(co: Coroutine, state: *State) Status {
+        return lib.coroutine.coStatus(state.thread(), co.raw);
+    }
+
+    /// Closes a suspended or dead coroutine, as `coroutine.close` does: its
+    /// pending to-be-closed variables are closed and it is dead. When it
+    /// had died with an error, or a `__close` handler raises, that error
+    /// comes back as `error.Runtime`, or `error.OutOfMemory` when an
+    /// allocation failed. Closing a running or normal coroutine raises
+    /// the reference's error.
+    pub fn close(co: Coroutine, state: *State) Error!void {
+        const th = state.thread();
+        const c = co.raw;
+        switch (co.status(state)) {
+            .suspended, .dead => {},
+            .running, .normal => |s| return state.raise("cannot close a {s} coroutine", .{@tagName(s)}),
+        }
+        // Handlers run anchored on the caller's stack, as for `resume`.
+        dropKept(th);
+        try ensure(th, 1);
+        const bottom = th.top;
+        defer th.top = bottom;
+        th.push(.thread(c));
+        extraOf(th.state).trace.clearRetainingCapacity();
+        const s = vm.closeThread(c, th);
+        if (s == .ok) return;
+        th.err = c.stack[c.top - 1];
+        c.top -= 1;
+        return if (s == .memory) error.OutOfMemory else error.Runtime;
+    }
 };
 
 /// A reference to a Lua value in the registry, as `luaL_ref` makes: it

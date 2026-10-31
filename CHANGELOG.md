@@ -30,6 +30,7 @@ All notable changes to lua are recorded here. The format follows
 - `lua.Options.stdout`, a `*std.Io.Writer` for `print` and `io.write` in place of the process's standard output, and `state.stdout()`, the writer in use.
 - `lua.DecodeOptions` with `.unknown_keys = .reject`, which fails a decode on a table key the struct has no field for and names its path ("unknown key 'keybinds[2].acton'").
 - `lua.Options.noenv` (as `lua -E`), `gc_mode`, and `gc_stress`, `state.warn`, and `state.loadFile(null, mode)` for standard input.
+- `co.close(state)` and `co.status(state)` on a `lua.Coroutine`, as `coroutine.close` and `coroutine.status`; `close` returns the error a coroutine died with, or a `__close` handler's, as `error.Runtime` (`error.OutOfMemory` for an allocation failure).
 
 ### Changed
 

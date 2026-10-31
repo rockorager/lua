@@ -765,3 +765,79 @@ test "coroutines resumed from the host, and Zig functions that yield" {
     const back = try state.getGlobal(lua.Coroutine, "lc");
     try testing.expectEqual(5, (try back.@"resume"(state, i64, .{5})).returned);
 }
+
+fn zigStatus(state: *lua.State, co: lua.Coroutine) []const u8 {
+    return @tagName(co.status(state));
+}
+
+fn zigClose(state: *lua.State, co: lua.Coroutine) !void {
+    try co.close(state);
+}
+
+fn failAllocation() !void {
+    return error.OutOfMemory;
+}
+
+test "coroutine status and close" {
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    try state.setGlobal("zstatus", zigStatus);
+    try state.setGlobal("zclose", zigClose);
+
+    // Seen from inside: running, the main thread normal, and a coroutine
+    // that resumed this one normal too; closing either is refused.
+    const outer = try state.doString(lua.Coroutine,
+        \\local main = coroutine.running()
+        \\local inner = coroutine.create(function(o)
+        \\  assert(zstatus(o) == "normal" and zstatus(coroutine.running()) == "running")
+        \\  assert(select(2, pcall(zclose, o)) == "cannot close a normal coroutine")
+        \\end)
+        \\local outer = coroutine.create(function()
+        \\  local self = coroutine.running()
+        \\  assert(zstatus(self) == "running" and zstatus(main) == "normal")
+        \\  assert(select(2, pcall(zclose, self)) == "cannot close a running coroutine")
+        \\  assert(coroutine.resume(inner, self))
+        \\  assert(zstatus(inner) == "dead")
+        \\  local x <close> = setmetatable({}, {__close = function() closed = true end})
+        \\  coroutine.yield()
+        \\end)
+        \\assert(zstatus(outer) == "suspended")
+        \\assert(coroutine.resume(outer))
+        \\return outer
+    , .{});
+    try testing.expectEqual(.suspended, outer.status(state));
+    try outer.close(state);
+    try testing.expect(try state.getGlobal(bool, "closed"));
+    try testing.expectEqual(.dead, outer.status(state));
+    try outer.close(state);
+    const main = try state.doString(lua.Coroutine, "return (coroutine.running())", .{});
+    try testing.expectEqual(.running, main.status(state));
+    try expectRuntime(state, "cannot close a running coroutine", main.close(state));
+
+    // A __close handler's error is close's error, once.
+    const raising = try state.newCoroutine(try state.doString(lua.Function,
+        \\return function()
+        \\  local x <close> = setmetatable({}, {__close = function() error("in close", 0) end})
+        \\  coroutine.yield()
+        \\end
+    , .{}));
+    _ = try raising.@"resume"(state, void, .{});
+    try expectRuntime(state, "in close", raising.close(state));
+    try testing.expectEqual(.dead, raising.status(state));
+    try raising.close(state);
+
+    // A coroutine that died with an error gives it again, with its kind.
+    const bad = try state.newCoroutine(try state.doString(lua.Function, "return function() error('bad', 0) end", .{}));
+    try expectRuntime(state, "bad", bad.@"resume"(state, void, .{}));
+    try testing.expectEqual(.dead, bad.status(state));
+    try expectRuntime(state, "bad", bad.close(state));
+    const oom = try state.newCoroutine(failAllocation);
+    try testing.expectError(error.OutOfMemory, oom.@"resume"(state, void, .{}));
+    try testing.expectError(error.OutOfMemory, oom.close(state));
+    try testing.expectEqualStrings("not enough memory", state.errorMessage());
+    // Raised by Lua, the same message is an ordinary error.
+    const said_body = "return function() error('not enough memory', 0) end";
+    const said = try state.newCoroutine(try state.doString(lua.Function, said_body, .{}));
+    try expectRuntime(state, "not enough memory", said.@"resume"(state, void, .{}));
+    try expectRuntime(state, "not enough memory", said.close(state));
+}

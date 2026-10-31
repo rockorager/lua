@@ -187,6 +187,17 @@ only as its return, which is `lua_yield` without `lua_yieldk`. Full
 continuations would need the wrapper to rebuild the Zig function's state
 from the stack; out of scope.
 
+`Coroutine.status` is `coroutine.status` (`lib.coroutine.coStatus`,
+re-exported as `Coroutine.Status`). `Coroutine.close` is
+`coroutine.close` for a suspended or dead coroutine: it anchors the
+coroutine on the caller's stack while `__close` handlers run, and moves
+the error to `th.err`, `.memory` mapping to `error.OutOfMemory` (the
+kind comes from `Thread.died`). A running or normal coroutine is
+refused with lcorolib's "cannot close a %s coroutine"; closing the
+coroutine that runs the Zig function, which `coroutine.close` does by
+unwinding to the resume (`vm.closeSelf`), would need the Zig function to
+return that unwinding, so the API leaves it to Lua.
+
 ## Unknown keys
 
 `DecodeOptions.unknown_keys = .reject` scans a struct's table after its
@@ -307,6 +318,3 @@ standalone `lua` on the API against the one on the engine.
   config-heavy hosts. Skipped in wave 5: decode's cost does not justify it
   yet.
 - Zig functions that yield in the middle (continuations).
-- A `Coroutine.close` (`coroutine.close`) and a status query, if hosts want
-  them; a coroutine that died with pending to-be-closed variables keeps
-  them until Lua code calls `coroutine.close` on it.

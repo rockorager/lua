@@ -241,6 +241,8 @@ while (true) switch (try gen.@"resume"(state, ?i64, .{})) {
 
 `resume` is a Zig keyword, hence `@"resume"`. The arguments go to the body on the first resume, and come back from `coroutine.yield` after that. An error inside the coroutine ends it and returns `error.Runtime`, with `errorTraceback` showing the coroutine's stack; resuming a dead coroutine fails the same way. A `lua.Coroutine` is borrowed like any value, and converts to and from Lua's threads.
 
+`co.status(state)` says what the coroutine is doing, with `coroutine.status`'s names: `.suspended` (not started, or in a yield), `.running` (it is the caller), `.normal` (it resumed the caller), or `.dead`. `co.close(state)` closes a suspended or dead coroutine, as `coroutine.close` does: its pending to-be-closed variables are closed, and it is dead. An error from a `__close` handler, or the error the coroutine died with, comes back as `error.Runtime` with `errorMessage` set (`error.OutOfMemory` if it died because an allocation failed). Closing a running or normal coroutine raises "cannot close a running coroutine" or "cannot close a normal coroutine".
+
 A Zig function yields by returning `state.yield(values)`, with a tuple or `lua.Values`, from a function that returns an error union. When the coroutine is resumed, the function returns the values the resume passed:
 
 ```zig
