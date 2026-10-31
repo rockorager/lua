@@ -13,6 +13,16 @@ const builtin = @import("builtin");
 const lua = @import("lua");
 const build_options = @import("build_options");
 
+/// Release builds keep neither Zig's segfault handler nor the 256 KiB
+/// thread-local signal stack it runs on, which was a sixth of `lua -e ''`'s
+/// peak memory: the native stack's limit raises "C stack overflow" before
+/// it runs out (`docs/slop/results/stack-20261031.md`). Debug keeps both,
+/// for stack traces.
+pub const std_options: std.Options = if (builtin.mode == .Debug) .{} else .{
+    .enable_segfault_handler = false,
+    .signal_stack_size = null,
+};
+
 const copyright = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio";
 
 /// The most slots a Lua stack holds, the engine's `LUAI_MAXSTACK`: past
