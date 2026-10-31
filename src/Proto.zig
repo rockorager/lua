@@ -12,6 +12,7 @@ const std = @import("std");
 const gc = @import("gc.zig");
 const Value = @import("Value.zig");
 const String = @import("String.zig");
+const opcodes = @import("opcodes.zig");
 
 header: gc.Header,
 gclist: ?*gc.Header = null,
@@ -19,6 +20,10 @@ gclist: ?*gc.Header = null,
 code: []u32 = &.{},
 /// The constants: nil, booleans, numbers, and strings.
 k: []Value = &.{},
+/// For each constant, the hash node where `GETTABUP` or `SETTABUP` last
+/// found it: the inline cache for global access. Empty when the code has
+/// neither.
+kslot: []u32 = &.{},
 /// Prototypes of the functions defined inside this one, for `CLOSURE`.
 p: []*Proto = &.{},
 upvalues: []UpvalDesc = &.{},
@@ -79,6 +84,7 @@ pub fn destroy(heap: *gc.Heap, p: *Proto) void {
     const a = heap.allocator();
     a.free(p.code);
     a.free(p.k);
+    a.free(p.kslot);
     a.free(p.p);
     a.free(p.upvalues);
     a.free(p.lineinfo);
@@ -88,8 +94,22 @@ pub fn destroy(heap: *gc.Heap, p: *Proto) void {
 
 /// The bytes the prototype holds, for the collector's pacing.
 pub fn byteSize(p: *const Proto) usize {
-    return @sizeOf(Proto) + p.code.len * @sizeOf(u32) + p.k.len * @sizeOf(Value) + p.p.len * @sizeOf(*Proto) +
-        p.upvalues.len * @sizeOf(UpvalDesc) + p.lineinfo.len * @sizeOf(u32) + p.locvars.len * @sizeOf(LocVar);
+    return @sizeOf(Proto) + p.code.len * @sizeOf(u32) + p.k.len * @sizeOf(Value) + p.kslot.len * @sizeOf(u32) +
+        p.p.len * @sizeOf(*Proto) + p.upvalues.len * @sizeOf(UpvalDesc) + p.lineinfo.len * @sizeOf(u32) +
+        p.locvars.len * @sizeOf(LocVar);
+}
+
+/// Allocates `kslot` when the code reads or writes a global (`GETTABUP`,
+/// `SETTABUP`); call once `code` and `k` are final.
+pub fn initSlots(p: *Proto, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    for (p.code) |i| {
+        const o: u7 = @truncate(i);
+        if (o == @intFromEnum(opcodes.OpCode.gettabup) or o == @intFromEnum(opcodes.OpCode.settabup)) {
+            p.kslot = try gpa.alloc(u32, p.k.len);
+            @memset(p.kslot, 0);
+            return;
+        }
+    }
 }
 
 /// The source line of the instruction at `pc`, or null without line info.

@@ -981,7 +981,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const key = k[getC(i)];
                 if (t.tag == .table) {
                     const h = t.asTable();
-                    const v = h.getShortStr(key.asString());
+                    const v = h.getShortStrCached(key.asString(), &cl.proto.kslot[getC(i)]);
                     if (!v.isNil() or th.state.fastTm(h.metatable, .index) == null) {
                         setv(&base[getA(i)], v);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1099,7 +1099,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
                 if (t.tag == .table) {
                     const h = t.asTable();
-                    if (h.replaceShortStr(th.heap(), key.asString(), vp.*))
+                    if (h.replaceShortStrCached(th.heap(), key.asString(), &cl.proto.kslot[getB(i)], vp.*))
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     if (h.metatable == null) {
                         try setShortStrAt(th, h, key.asString(), vp);
@@ -2730,6 +2730,7 @@ fn makeProto(state: *State, s: ProtoSpec) !*Proto {
     p.numparams = s.numparams;
     p.flags.vararg = s.vararg;
     p.maxstacksize = s.maxstack;
+    try p.initSlots(a);
     return p;
 }
 

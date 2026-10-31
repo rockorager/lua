@@ -175,6 +175,8 @@ const Loader = struct {
             };
         }
 
+        try f.initSlots(gpa);
+
         const nup = try s.int();
         try s.checkCount(nup, 3);
         f.upvalues = try gpa.alloc(Proto.UpvalDesc, nup);

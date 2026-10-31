@@ -699,6 +699,7 @@ fn closeFunc(ls: *Parser) Error!void {
     f.code = try fs.insts.toOwnedSlice(gpa);
     f.lineinfo = try fs.lines.toOwnedSlice(gpa);
     f.k = try fs.ks.toOwnedSlice(gpa);
+    try f.initSlots(gpa);
     f.p = try fs.protos.toOwnedSlice(gpa);
     f.locvars = try fs.locvars.toOwnedSlice(gpa);
     f.upvalues = try fs.upvals.toOwnedSlice(gpa);

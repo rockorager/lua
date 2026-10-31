@@ -251,6 +251,32 @@ pub inline fn getShortStr(t: *const Table, s: *const String) Value {
     return if (t.getShortStrNode(s)) |n| n.value() else .nil;
 }
 
+/// `getShortStr` through an inline cache: `slot` holds the node where the
+/// key was last found, which is tried before hashing (`GETTABUP`).
+pub inline fn getShortStrCached(t: *const Table, s: *const String, slot: *u32) Value {
+    return if (t.cachedNode(s, slot)) |n| n.value() else .nil;
+}
+
+/// `replaceShortStr` through an inline cache, as `getShortStrCached`
+/// (`SETTABUP`).
+pub inline fn replaceShortStrCached(t: *Table, heap: *gc.Heap, s: *const String, slot: *u32, val: Value) bool {
+    const n = t.cachedNode(s, slot) orelse return false;
+    if (n.val_tag == .nil) return false;
+    t.writeNode(heap, n, val);
+    return true;
+}
+
+inline fn cachedNode(t: *const Table, s: *const String, slot: *u32) ?*Node {
+    const c = slot.*;
+    if (c <= t.mask()) {
+        const n = &t.node[c];
+        if (n.key_tag == .short_string and n.key.gc == &s.header) return n;
+    }
+    const n = t.getShortStrNode(s) orelse return null;
+    slot.* = @intCast(n - t.node);
+    return n;
+}
+
 fn getShortStrNode(t: *const Table, s: *const String) ?*Node {
     std.debug.assert(s.isShort());
     var i = s.hash & t.mask();
@@ -745,6 +771,36 @@ test "integer keys fill the array part and read back" {
     // Sequential keys end in the array part, not the hash part.
     try testing.expect(t.asize >= 1000);
     try testing.expectEqual(@as(u64, 1000), t.length());
+}
+
+test "the inline cache answers for its own key from any slot" {
+    var h: TestHeap = undefined;
+    try h.init();
+    defer h.deinit();
+    const t = try Table.create(&h.heap, 0, 0);
+    var name: [8]u8 = undefined;
+    for (0..100) |i| try t.set(&h.heap, h.str(try std.fmt.bufPrint(&name, "k{d}", .{i})), .int(@intCast(i)));
+    const x = h.str("k42").asString();
+    const absent = h.str("absent").asString();
+    // A slot naming another key's node, an empty node, or no node at all
+    // (as after the table shrank) must not answer for the key.
+    for (0..t.nodeCount() + 2) |c| {
+        var slot: u32 = @intCast(c);
+        try testing.expectEqual(@as(i64, 42), t.getShortStrCached(x, &slot).asInt());
+        try testing.expectEqual(@as(i64, 42), t.getShortStrCached(x, &slot).asInt());
+        slot = @intCast(c);
+        try testing.expect(t.getShortStrCached(absent, &slot).isNil());
+        try testing.expect(!t.replaceShortStrCached(&h.heap, absent, &slot, .int(7)));
+    }
+    try testing.expect(t.get(.string(absent)).isNil());
+    var slot: u32 = 0;
+    try testing.expect(t.replaceShortStrCached(&h.heap, x, &slot, .int(-1)));
+    try testing.expectEqual(@as(i64, -1), t.get(.string(x)).asInt());
+    // A key whose value became nil is absent: replacing it would skip
+    // `__newindex`.
+    try t.set(&h.heap, .string(x), .nil);
+    try testing.expect(!t.replaceShortStrCached(&h.heap, x, &slot, .int(1)));
+    try testing.expect(t.getShortStrCached(x, &slot).isNil());
 }
 
 test "string, float, boolean, and object keys" {
