@@ -73,11 +73,40 @@ const Loader = struct {
         _ = try s.block((alignment - s.pos % alignment) % alignment);
     }
 
-    /// Reads `n` items of at least `min_bytes` each later, so a count too
-    /// large for what is left is a truncated chunk before anything is
-    /// allocated for it.
-    fn checkCount(s: *Loader, n: usize, min_bytes: usize) Error!void {
-        if (n > (s.src.len - s.pos) / min_bytes) return s.fail("truncated chunk");
+    /// Whether what is left can hold `n` items of at least `min_bytes`
+    /// each. The reference allocates room for a count before it reads the
+    /// items; a count that fails this check gets only `probe`, so the
+    /// memory it touches stays bounded by the chunk, and then the error
+    /// the reference meets next: `overlongBytes` or `overlong`.
+    fn fits(s: *const Loader, n: u64, min_bytes: usize) bool {
+        return n <= (s.src.len - s.pos) / min_bytes;
+    }
+
+    /// Asks the allocator for the block the reference allocates for `n`
+    /// items of `item_size` bytes and gives it back untouched, so a count
+    /// no allocator can satisfy is "not enough memory" here too.
+    fn probe(s: *Loader, n: u64, item_size: usize) Error!void {
+        const len = std.math.mul(usize, std.math.cast(usize, n) orelse return error.OutOfMemory, item_size) catch
+            return error.OutOfMemory;
+        const a = s.th.heap().allocator();
+        const p = a.rawAlloc(len, .@"16", @returnAddress()) orelse return error.OutOfMemory;
+        a.rawFree(p[0..len], .@"16", @returnAddress());
+    }
+
+    /// A count of plain bytes or bytes-only items that `fits` refused:
+    /// what is left is too short for it.
+    fn overlongBytes(s: *Loader, n: u64, item_size: usize) Error {
+        try s.probe(n, item_size);
+        return s.fail("truncated chunk");
+    }
+
+    /// Reads and drops the items of a count that `fits` refused, with
+    /// `read`. Each takes at least the bytes `fits` assumed, so one of them
+    /// fails, with the error the reference gives for the same bytes
+    /// ("invalid constant", "integer overflow", ..., or a truncated chunk).
+    fn overlong(s: *Loader, n: u64, item_size: usize, comptime read: anytype) Error {
+        try s.probe(n, item_size);
+        while (true) _ = try read(s);
     }
 
     fn varint(s: *Loader, limit_in: u64) Error!u64 {
@@ -117,10 +146,36 @@ const Loader = struct {
             if (idx > s.saved.items.len) return s.fail("invalid string index");
             return s.saved.items[@intCast(idx - 1)];
         }
+        // The reference makes a long string before reading its bytes.
+        if (n - 1 > String.max_short_len and !s.fits(n, 1)) return s.overlongBytes(n, 1);
         const b = try s.block(@intCast(n));
         const str = try s.th.state.newString(b[0 .. b.len - 1]);
         try s.saved.append(s.th.heap().allocator(), str);
         return str;
+    }
+
+    fn constant(s: *Loader) Error!Value {
+        return switch (try s.byte()) {
+            dump.Tag.nil => .nil,
+            dump.Tag.false_ => .boolean(false),
+            dump.Tag.true_ => .boolean(true),
+            dump.Tag.float => .float(try s.native(f64)),
+            dump.Tag.int => .int(try s.integer()),
+            dump.Tag.short_string, dump.Tag.long_string => .string(try s.string() orelse
+                return s.fail("bad format for constant string")),
+            else => s.fail("invalid constant"),
+        };
+    }
+
+    fn locVar(s: *Loader) Error!Proto.LocVar {
+        const name = try s.string();
+        const startpc = try s.int();
+        return .{ .name = name, .startpc = startpc, .endpc = try s.int() };
+    }
+
+    /// A nested function outside any array, which the heap holds.
+    fn newFunction(s: *Loader) Error!void {
+        try s.function(try Proto.create(s.th.heap()));
     }
 
     fn checkLiteral(s: *Loader, lit: []const u8, why: []const u8) Error!void {
@@ -156,7 +211,7 @@ const Loader = struct {
 
         const ncode = try s.int();
         try s.alignTo(@sizeOf(u32));
-        try s.checkCount(ncode, @sizeOf(u32));
+        if (!s.fits(ncode, @sizeOf(u32))) return s.overlongBytes(ncode, @sizeOf(u32));
         const code_bytes = try s.block(ncode * @sizeOf(u32));
         f.code = try gpa.alloc(u32, ncode);
         @memcpy(std.mem.sliceAsBytes(f.code), code_bytes);
@@ -167,26 +222,15 @@ const Loader = struct {
         }
 
         const nk = try s.int();
-        try s.checkCount(nk, 1);
+        if (!s.fits(nk, 1)) return s.overlong(nk, @sizeOf(Value), constant);
         f.k = try gpa.alloc(Value, nk);
         @memset(f.k, .nil);
-        for (f.k) |*k| {
-            k.* = switch (try s.byte()) {
-                dump.Tag.nil => .nil,
-                dump.Tag.false_ => .boolean(false),
-                dump.Tag.true_ => .boolean(true),
-                dump.Tag.float => .float(try s.native(f64)),
-                dump.Tag.int => .int(try s.integer()),
-                dump.Tag.short_string, dump.Tag.long_string => .string(try s.string() orelse
-                    return s.fail("bad format for constant string")),
-                else => return s.fail("invalid constant"),
-            };
-        }
+        for (f.k) |*k| k.* = try s.constant();
 
         try f.initSlots(gpa);
 
         const nup = try s.int();
-        try s.checkCount(nup, 3);
+        if (!s.fits(nup, 3)) return s.overlongBytes(nup, @sizeOf(Proto.UpvalDesc));
         f.upvalues = try gpa.alloc(Proto.UpvalDesc, nup);
         @memset(f.upvalues, .{ .instack = false, .idx = 0 });
         for (f.upvalues) |*u| {
@@ -195,7 +239,7 @@ const Loader = struct {
         }
 
         const np = try s.int();
-        try s.checkCount(np, 1);
+        if (!s.fits(np, 1)) return s.overlong(np, @sizeOf(*Proto), newFunction);
         const protos = try gpa.alloc(*Proto, np);
         var made: usize = 0;
         errdefer if (made < np) gpa.free(protos);
@@ -210,26 +254,23 @@ const Loader = struct {
     fn debug(s: *Loader, f: *Proto) Error!void {
         const gpa = s.th.heap().allocator();
         const nlines = try s.int();
+        if (!s.fits(nlines, 1)) return s.overlongBytes(nlines, 1);
         const rel: []const i8 = @ptrCast(try s.block(nlines));
         f.lineinfo = try gpa.dupe(i8, rel);
         const nabs = try s.int();
         if (nabs > 0) {
             try s.alignTo(@sizeOf(i32));
-            try s.checkCount(nabs, @sizeOf(Proto.AbsLineInfo));
+            if (!s.fits(nabs, @sizeOf(Proto.AbsLineInfo))) return s.overlongBytes(nabs, @sizeOf(Proto.AbsLineInfo));
             const abs = try s.block(nabs * @sizeOf(Proto.AbsLineInfo));
             f.abslineinfo = try gpa.alloc(Proto.AbsLineInfo, nabs);
             @memcpy(std.mem.sliceAsBytes(f.abslineinfo), abs);
         }
 
         const nloc = try s.int();
-        try s.checkCount(nloc, 3);
+        if (!s.fits(nloc, 3)) return s.overlong(nloc, @sizeOf(Proto.LocVar), locVar);
         f.locvars = try gpa.alloc(Proto.LocVar, nloc);
         @memset(f.locvars, .{ .name = null, .startpc = 0, .endpc = 0 });
-        for (f.locvars) |*lv| {
-            lv.name = try s.string();
-            lv.startpc = try s.int();
-            lv.endpc = try s.int();
-        }
+        for (f.locvars) |*lv| lv.* = try s.locVar();
 
         // Upvalue names come all or none.
         if (try s.int() != 0) {
@@ -306,6 +347,14 @@ test "bad chunks raise the reference's messages and never crash" {
         var buf: [64]u8 = undefined;
         try expectFailure(th, &bad, try std.fmt.bufPrint(&buf, "c: bad binary format ({s})", .{h.msg}));
     }
+    // A count the bytes left cannot hold fails on its first bad item, as
+    // the reference reads the items before running out: the header, then
+    // a function with no code (one byte of padding) and 100 constants.
+    const head = chunk[0..41].* ++ [_]u8{ 0, 0, 0, 0, 2, 0, 0, 100 };
+    try expectFailure(th, &(head ++ [_]u8{ dump.Tag.nil, 0x55 }), "c: bad binary format (invalid constant)");
+    const bad_index = head ++ [_]u8{ dump.Tag.short_string, 0, 1 };
+    try expectFailure(th, &bad_index, "c: bad binary format (invalid string index)");
+    try expectFailure(th, &(head ++ [_]u8{ dump.Tag.nil, dump.Tag.true_ }), "c: bad binary format (truncated chunk)");
     // An opcode outside the set, in the main function or a nested one,
     // with the rest of the instruction intact. 84 (EXTRAARG) is the last
     // valid one.

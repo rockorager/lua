@@ -14,10 +14,11 @@
 //!   run grammar  generated programs, compiled and run with the safe
 //!                libraries; with --gc-stress, under collector stress.
 //!   run binary   corrupted `string.dump` output through `load(..., "b")`:
-//!                the loader must refuse it or load it. A crash or hang
-//!                while running a chunk that loaded is the known limit
-//!                (the loader checks opcodes, not the code), and is
-//!                written to `known/` instead.
+//!                the loader must refuse it or load it ("not enough
+//!                memory" for a count past the cap, holding nothing).
+//!                A crash or hang while running a chunk that loaded is
+//!                the known limit (the loader checks opcodes, not the
+//!                code), and is written to `known/` instead.
 //!   run oom      every program in `oom_programs` and the API scenario,
 //!                with the Nth allocation failing, for every N, once
 //!                (later allocations succeed) and from then on: the error
@@ -358,7 +359,11 @@ fn runBinary(ctx: *Ctx, input: []const u8) Outcome {
                     std.mem.startsWith(u8, msg, "attempt to load a text chunk")) break :blk .ok;
                 break :blk .{ .wrong = std.fmt.allocPrint(gpa, "unexpected load error: {s}", .{msg}) catch "unexpected load error" };
             },
-            error.OutOfMemory => break :blk .{ .memory = counting.peak },
+            // The loader asks for the block a count needs, as the
+            // reference does, but fills only what the chunk holds: a
+            // refused block is "not enough memory" there too, and only
+            // memory still held after the failure is a finding.
+            error.OutOfMemory => break :blk if (counting.live > (64 << 20) + 256 * input.len) .{ .memory = counting.live } else .ok,
             error.Runtime => break :blk .{ .wrong = "load returned error.Runtime" },
         };
         // Line lookups on a loaded chunk stay in bounds whatever its

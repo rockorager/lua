@@ -65,3 +65,4 @@ All notable changes to lua are recorded here. The format follows
 - `setmetatable(t)` without a second argument raises "bad argument #2 to 'setmetatable' (nil or table expected, got no value)", as in the reference.
 - `#t` on a table with holes in its array part returns the border the reference returns.
 - A chunk name passed to `load` ends at its first zero byte, and the standalone `lua` prints an error message, and its traceback, only up to a zero byte, as the reference's C strings do.
+- `load` of a corrupted binary chunk fails with the reference's message where it differed: "invalid constant", "invalid string index", "integer overflow", "bad format for constant string", or "not enough memory" for a count the allocator refuses, instead of "bad binary format (truncated chunk)".

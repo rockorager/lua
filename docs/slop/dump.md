@@ -51,8 +51,16 @@ size mismatch` and the other size and format checks, `integer overflow`,
   `invalid string index`, `bad format for constant string`, and `invalid
 constant`. Bytes after the main function are ignored, as the reference
   reads no further.
-- A count larger than the bytes left could hold fails as a truncated chunk
-  before anything is allocated for it.
+- The checks come in the reference's order: a count is allocated for,
+  then its items are read, and a long string is made before its bytes.
+  A count larger than the bytes left could hold is not allocated for:
+  the loader asks the allocator for the block the reference would and
+  frees it untouched ("not enough memory" when it is refused), then
+  reads the items without keeping them, so the first bad item gives the
+  reference's message ("invalid constant", "invalid string index",
+  "integer overflow", "bad format for constant string") and the end of
+  the chunk "truncated chunk". The memory a chunk makes the loader touch
+  stays bounded by its size (`undump.zig`'s `fits`, `probe`, `overlong`).
 - The closure is `vm.mainClosure`'s, as `lua_load` builds it: every upvalue
   a fresh nil, then the first set to the globals table (or `load`'s `env`),
   whatever its name.
