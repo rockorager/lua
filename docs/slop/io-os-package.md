@@ -54,6 +54,16 @@ goes through `std.Io` and `lib.base.Host`; there is no C and no libc.
   wrapping included). A `TZ` that fails to parse is UTC under its leading
   name, as glibc does.
 
+## In C-API builds
+
+`-Dc-api=true` builds open `capi/liolib.zig` in place of `lib/io.zig`:
+liolib.c ported to Zig on C's stdio, so file handles are lauxlib.h's
+`luaL_Stream` with a real `FILE *` that C modules share, and `print`,
+`io.stdout`, and C code write through one C `stdout`. `os` and `package`
+are the same files in both builds. The design is in `c-api.md` ("io
+handles are `luaL_Stream`"); `just capi-test` checks files.lua and
+`test/diff` on that build.
+
 ## Not covered
 
 - Closing files when the collector frees them: `__gc` is set, but the

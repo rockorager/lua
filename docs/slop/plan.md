@@ -192,8 +192,14 @@ reference.
     call per C function. The default build is unchanged; without the
     option `package.loadlib` and the C searchers keep the reference's
     "dynamic libraries not enabled" answer. Still to decide: full
-    coverage (hooks, `luaL_Stream`, `lua_newstate` for a `liblua.so`),
-    aarch64, and whether the C-API build becomes a release artifact.
+    coverage (hooks, `lua_newstate` for a `liblua.so`) and whether the
+    C-API build becomes a release artifact. Landed in wave 11: io
+    handles are `luaL_Stream` on C's stdio in C-API builds
+    (`capi/liolib.zig`, liolib.c ported; luafilesystem's `setmode` and
+    `lock` and luaposix's `fileno` and `fdopen` work), C libraries close
+    with the state in 5.5.1's order, and aarch64 Linux (`jmp.zig`'s
+    pair, `va.zig` for the `...` functions Zig refuses there), tested
+    under qemu-user (`c-api.md`, `results/c-api-io-20261031.md`).
     Landed: `src/api.zig`, exported at the
     module's root (`lua.State`, `lua.Value`, `lua.Ref`, ...), with the engine
     under `lua.internal` for the tools. `State` is an opaque
@@ -434,4 +440,18 @@ nesting level to 176). The default build's loop is byte for byte
 wave 9's. The comparison with the reference at the end of wave 10 is
 `results/bench-compare-wave10-20261031.md`.
 
-Next: full C API coverage (`c-api.md`'s missing list).
+Wave 11: full C API coverage, in two parts. The rest of the API and a
+`liblua` (`capi.zig`, `lauxlib.zig`, `loadlib.zig`) is another
+owner's. This part: io handles as `luaL_Stream` on C's stdio in C-API
+builds (`src/capi/liolib.zig`, `base.Host.cstdout`), `dlclose` with
+the state (`loadlib.closeLibs` from `State.destroy`), and aarch64
+(`src/capi/jmp.zig`, `src/capi/va.zig`, `just capi-test
+aarch64-linux-gnu` under qemu-user); owner of those files and of
+`test/capi/stream.c`, `handles.lua`, `lock.lua`, `posix.lua`,
+`unload.c`, `unload.lua`, with small edits to `lib/init.zig`,
+`lib/os.zig`, `lib/base.zig`, `api.zig`, `State.zig`, `Value.zig`, and
+the `...` functions of `capi.zig` and `lauxlib.zig`. The default
+build's loop is byte for byte wave 10's
+(`results/c-api-io-20261031.md`).
+
+Next: the rest of `c-api.md`'s missing list.

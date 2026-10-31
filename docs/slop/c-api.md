@@ -73,7 +73,9 @@ is the one proposed, with one change, the fused protected call:
 
 1. **The trampoline makes a protected call.** `jmp.call(regs, f, L, a1, a2)`
    (`src/capi/jmp.zig`, two naked functions) saves rbx, rbp, r12 to r15, the
-   stack pointer after its return, and its return address, then calls `f`.
+   stack pointer after its return, and its return address, then calls `f`
+   (on aarch64: x19 to x30, the stack pointer, and d8 to d15, under a frame
+   record; see "aarch64" below).
    `jmp.jump(regs)` restores them and returns from that same call with
    `aborted` (~0, which a C `int` zero-extended can never be). The trampoline
    keeps a thread-local chain of these (`current`), innermost first.
@@ -171,6 +173,162 @@ with addresses masked (identical):
   every `lua_*` call pay for it. Per C function, a C function that raises
   nothing pays once.
 
+## io handles are `luaL_Stream`
+
+lauxlib.h promises C modules that a file handle is a full userdata with
+the "FILE*" metatable whose first bytes are `luaL_Stream { FILE *f;
+lua_CFunction closef; }`, `closef` null once closed. Modules rely on it
+both ways: luafilesystem's `setmode` and `lock` and luaposix's `fileno`
+read `f` from a handle Lua opened; luaposix's `fdopen` makes a handle with
+its own `FILE *` and close function and gives it to Lua to read, write,
+and close. The default build's io (`lib/io.zig`) has no libc and emulates
+glibc's stdio in Zig, with a 4 KiB buffer in each handle, so there is no
+`FILE *` to give.
+
+A C-API build links libc anyway, so there `lib/init.zig` opens
+`capi/liolib.zig` instead: liolib.c ported function by function to Zig,
+on C's stdio and the C API. Its functions are C functions (`callconv(.c)`,
+run through the trampoline), and call the API by its C names (`extern fn
+lua_getfield`, `luaL_checkudata`, ...), as liolib.c does, so they may use
+the API functions that raise and `luaL_fileresult` is the one module see.
+What follows from being the reference's code on the reference's libc:
+
+- Every behavior is the reference's by construction: buffering modes,
+  read/write switching, `read("n")`'s numeral scan with `ungetc`, `popen`
+  (with `fflush(NULL)` first) and `pclose`'s status, `tmpfile`, `seek` with
+  `fseeko`/`ftello`, errors with errno and glibc's `strerror`. The default
+  build's divergences (`io.stdout:seek` on a shared descriptor, `read(n)`
+  with a huge `n`) are gone in this build.
+- `aux_close` calls the handle's `closef` directly, whoever set it: a
+  module's close function runs inside io's protected call and may raise.
+- Standard output is one C stream for everyone. `base.Host` gains
+  `cstdout`: C's `stdout`, or with `Options.stdout` a `fopencookie` stream
+  over the embedder's writer (its write function writes and flushes the
+  writer, as the default build's `io.stdout` flushes it; seeking fails
+  with ESPIPE, "Illegal seek", as there). `print`, `io.stdout`, `lua`'s
+  own output (`Host.stdout` is a writer with no buffer that `fwrite`s to
+  it), and C modules writing to `stdout` all go through its one buffer, so
+  their output stays in order. `State.stdout()` with an embedder's writer
+  flushes the C stream into it first. `stdin` and `stderr` are C's.
+- `luaL_execresult` is not exported yet; `liolib.execResult` is
+  lauxlib.c's, for `pclose`. The C API's must equal it.
+- `read_line` reads with glibc's `getc_unlocked` macro inlined (the
+  stream's read pointer, `__uflow` at the end of the buffer), as liolib.c
+  compiles on glibc; other libcs call the function.
+- One departure from liolib.c: `read("a")` on a regular file first sizes
+  its buffer to what is left of the file (`statx`, or `fstat` off Linux).
+  lauxlib's box grows by copying into a new userdata, which the collector
+  frees later, where the reference's `realloc`s in place (glibc `mremap`s
+  large blocks); without the hint reading 20.6 MB whole took 3.1× the
+  reference's time and 1.7× its memory, with it 1.5× and the same memory.
+  A box that reallocates in place would make the hint unnecessary.
+- `lib/io.zig`'s tests run on this io in a C-API build (they only run Lua
+  chunks), and `just capi-test` runs `files.lua` and every `test/diff`
+  case on the C-API `lua` against the reference.
+
+`os` stays `lib/os.zig` in both builds: it opens no files, and its
+`execute` and `exit` reach io only through `lib.io.flushAll`.
+
+Proofs (`just capi-test`, same output as the reference with the same
+`.so`): luafilesystem's own tests whole (its setmode block was cut
+before), `lock.lua` (lock, unlock, ranges, closed and bad-mode errors),
+`stream.c` with `handles.lua` (Lua and C writing and reading one `FILE`
+in order, `fileno` of the standard files, module-made handles closed by
+`close`, the collector, `<close>`, and a raising close function, `io.output`
+and `io.input` on them, every open mode, `popen`, `tmpfile`), and
+luaposix 37's `posix.stdio` (its spec's cases without specl, `fileno`
+with `posix.unistd.write`, `fdopen` over a dup of stdout, an `O_EXCL` file
+and a pipe, `rename`).
+
+## C libraries close with the state
+
+`package.loadlib` and the C searchers keep each library's handle in the
+registry's `_CLIBS`, by path as before and now also at `#_CLIBS + 1`, as
+5.4's loadlib.c did. `State.destroy` calls `capi/loadlib.closeLibs` after
+`vm.closeState` (to-be-closed variables and every finalizer) and before
+any object is freed: it `dlclose`s from the last opened to the first.
+That is 5.5.1's order: it ties each library to an external string whose
+deallocation closes it, so `lua_close` closes libraries after every
+finalizer, newest first, while freeing objects. Here external strings are
+copied (`lua_pushexternalstring` gives the bytes back at once), so no
+object can point into a library's memory and closing before the objects
+are freed is the same. `_CLIBS[i]` holds a light userdata where 5.5.1 has
+a library string. `os.exit(code, true)` runs finalizers but leaves the
+libraries to the process's exit, which closes them anyway.
+
+`unload.c`, built as two libraries, checks it: their userdata's `__gc`
+(module code) prints first, then each library's destructor reports whether
+the other is still mapped: "unload 2: still loaded", then "unload 1:
+gone", as on the reference. Before this change the destructors ran at
+exit with both still mapped.
+
+## aarch64
+
+`jmp.zig` has an aarch64 pair beside the x86-64 one, for AAPCS64 (Linux)
+and Apple's arm64 ABI, which agree on everything it touches. `call`
+stores x19 to x28, x29 and x30, the stack pointer at entry, and d8 to d15
+(AAPCS64 has the callee keep the low 64 bits of v8 to v15, which x86-64
+System V has no counterpart for), pushes a frame record and sets x29 (Apple
+requires x29 to address a valid frame record at every call; unwinders
+follow it), calls `f`, and zero-extends its `int` (`mov w0, w0`). `jump`
+reloads them, sets the stack pointer, and `ret`s to x30 with x0 = ~0. x18,
+Apple's platform register, is never touched; it is not callee-saved on
+Linux either. No BTI landing pad: Zig does not mark its objects for BTI,
+so no page is guarded.
+
+A test in `jmp.zig` loads 100 + n into every callee-saved register, makes
+a protected call to a function that overwrites them all and jumps, and
+checks each came back (on x86-64 too). Dropping one restore fails it.
+
+The rest of the API needed two changes for aarch64:
+
+- Function pointers have 4-byte alignment there, so `@ptrCast` from
+  `*anyopaque` to a function pointer needs `@alignCast` (`Value.asNative`,
+  `capi.cfunction`, `loadlib`); on x86-64 it compiles to nothing, and the
+  default build's interpreter loop is byte for byte the same.
+- Zig 0.16 refuses `@cVaStart`, `@cVaArg`, and `std.builtin.VaList` on
+  aarch64 Linux with LLVM ("disabled due to miscompilations"), which
+  `lua_pushfstring`, `lua_pushvfstring`, and `luaL_error` used.
+  `capi/va.zig` is AAPCS64's `va_list` there: `va.Entry(target)` is a
+  naked entry that saves x0 to x7 and q0 to q7, builds the list
+  (`__stack`, `__gr_top`, `__vr_top`, `__gr_offs` = -48 after two named
+  arguments, `__vr_offs` = -128) and calls `target(L, fmt, &list)`;
+  `va.arg` reads it as `va_arg` does. Elsewhere `va.List` is
+  `std.builtin.VaList` and `va.arg` is `@cVaArg`, so x86-64 compiles as
+  before. `lua_gc` declares `...` without reading it, which compiles; when
+  it reads its arguments (`LUA_GCINC`, `LUA_GCGEN`) it needs the same.
+
+Tested on aarch64 Linux under qemu-user from the flake's nixpkgs:
+`just capi-test aarch64-linux-gnu` cross-builds `lua` and every module
+with `zig cc -target aarch64-linux-gnu` and runs both interpreters under
+qemu, the reference being nixpkgs' aarch64 build; all 28 comparisons
+match. io_os takes the native reference as its oracle there: under qemu
+glibc's `system()` leaves errno at ENOSYS from a `clone3` qemu refuses,
+which the reference's `luaL_execresult` reports for a failing command.
+`zig build test -Dc-api=true -Dtarget=aarch64-linux-gnu -fqemu
+--libc-runtimes DIR` (DIR/aarch64-linux-gnu/lib holding nixpkgs'
+aarch64 glibc) passes everything C-API: the register test, allocation
+failure under C calls, the io tests on liolib, the API's stdout test. Three
+tests fail on aarch64 in every build, the default one included: they
+expect x86-64's "-nan" for a NaN from 0/0 or `math.fmod`, where aarch64
+gives a positive NaN, as the reference does there.
+
+What macOS (arm64 and x86-64) still needs, untested here:
+
+- `jmp.zig` and `va.zig` should be right as written (Apple passes
+  variable arguments on the stack and `va_list` is a pointer, which Zig's
+  own `@cVaStart` handles; `va.native` is true there). Run the register
+  test and `capitest.c` on hardware.
+- `fopencookie` is glibc's; macOS has `funopen`, which `Host.setStdout`
+  would use with the same write and seek functions. `liolib.zig`'s
+  `__uflow` fast path is glibc-only already; `stdin`, `stdout`, and
+  `stderr` are `__stdinp`, `__stdoutp`, `__stderrp` there (done).
+- Linking: `lua` exports its symbols with `-rdynamic` (fine with Mach-O's
+  `-export_dynamic`), and modules link with `-undefined dynamic_lookup`
+  (`-bundle`) instead of `-shared`; `capi-test` would need that flag.
+- `dlopen` and `dlclose` exist; `libm.so.6` in loadlib's retry would be
+  `libm.dylib` (libSystem has it already, so the retry never triggers).
+
 ## Coverage
 
 `lua.h` and `lauxlib.h` declare 156 functions; 128 are implemented. Enough for
@@ -191,17 +349,16 @@ Missing, and what each needs:
   `lua_upvalueid`, `lua_upvaluejoin`: over the debug library's internals.
 - `lua_toclose`, `lua_closeslot`: over the VM's to-be-closed list.
 - `lua_dump`: over `dump.zig` with a `lua_Writer`.
-- `lua_setwarnf`, `luaL_execresult`.
-- `luaL_Stream`: io's files are not a `FILE *` behind `luaL_Stream`, so a
-  module that reads `LUA_FILEHANDLE` userdata as `luaL_Stream` (lfs's
-  `setmode`, luaposix, luasocket's file handles) does not work. Making io's
-  files `luaL_Stream` in C-API builds means io on libc stdio there.
+- `lua_setwarnf`, `luaL_execresult` (io uses `liolib.execResult`, which
+  the export should be).
+- `luaL_Stream`: done in wave 11, "io handles are `luaL_Stream`" above.
 - `lua_newthread` zeroes the new thread's extra space; 5.5.1 copies the
   main thread's.
 - `lua_gc` covers stop, restart, collect, count, countb, step, isrunning;
   not the mode switches and parameters.
-- x86-64 System V only (`jmp.zig`); aarch64 needs its own 20-line pair.
-- Libraries are never `dlclose`d (the reference closes them with the state).
+- x86-64 System V and aarch64 Linux (wave 11, "aarch64" above); macOS
+  untested.
+- Libraries close with the state since wave 11.
 
 Full coverage is roughly the size of the prototype again: most missing
 functions are thin, the hooks and `luaL_Stream` are the real work, and every
