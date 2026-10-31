@@ -1,7 +1,9 @@
 //! Loading a precompiled chunk, reference Lua 5.5.1's lundump.c: the format
 //! `dump.zig` and `luac` write, with the reference's checks and its
 //! messages ("name: bad binary format (truncated chunk)", "version
-//! mismatch", ...). Like the reference, it does not verify the bytecode.
+//! mismatch", ...). Like the reference, it does not verify the bytecode's
+//! operands; unlike it, it rejects an instruction whose opcode is not one
+//! of the set ("invalid opcode"), so the interpreter never dispatches one.
 //!
 //! Line information comes in as luac's relative bytes and absolute entries
 //! and is expanded to `Proto.lineinfo`'s one absolute line per instruction,
@@ -13,6 +15,7 @@ const String = @import("String.zig");
 const Value = @import("Value.zig");
 const Thread = @import("Thread.zig");
 const dump = @import("dump.zig");
+const opcodes = @import("opcodes.zig");
 
 const Error = Value.Error;
 
@@ -157,6 +160,11 @@ const Loader = struct {
         const code_bytes = try s.block(ncode * @sizeOf(u32));
         f.code = try gpa.alloc(u32, ncode);
         @memcpy(std.mem.sliceAsBytes(f.code), code_bytes);
+        // The interpreter's dispatch trusts every opcode, so a chunk with
+        // one outside the set fails here instead of running into it.
+        for (f.code) |i| {
+            if (@as(u7, @truncate(i)) >= opcodes.props.len) return s.fail("invalid opcode");
+        }
 
         const nk = try s.int();
         try s.checkCount(nk, 1);
@@ -306,6 +314,21 @@ test "bad chunks raise the reference's messages and never crash" {
         bad[h.at] = h.byte;
         var buf: [64]u8 = undefined;
         try expectFailure(th, &bad, try std.fmt.bufPrint(&buf, "c: bad binary format ({s})", .{h.msg}));
+    }
+    // An opcode outside the set, in the main function or a nested one,
+    // with the rest of the instruction intact. 84 (EXTRAARG) is the last
+    // valid one.
+    const golden = try undump(th, &chunk, "=c");
+    for ([_]*const Proto{ golden, golden.p[0] }) |f| {
+        const at = std.mem.find(u8, &chunk, std.mem.asBytes(&f.code[0])).?;
+        for ([_]u7{ 85, 127 }) |o| {
+            var bad = chunk;
+            bad[at] = (bad[at] & 0x80) | o;
+            try expectFailure(th, &bad, "c: bad binary format (invalid opcode)");
+        }
+        var ok = chunk;
+        ok[at] = (ok[at] & 0x80) | 84;
+        _ = try undump(th, &ok, "=c");
     }
     // Any single corrupted byte loads or fails cleanly, and whatever loads
     // dumps again.

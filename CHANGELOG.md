@@ -30,3 +30,7 @@ All notable changes to lua are recorded here. The format follows
 - `table.concat`, `string.format`, `gsub`, and the other functions that build strings in an `auxlib.Buffer` no longer copy a long result into a new string, and grow their buffer by half instead of doubling, halving table_concat's peak memory.
 - Reading and writing a global variable (a field of `_ENV` with a constant name) goes through a per-function cache of where the name sits in the table, so code written with globals runs faster (bench/globals.lua 9% faster).
 - `auxlib.Buffer` is declared `var b: auxlib.Buffer = .init(state)` instead of `undefined` followed by `b.init(state)`, so ReleaseSafe builds no longer clear 1 KiB on every `string.format`, `table.concat`, `gsub`, `string.pack`, or `string.dump` call (format 21–28% faster in ReleaseSafe).
+
+### Fixed
+
+- `load` of a binary chunk with an instruction whose opcode is not one of Lua 5.5.1's fails with "bad binary format (invalid opcode)" instead of loading a function that crashes when called.
