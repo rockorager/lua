@@ -37,7 +37,9 @@ pub fn checkStack(th: *Thread, n: usize, comptime msg: []const u8) Error!void {
 
 /// A native's arguments, `stack[base..top]`, and the name its messages use
 /// when neither the call site nor the loaded modules name the function.
-/// Argument numbers are Lua's, from 1.
+/// Argument numbers are Lua's, from 1. The checks that do not inline take
+/// `*const Args`: by value, each call site copied the 40 bytes to a stack
+/// slot of its own in the native's frame (`results/stack-20261031.md`).
 pub const Args = struct {
     th: *Thread,
     base: u32,
@@ -60,10 +62,15 @@ pub const Args = struct {
         return a.base + n - 1;
     }
 
-    /// Argument `n`, or nil when it is absent.
+    /// Argument `n`, or nil when it is absent. One return of a variable:
+    /// an `if` choosing between two values makes LLVM choose between
+    /// their addresses, which keeps both in stack slots of the caller
+    /// (`results/stack-20261031.md`).
     pub inline fn get(a: Args, n: u32) Value {
         const i = a.slot(n);
-        return if (i < a.top) a.th.stack[i] else .nil;
+        var v: Value = .nil;
+        if (i < a.top) v = a.th.stack[i];
+        return v;
     }
 
     pub inline fn isNone(a: Args, n: u32) bool {
@@ -75,25 +82,27 @@ pub const Args = struct {
     }
 
     /// `luaL_argerror`: "bad argument #n to 'name' (msg)".
-    pub fn argError(a: Args, n: u32, comptime fmt: []const u8, args: anytype) Error {
+    pub noinline fn argError(a: *const Args, n: u32, comptime fmt: []const u8, args: anytype) Error {
+        @branchHint(.cold);
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
         return debuginfo.argError(a.th, n, a.name, msg);
     }
 
     /// `luaL_typeerror`: "bad argument #n to 'name' (T expected, got U)".
-    pub fn typeError(a: Args, n: u32, expected: []const u8) Error {
+    pub noinline fn typeError(a: *const Args, n: u32, expected: []const u8) Error {
+        @branchHint(.cold);
         const got = if (a.isNone(n)) "no value" else typeName(a.th.state, a.get(n));
         return a.argError(n, "{s} expected, got {s}", .{ expected, got });
     }
 
     /// `luaL_checkany`.
-    pub fn checkAny(a: Args, n: u32) Error!void {
+    pub fn checkAny(a: *const Args, n: u32) Error!void {
         if (a.isNone(n)) return a.argError(n, "value expected", .{});
     }
 
     /// `luaL_checkinteger`.
-    pub fn checkInteger(a: Args, n: u32) Error!i64 {
+    pub fn checkInteger(a: *const Args, n: u32) Error!i64 {
         const v = a.get(n);
         if (v.tag == .int) return v.payload.int;
         if (toInteger(v)) |i| return i;
@@ -102,25 +111,25 @@ pub const Args = struct {
     }
 
     /// `luaL_optinteger`.
-    pub fn optInteger(a: Args, n: u32, def: i64) Error!i64 {
+    pub fn optInteger(a: *const Args, n: u32, def: i64) Error!i64 {
         return if (a.isNoneOrNil(n)) def else a.checkInteger(n);
     }
 
     /// `luaL_checknumber`.
-    pub fn checkNumber(a: Args, n: u32) Error!f64 {
+    pub fn checkNumber(a: *const Args, n: u32) Error!f64 {
         const v = a.get(n);
         if (v.tag == .float) return v.payload.float;
         return toNumber(v) orelse a.typeError(n, "number");
     }
 
     /// `luaL_optnumber`.
-    pub fn optNumber(a: Args, n: u32, def: f64) Error!f64 {
+    pub fn optNumber(a: *const Args, n: u32, def: f64) Error!f64 {
         return if (a.isNoneOrNil(n)) def else a.checkNumber(n);
     }
 
     /// `luaL_checklstring`: a string argument, or a number converted to one
     /// in place, as `lua_tolstring` does.
-    pub fn checkString(a: Args, n: u32) Error!*String {
+    pub fn checkString(a: *const Args, n: u32) Error!*String {
         const v = a.get(n);
         if (v.isString()) return v.asString();
         if (v.isNumber()) {
@@ -132,12 +141,12 @@ pub const Args = struct {
     }
 
     /// `luaL_optlstring`.
-    pub fn optString(a: Args, n: u32, def: []const u8) Error![]const u8 {
+    pub fn optString(a: *const Args, n: u32, def: []const u8) Error![]const u8 {
         return if (a.isNoneOrNil(n)) def else (try a.checkString(n)).bytes();
     }
 
     /// `luaL_checktype(L, n, LUA_TTABLE)`.
-    pub fn checkTable(a: Args, n: u32) Error!*Table {
+    pub fn checkTable(a: *const Args, n: u32) Error!*Table {
         const v = a.get(n);
         if (v.tag != .table) return a.typeError(n, "table");
         return v.asTable();

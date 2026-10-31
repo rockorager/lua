@@ -24,13 +24,29 @@ pub const Name = struct {
 };
 
 /// Where a value an instruction failed on came from, for `varInfo`.
-pub const Origin = union(enum) {
-    none,
-    /// A stack slot; only slots among the running Lua frame's registers
-    /// get a name.
-    slot: u32,
-    /// An upvalue of the running Lua function.
-    upval: u32,
+/// Packed, so it passes in a register: as a tagged union it went by
+/// reference, and every call site in the interpreter loop kept a stack
+/// slot for it (`results/stack-20261031.md`).
+pub const Origin = packed struct(u64) {
+    kind: enum(u32) {
+        none,
+        /// A stack slot; only slots among the running Lua frame's
+        /// registers get a name.
+        slot,
+        /// An upvalue of the running Lua function.
+        upval,
+    },
+    index: u32,
+
+    pub const none: Origin = .{ .kind = .none, .index = 0 };
+
+    pub fn slot(i: u32) Origin {
+        return .{ .kind = .slot, .index = i };
+    }
+
+    pub fn upval(i: u32) Origin {
+        return .{ .kind = .upval, .index = i };
+    }
 };
 
 /// The name of local variable `n` (1-based, in declaration order among
@@ -60,11 +76,12 @@ pub fn varInfo(th: *Thread, origin: Origin, buf: []u8) []const u8 {
     const f = th.frame();
     if (!f.flags.lua) return "";
     const p = th.stack[f.func].asLuaClosure().proto;
-    const n: ?Name = switch (origin) {
+    const i = origin.index;
+    const n: ?Name = switch (origin.kind) {
         .none => null,
-        .upval => |i| .{ .kind = "upvalue", .name = upvalName(p, i) },
-        .slot => |s| if (s >= f.base() and s < f.top)
-            objName(p, Thread.currentPc(p, f), s - f.base())
+        .upval => .{ .kind = "upvalue", .name = upvalName(p, i) },
+        .slot => if (i >= f.base() and i < f.top)
+            objName(p, Thread.currentPc(p, f), i - f.base())
         else
             null,
     };
@@ -302,7 +319,8 @@ pub fn traceback(w: *std.Io.Writer, t: *Thread, msg: ?[]const u8, level_in: i64)
 
 /// Raises a message prefixed with the position of the Lua function that
 /// called the running native, as `luaL_error` does.
-pub fn raise(th: *Thread, comptime fmt: []const u8, args: anytype) Value.Error {
+pub noinline fn raise(th: *Thread, comptime fmt: []const u8, args: anytype) Value.Error {
+    @branchHint(.cold);
     var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
     defer aw.deinit();
     where(th, 1, &aw.writer) catch return error.OutOfMemory;
@@ -315,7 +333,8 @@ pub fn raise(th: *Thread, comptime fmt: []const u8, args: anytype) Value.Error {
 /// ("f" after `local f = string.rep`), else the function's name among the
 /// loaded modules, else `fallback`. A method call does not count `self`,
 /// and a bad `self` is "calling 'name' on bad self".
-pub fn argError(th: *Thread, arg: u32, fallback: []const u8, msg: []const u8) Value.Error {
+pub noinline fn argError(th: *Thread, arg: u32, fallback: []const u8, msg: []const u8) Value.Error {
+    @branchHint(.cold);
     const n = funcName(th, th.frames.items.len - 1);
     var namebuf: [128]u8 = undefined;
     const name = if (n) |v| v.name else globalFuncName(th.state, th.stack[th.frame().func], &namebuf) orelse fallback;

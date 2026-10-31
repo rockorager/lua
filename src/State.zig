@@ -43,6 +43,13 @@ host: ?*anyopaque = null,
 /// finalizers through it, in pieces, `tocont` set on all but the last.
 /// None until the libraries set one.
 warnf: ?*const fn (state: *State, msg: []const u8, tocont: bool) void = null,
+/// The native stack address below which entering Lua again from native
+/// code raises "C stack overflow": `Thread.max_native_stack` below where
+/// the host last called in (`markStack`).
+cstack_limit: usize = 0,
+/// A message handler for a "C stack overflow" past `cstack_limit` is
+/// running, and may go past it.
+cstack_handling: bool = false,
 
 /// Metamethod events, in PUC-Rio's order (`ltm.h`). The first six are the
 /// ones `Table.flags` caches the absence of.
@@ -246,6 +253,20 @@ pub inline fn checkGc(state: *State, th: *Thread) bool {
     if (state.heap.bytes < state.heap.threshold) return false;
     gc.step(th);
     return true;
+}
+
+/// Records the native stack budget for an entry into Lua from the host:
+/// nested native-to-Lua calls may use `Thread.max_native_stack` bytes
+/// below the caller's frame. Every outermost entry marks it again, since
+/// a host may call in from any depth or thread.
+pub inline fn markStack(state: *State) void {
+    state.cstack_limit = @frameAddress() -| Thread.max_native_stack;
+}
+
+/// Whether the caller's frame is within `slack` bytes of the native stack
+/// budget, or past it.
+pub inline fn nearStackLimit(state: *const State, slack: usize) bool {
+    return @frameAddress() < state.cstack_limit +| slack;
 }
 
 /// Whether enough was allocated since the last step for another.

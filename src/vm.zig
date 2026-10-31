@@ -153,21 +153,27 @@ fn protectedCall(th: *Thread, func: u32, nresults: i16, msgh: u32) Error!Status 
     const old_allowhook = th.allowhook;
     th.errfunc = msgh;
     defer th.errfunc = old_errfunc;
-    call(th, func, nresults) catch |e| {
-        if (th.closed_self) return e;
-        var status = errorStatus(th, e);
-        const err = errorObject(th, e);
-        th.frames.items.len = frames;
-        th.allowhook = old_allowhook;
-        // The `__close` handlers can move the stack: index it after.
-        const final = closeProtected(th, func, err, &status) orelse err;
-        th.stack[func] = final;
-        if (th.closed_self) return error.LuaError;
-        th.top = func + 1;
-        th.shrinkStack();
-        return status;
-    };
+    call(th, func, nresults) catch |e| return recover(th, e, func, frames, old_allowhook);
     return .ok;
+}
+
+/// The end of a `protectedCall` that failed with `e`. Out of line: its
+/// locals would otherwise sit in the native frame of every `pcall` level
+/// (`results/stack-20261031.md`).
+noinline fn recover(th: *Thread, e: Error, func: u32, frames: usize, old_allowhook: bool) Error!Status {
+    @branchHint(.cold);
+    if (th.closed_self) return e;
+    var status = errorStatus(th, e);
+    const err = errorObject(th, e);
+    th.frames.items.len = frames;
+    th.allowhook = old_allowhook;
+    // The `__close` handlers can move the stack: index it after.
+    const final = closeProtected(th, func, err, &status) orelse err;
+    th.stack[func] = final;
+    if (th.closed_self) return error.LuaError;
+    th.top = func + 1;
+    th.shrinkStack();
+    return status;
 }
 
 /// `pcallMsgh` from a native function that can be suspended inside the
@@ -202,31 +208,62 @@ pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn
 fn callYieldable(th: *Thread, func: u32, nresults: i16) Error!void {
     try enterNative(th);
     defer th.native_calls -= 1;
-    if (try preCall(th, func, nresults)) {
+    const depth = th.frames.items.len;
+    try preCall(th, func, nresults);
+    if (th.frames.items.len > depth) {
         th.frame().flags.fresh = true;
         try execute(th);
     }
 }
 
 /// Counts one more entry into the interpreter from Zig, `ccall`'s check:
-/// "C stack overflow" at the limit, and "error in error handling" when
-/// handling that error keeps nesting.
+/// "C stack overflow" at the limit of levels or of native stack, and
+/// "error in error handling" when handling that error keeps nesting. The
+/// outermost entry marks where the native stack budget starts.
 inline fn enterNative(th: *Thread) Error!void {
-    th.native_calls += 1;
-    if (th.native_calls >= Thread.max_native_calls) try nativeOverflow(th);
+    // The level check comes first: with the test for 1 first, LLVM read
+    // the count 32 bits wide, across the 16-bit store of the last call's
+    // decrement, and every call from the host stalled on store
+    // forwarding (`results/stack-20261031.md`).
+    const n = th.native_calls + 1;
+    th.native_calls = n;
+    if (n >= Thread.max_native_calls) return nativeOverflow(th);
+    if (n == 1) {
+        th.state.markStack();
+    } else if (th.state.nearStackLimit(0)) {
+        try nativeOverflow(th);
+    }
 }
 
-fn nativeOverflow(th: *Thread) Error!void {
-    if (th.native_calls == Thread.max_native_calls) {
-        // The count stays at the limit while a message handler runs.
-        const e = th.runError("C stack overflow", .{});
-        th.native_calls -= 1;
-        return e;
+noinline fn nativeOverflow(th: *Thread) Error!void {
+    @branchHint(.cold);
+    if (th.native_calls >= Thread.max_native_calls) {
+        if (th.native_calls == Thread.max_native_calls) {
+            // The count stays at the limit while a message handler runs.
+            const e = th.runError("C stack overflow", .{});
+            th.native_calls -= 1;
+            return e;
+        }
+        if (th.native_calls >= Thread.max_native_calls / 10 * 11) {
+            th.native_calls -= 1;
+            return th.errorInErrorHandling();
+        }
+        return;
     }
-    if (th.native_calls >= Thread.max_native_calls / 10 * 11) {
+    // Past the native stack budget. As at the limit of levels, the
+    // message handler gets a tenth more, and nesting past that is
+    // "error in error handling".
+    const state = th.state;
+    if (@frameAddress() < state.cstack_limit -| Thread.max_native_stack / 10) {
         th.native_calls -= 1;
         return th.errorInErrorHandling();
     }
+    if (state.cstack_handling) return;
+    state.cstack_handling = true;
+    const e = th.runError("C stack overflow", .{});
+    state.cstack_handling = false;
+    th.native_calls -= 1;
+    return e;
 }
 
 /// The error object a failed call left: `Thread.err`, or the memory error
@@ -285,9 +322,12 @@ pub fn mainClosure(state: *State, p: *Proto) error{OutOfMemory}!*LuaClosure {
 }
 
 /// Starts a call of the value at `func`. For a Lua function, pushes its
-/// frame and returns true; the caller runs it. A native function runs to
-/// completion here, its results placed, and the result is false.
-noinline fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
+/// frame, which the caller runs. A native function runs to completion
+/// here, its results placed. Callers tell the two apart by the frame
+/// count: a result in a register keeps the interpreter loop's frame small
+/// where an `Error!bool` would take a stack slot at each call site
+/// (`results/stack-20261031.md`).
+noinline fn preCall(th: *Thread, func: u32, nresults: i16) Error!void {
     var chain: u32 = 0;
     while (true) {
         const f = th.stack[func];
@@ -295,15 +335,15 @@ noinline fn preCall(th: *Thread, func: u32, nresults: i16) Error!bool {
             .lua_closure => {
                 try pushLuaFrame(th, func, f.asLuaClosure().proto, nresults);
                 if (chain > 0) th.frame().flags.ncallmt = @intCast(chain);
-                return true;
+                return;
             },
             .native_fn => {
                 try callNative(th, func, nresults, f.asNative());
-                return false;
+                return;
             },
             .native_closure => {
                 try callNative(th, func, nresults, f.asNativeClosure().f);
-                return false;
+                return;
             },
             else => try insertCallTm(th, func, &chain),
         }
@@ -460,7 +500,9 @@ pub fn resumeThread(co: *Thread, from: ?*Thread, nargs: u32) Error!Resumed {
         .dead => return resumeError(co, "cannot resume dead coroutine", nargs),
     }
     co.native_calls = if (from) |f| f.native_calls else 0;
-    if (co.native_calls >= Thread.max_native_calls) return resumeError(co, "C stack overflow", nargs);
+    if (co.native_calls == 0) co.state.markStack();
+    if (co.native_calls >= Thread.max_native_calls or co.state.nearStackLimit(0))
+        return resumeError(co, "C stack overflow", nargs);
     co.native_calls += 1;
     const base_calls = co.native_calls;
     co.nny = 0;
@@ -514,7 +556,9 @@ fn resumeError(co: *Thread, msg: []const u8, nargs: u32) Error!Resumed {
 
 fn resumeBody(co: *Thread, nargs: u32) Error!void {
     if (co.status == .ok) {
-        if (try preCall(co, co.top - nargs - 1, -1)) {
+        const depth = co.frames.items.len;
+        try preCall(co, co.top - nargs - 1, -1);
+        if (co.frames.items.len > depth) {
             co.frame().flags.fresh = true;
             try execute(co);
         }
@@ -641,7 +685,9 @@ pub fn closeState(state: *State) void {
     if (state.heap.stopped & gc.stop.closing != 0) return;
     const th = state.main;
     th.resetFrames();
-    th.native_calls = 0;
+    // Levels start over, but from inside Lua (`os.exit` with `close`) as
+    // one level, so the native stack budget stays the host's call's.
+    th.native_calls = @min(th.native_calls, 1);
     _ = closeProtected(th, 1, null, null);
     gc.callAllFinalizers(state);
 }
@@ -957,6 +1003,14 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
     // The inline prongs instantiate many inline calls at compile time.
     @setEvalBranchQuota(10_000);
     var ci: *Frame = th.frame();
+    // A slow path's constant operand, and a comparison's result, one of
+    // each for the whole loop. Zig gives a temporary no lifetime, so LLVM
+    // cannot share one stack slot between call sites, and this frame is
+    // native stack that every nested native call pays for
+    // (`results/stack-20261031.md`). A slow path that leaves a Lua
+    // metamethod's frame pushed says so by the frame count.
+    var tmp: Value = undefined;
+    var flag: bool = undefined;
     newframe: while (true) {
         const cl = th.stack[ci.func].asLuaClosure();
         const k: [*]const Value = cl.proto.k.ptr;
@@ -1037,17 +1091,18 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try getSlow(
+                const depth = th.frames.items.len;
+                try getSlow(
                     th,
                     .vm,
                     ci,
                     cl.upvals()[getB(i)].v,
                     &k[getC(i)],
-                    .{ .upval = getB(i) },
+                    .upval(getB(i)),
                     ci.base() + getA(i),
                 );
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1067,17 +1122,18 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try getSlow(
+                const depth = th.frames.items.len;
+                try getSlow(
                     th,
                     .vm,
                     ci,
                     &base[getB(i)],
                     keyp,
-                    .{ .slot = ci.base() + getB(i) },
+                    .slot(ci.base() + getB(i)),
                     ci.base() + getA(i),
                 );
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1093,10 +1149,12 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const origin: Origin = .{ .slot = ci.base() + getB(i) };
-                const done = try getSlow(th, .vm, ci, &base[getB(i)], &Value.int(getC(i)), origin, ci.base() + getA(i));
+                const origin: Origin = .slot(ci.base() + getB(i));
+                tmp = .int(getC(i));
+                const depth = th.frames.items.len;
+                try getSlow(th, .vm, ci, &base[getB(i)], &tmp, origin, ci.base() + getA(i));
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1127,17 +1185,18 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try getSlow(
+                const depth = th.frames.items.len;
+                try getSlow(
                     th,
                     .vm,
                     ci,
                     &base[getB(i)],
                     keyp,
-                    .{ .slot = ci.base() + getB(i) },
+                    .slot(ci.base() + getB(i)),
                     ci.base() + getA(i),
                 );
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1156,9 +1215,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try setSlow(th, .vm, ci, cl.upvals()[getA(i)].v, &k[getB(i)], vp, .{ .upval = getA(i) });
+                const depth = th.frames.items.len;
+                try setSlow(th, .vm, ci, cl.upvals()[getA(i)].v, &k[getB(i)], vp, .upval(getA(i)));
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1181,14 +1241,15 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                             continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                         }
                     } else if (key.tag == .int and h.metatable == null) {
-                        try h.setInt(th.heap(), key.payload.int, v);
+                        try h.setIntAt(th.heap(), key.payload.int, vp);
                         continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                     }
                 }
                 ci.pc = pc;
-                const done = try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .{ .slot = ci.base() + getA(i) });
+                const depth = th.frames.items.len;
+                try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .slot(ci.base() + getA(i)));
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1196,23 +1257,16 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             .seti => {
                 const t = base[getA(i)];
                 const vp = if (getK(i)) &k[getC(i)] else &base[getC(i)];
-                const v = vp.*;
                 if (t.tag == .table and t.asTable().metatable == null) {
-                    try t.asTable().setInt(th.heap(), getB(i), v);
+                    try t.asTable().setIntAt(th.heap(), getB(i), vp);
                     continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
                 }
                 ci.pc = pc;
-                const done = try setSlow(
-                    th,
-                    .vm,
-                    ci,
-                    &base[getA(i)],
-                    &Value.int(getB(i)),
-                    vp,
-                    .{ .slot = ci.base() + getA(i) },
-                );
+                tmp = .int(getB(i));
+                const depth = th.frames.items.len;
+                try setSlow(th, .vm, ci, &base[getA(i)], &tmp, vp, .slot(ci.base() + getA(i)));
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1235,9 +1289,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     }
                 }
                 ci.pc = pc;
-                const done = try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .{ .slot = ci.base() + getA(i) });
+                const depth = th.frames.items.len;
+                try setSlow(th, .vm, ci, &base[getA(i)], keyp, vp, .slot(ci.base() + getA(i)));
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1322,11 +1377,9 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     .shli, .shri => Value.int(opcodes.sc(i)),
                     else => base[getC(i)],
                 };
-                const x_opt = toIntStrict(rb);
-                const y_opt = toIntStrict(rc);
-                if (x_opt != null and y_opt != null) {
-                    const x = x_opt.?;
-                    const y = y_opt.?;
+                var x: i64 = undefined;
+                var y: i64 = undefined;
+                if (toIntStrict(rb, &x) and toIntStrict(rc, &y)) {
                     base[getA(i)] = .int(switch (o) {
                         .band, .bandk => x & y,
                         .bor, .bork => x | y,
@@ -1342,27 +1395,31 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .mmbin, .mmbini, .mmbink => {
-                const ra = base[getA(i)];
-                var rb: Value = switch (op(i)) {
-                    .mmbin => base[getB(i)],
-                    .mmbini => .int(opcodes.sb(i)),
-                    else => k[getB(i)],
+                var first: *const Value = &base[getA(i)];
+                var second: *const Value = switch (op(i)) {
+                    .mmbin => &base[getB(i)],
+                    .mmbini => blk: {
+                        tmp = .int(opcodes.sb(i));
+                        break :blk &tmp;
+                    },
+                    else => &k[getB(i)],
                 };
-                var first = ra;
-                var o1: Origin = .{ .slot = ci.base() + getA(i) };
-                var o2: Origin = if (op(i) == .mmbin) .{ .slot = ci.base() + getB(i) } else .none;
+                var o1: Origin = .slot(ci.base() + getA(i));
+                var o2: Origin = if (op(i) == .mmbin) .slot(ci.base() + getB(i)) else .none;
                 if (op(i) != .mmbin and getK(i)) {
-                    first = rb;
-                    rb = ra;
+                    const ra = first;
+                    first = second;
+                    second = ra;
                     o2 = o1;
                     o1 = .none;
                 }
                 const event: Tm = @enumFromInt(getC(i));
                 const dest = ci.base() + getA((pc - 2)[0]);
                 ci.pc = pc;
-                const done = try arithSlow(th, .vm, ci, &first, &rb, event, o1, o2, dest);
+                const depth = th.frames.items.len;
+                try arithSlow(th, .vm, ci, first, second, event, o1, o2, dest);
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1375,8 +1432,9 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     base[getA(i)] = .float(-rb.payload.float);
                 } else {
                     ci.pc = pc;
-                    const o: Origin = .{ .slot = ci.base() + getB(i) };
-                    const done = try arithSlow(
+                    const o: Origin = .slot(ci.base() + getB(i));
+                    const depth = th.frames.items.len;
+                    try arithSlow(
                         th,
                         .vm,
                         ci,
@@ -1388,20 +1446,21 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                         ci.base() + getA(i),
                     );
                     ci = th.frame();
-                    if (!done) continue :newframe;
+                    if (th.frames.items.len > depth) continue :newframe;
                     if (hookSwitch(hooked, th)) return true;
                     base = th.stack.ptr + ci.base();
                 }
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .bnot => {
-                const rb = base[getB(i)];
-                if (toIntStrict(rb)) |x| {
+                var x: i64 = undefined;
+                if (toIntStrict(base[getB(i)], &x)) {
                     base[getA(i)] = .int(~x);
                 } else {
                     ci.pc = pc;
-                    const o: Origin = .{ .slot = ci.base() + getB(i) };
-                    const done = try arithSlow(
+                    const o: Origin = .slot(ci.base() + getB(i));
+                    const depth = th.frames.items.len;
+                    try arithSlow(
                         th,
                         .vm,
                         ci,
@@ -1413,7 +1472,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                         ci.base() + getA(i),
                     );
                     ci = th.frame();
-                    if (!done) continue :newframe;
+                    if (th.frames.items.len > depth) continue :newframe;
                     if (hookSwitch(hooked, th)) return true;
                     base = th.stack.ptr + ci.base();
                 }
@@ -1431,19 +1490,21 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                         base[getA(i)] = .int(@bitCast(rb.asTable().length()));
                     } else {
                         ci.pc = pc;
-                        const origin: Origin = .{ .slot = ci.base() + getB(i) };
-                        const done = try lenSlow(th, .vm, ci, &base[getB(i)], origin, ci.base() + getA(i));
+                        const origin: Origin = .slot(ci.base() + getB(i));
+                        const depth = th.frames.items.len;
+                        try lenSlow(th, .vm, ci, &base[getB(i)], origin, ci.base() + getA(i));
                         ci = th.frame();
-                        if (!done) continue :newframe;
+                        if (th.frames.items.len > depth) continue :newframe;
                         if (hookSwitch(hooked, th)) return true;
                         base = th.stack.ptr + ci.base();
                     },
                     else => {
                         ci.pc = pc;
-                        const origin: Origin = .{ .slot = ci.base() + getB(i) };
-                        const done = try lenSlow(th, .vm, ci, &base[getB(i)], origin, ci.base() + getA(i));
+                        const origin: Origin = .slot(ci.base() + getB(i));
+                        const depth = th.frames.items.len;
+                        try lenSlow(th, .vm, ci, &base[getB(i)], origin, ci.base() + getA(i));
                         ci = th.frame();
-                        if (!done) continue :newframe;
+                        if (th.frames.items.len > depth) continue :newframe;
                         if (hookSwitch(hooked, th)) return true;
                         base = th.stack.ptr + ci.base();
                     },
@@ -1453,9 +1514,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             .concat => {
                 th.top = ci.base() + getA(i) + getB(i);
                 ci.pc = pc;
-                const done = try concatValues(th, .vm, getB(i));
+                const depth = th.frames.items.len;
+                try concatValues(th, .vm, getB(i));
                 ci = th.frame();
-                if (!done) continue :newframe;
+                if (th.frames.items.len > depth) continue :newframe;
                 if (th.state.checkGc(th)) ci = th.frame();
                 if (hookSwitch(hooked, th)) return true;
                 base = th.stack.ptr + ci.base();
@@ -1507,13 +1569,15 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     };
                 } else {
                     ci.pc = pc;
-                    const r = switch (o) {
-                        .eq => try equalSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)]),
-                        .lt => try orderSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)], .lt),
-                        else => try orderSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)], .le),
-                    };
+                    const depth = th.frames.items.len;
+                    switch (o) {
+                        .eq => try equalSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)], &flag),
+                        .lt => try orderSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)], .lt, &flag),
+                        else => try orderSlow(th, .vm, ci, &base[getA(i)], &base[getB(i)], .le, &flag),
+                    }
                     ci = th.frame();
-                    cond = r orelse continue :newframe;
+                    if (th.frames.items.len > depth) continue :newframe;
+                    cond = flag;
                     base = th.stack.ptr + ci.base();
                     if (hookSwitch(hooked, th)) {
                         ci.pc = if (cond != getK(i)) pc + 1 else pc + jumpOffset(pc[0]);
@@ -1555,15 +1619,17 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     cond = false;
                 } else {
                     ci.pc = pc;
-                    const imv: Value = if (getC(i) != 0) .float(@floatFromInt(im)) else .int(im);
-                    const r = switch (o) {
-                        .lti => try orderSlow(th, .vm, ci, &base[getA(i)], &imv, .lt),
-                        .lei => try orderSlow(th, .vm, ci, &base[getA(i)], &imv, .le),
-                        .gti => try orderSlow(th, .vm, ci, &imv, &base[getA(i)], .lt),
-                        else => try orderSlow(th, .vm, ci, &imv, &base[getA(i)], .le),
-                    };
+                    if (getC(i) != 0) tmp = .float(@floatFromInt(im)) else tmp = .int(im);
+                    const depth = th.frames.items.len;
+                    switch (o) {
+                        .lti => try orderSlow(th, .vm, ci, &base[getA(i)], &tmp, .lt, &flag),
+                        .lei => try orderSlow(th, .vm, ci, &base[getA(i)], &tmp, .le, &flag),
+                        .gti => try orderSlow(th, .vm, ci, &tmp, &base[getA(i)], .lt, &flag),
+                        else => try orderSlow(th, .vm, ci, &tmp, &base[getA(i)], .le, &flag),
+                    }
                     ci = th.frame();
-                    cond = r orelse continue :newframe;
+                    if (th.frames.items.len > depth) continue :newframe;
+                    cond = flag;
                     base = th.stack.ptr + ci.base();
                     if (hookSwitch(hooked, th)) {
                         ci.pc = if (cond != getK(i)) pc + 1 else pc + jumpOffset(pc[0]);
@@ -1602,9 +1668,13 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 }
                 if (callee.tag == .native_fn) {
                     try callNative(th, func, nres, callee.asNative());
-                } else if (try preCall(th, func, nres)) {
-                    ci = th.frame();
-                    continue :newframe;
+                } else {
+                    const depth = th.frames.items.len;
+                    try preCall(th, func, nres);
+                    if (th.frames.items.len > depth) {
+                        ci = th.frame();
+                        continue :newframe;
+                    }
                 }
                 ci = th.frame();
                 if (hookSwitch(hooked, th)) return true;
@@ -1737,7 +1807,8 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
             .forprep => {
                 ci.pc = pc;
-                if (try forPrep(th, base + getA(i))) pc += @as(usize, opcodes.bx(i)) + 1;
+                try forPrep(th, base + getA(i), &flag);
+                if (flag) pc += @as(usize, opcodes.bx(i)) + 1;
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
             .tforprep => {
@@ -1763,9 +1834,13 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const callee = th.stack[func];
                 if (callee.tag == .native_fn) {
                     try callNative(th, func, @intCast(getC(i)), callee.asNative());
-                } else if (try preCall(th, func, @intCast(getC(i)))) {
-                    ci = th.frame();
-                    continue :newframe;
+                } else {
+                    const depth = th.frames.items.len;
+                    try preCall(th, func, @intCast(getC(i)));
+                    if (th.frames.items.len > depth) {
+                        ci = th.frame();
+                        continue :newframe;
+                    }
                 }
                 ci = th.frame();
                 if (hookSwitch(hooked, th)) return true;
@@ -1789,7 +1864,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 }
                 if (last > t.asize) try t.resize(th.heap(), last, if (t.isDummy()) 0 else t.nodeCount());
                 while (n > 0) : (n -= 1) {
-                    try t.setInt(th.heap(), last, base[a + n]);
+                    try t.setIntAt(th.heap(), last, &base[a + n]);
                     last -= 1;
                 }
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
@@ -1815,8 +1890,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
             .vararg => {
                 ci.pc = pc;
-                const vatab: ?u32 = if (getK(i)) getB(i) else null;
-                try getVarargs(th, ci, ci.base() + getA(i), @as(i32, @intCast(getC(i))) - 1, vatab);
+                try getVarargs(th, ci, i);
                 base = th.stack.ptr + ci.base();
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
@@ -1824,7 +1898,8 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 const rc = base[getC(i)];
                 const nextra = ci.extra_args;
                 var result: Value = .nil;
-                if (toIntStrict(rc)) |n| {
+                var n: i64 = undefined;
+                if (toIntStrict(rc, &n)) {
                     const u: u64 = @bitCast(n -% 1);
                     if (u < nextra) result = th.stack[ci.func - nextra + @as(u32, @intCast(u))];
                 } else if (rc.isString() and std.mem.eql(u8, rc.asString().bytes(), "n")) {
@@ -1836,9 +1911,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             .errnnil => {
                 if (!base[getA(i)].isNil()) {
                     ci.pc = pc;
-                    const bx = opcodes.bx(i);
-                    const name = if (bx > 0 and k[bx - 1].isString()) k[bx - 1].asString().bytes() else "?";
-                    return th.runError("global '{s}' already defined", .{name});
+                    return globalDefined(th, k, opcodes.bx(i));
                 }
                 continue :dispatch try nextOp(hooked, th, &ci, &pc, &i, &base);
             },
@@ -1869,6 +1942,13 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
             },
         }
     }
+}
+
+/// `ERRNNIL`'s error: the global named by constant `bx - 1` exists.
+noinline fn globalDefined(th: *Thread, k: [*]const Value, bx: u32) Error {
+    @branchHint(.cold);
+    const name = if (bx > 0 and k[bx - 1].isString()) k[bx - 1].asString().bytes() else "?";
+    return th.runError("global '{s}' already defined", .{name});
 }
 
 /// `Table.setShortStr` with the value by pointer: a `Value` argument
@@ -1952,7 +2032,7 @@ noinline fn finishOp(th: *Thread, ci: *Frame) Error!void {
             const total = top - 1 - (base + getA(inst));
             th.stack[top - 2] = th.stack[top];
             th.top = top - 1;
-            _ = try concatValues(th, .vm, total);
+            try concatValues(th, .vm, total);
         },
         // Yielded while closing variables: run the instruction again to
         // close the rest (and, for RETURN, to return).
@@ -1972,9 +2052,12 @@ noinline fn finishOp(th: *Thread, ci: *Frame) Error!void {
 // Each slow path serves an instruction of the running Lua frame `ci`
 // (`.vm`) or native code through the API below (`.native`). For an
 // instruction, a handler written in Lua gets its own frame flagged
-// `finish_op` and the slow path returns false: the interpreter runs the
-// handler, and `finishOp` completes the instruction. For native code the
-// handler runs to completion through `call`.
+// `finish_op`, which the slow path returns with: the interpreter sees the
+// frame count grown, runs the handler, and `finishOp` completes the
+// instruction. For native code the handler runs to completion through
+// `call`. Results go to stack slots or out parameters, not `Error!T`:
+// Zig returns that through memory, a stack slot in the loop per call
+// site (`results/stack-20261031.md`).
 // ---------------------------------------------------------------------------
 
 /// Who asks for a metamethod: an instruction of a Lua frame, or native
@@ -2001,7 +2084,9 @@ inline fn callTm(
     th.push(a2);
     if (a3) |v| th.push(v);
     if (caller == .vm) {
-        if (try preCall(th, func, nresults)) {
+        const depth = th.frames.items.len;
+        try preCall(th, func, nresults);
+        if (th.frames.items.len > depth) {
             th.frame().flags.finish_op = true;
             return null;
         }
@@ -2014,8 +2099,8 @@ inline fn callTm(
 }
 
 /// `t[key]` with `__index` (`luaV_finishget`) into stack slot `dest`.
-/// False when a Lua metamethod frame was pushed. `origin` names `t` in a
-/// type error.
+/// For `.vm`, a Lua metamethod is left pushed (see above). `origin` names
+/// `t` in a type error.
 noinline fn getSlow(
     th: *Thread,
     comptime caller: Caller,
@@ -2024,7 +2109,7 @@ noinline fn getSlow(
     key_ptr: *const Value,
     origin: Origin,
     dest: u32,
-) Error!bool {
+) Error!void {
     @branchHint(.cold);
     var t = t_ptr.*;
     const key = key_ptr.*;
@@ -2035,12 +2120,12 @@ noinline fn getSlow(
             const tbl = t.asTable();
             const v = tbl.get(key);
             if (!v.isNil()) {
-                th.stack[dest] = v;
-                return true;
+                setv(&th.stack[dest], v);
+                return;
             }
             h = th.state.fastTm(tbl.metatable, .index) orelse {
                 th.stack[dest] = .nil;
-                return true;
+                return;
             };
         } else {
             h = th.state.tmOf(t, .index) orelse return typeError(th, t, "index", org);
@@ -2048,9 +2133,9 @@ noinline fn getSlow(
         if (h.isFunction()) {
             // Not `th.stack[dest] = try callTm(...)`: Zig takes the
             // destination's address first, and the call can move the stack.
-            const r = try callTm(th, caller, ci, h, t, key, null, 1) orelse return false;
+            const r = try callTm(th, caller, ci, h, t, key, null, 1) orelse return;
             th.stack[dest] = r;
-            return true;
+            return;
         }
         t = h;
         org = .none;
@@ -2058,8 +2143,7 @@ noinline fn getSlow(
     return th.runError("'__index' chain too long; possible loop", .{});
 }
 
-/// `t[key] = v` with `__newindex` (`luaV_finishset`). False when a Lua
-/// metamethod frame was pushed.
+/// `t[key] = v` with `__newindex` (`luaV_finishset`).
 noinline fn setSlow(
     th: *Thread,
     comptime caller: Caller,
@@ -2068,7 +2152,7 @@ noinline fn setSlow(
     key_ptr: *const Value,
     v_ptr: *const Value,
     origin: Origin,
-) Error!bool {
+) Error!void {
     @branchHint(.cold);
     var t = t_ptr.*;
     const key = key_ptr.*;
@@ -2080,18 +2164,18 @@ noinline fn setSlow(
             const tbl = t.asTable();
             if (!tbl.get(key).isNil()) {
                 tbl.set(th.heap(), key, v) catch |e| return setError(th, e);
-                return true;
+                return;
             }
             h = th.state.fastTm(tbl.metatable, .newindex) orelse {
                 tbl.set(th.heap(), key, v) catch |e| return setError(th, e);
-                return true;
+                return;
             };
         } else {
             h = th.state.tmOf(t, .newindex) orelse return typeError(th, t, "index", org);
         }
         if (h.isFunction()) {
-            _ = try callTm(th, caller, ci, h, t, key, v, 0) orelse return false;
-            return true;
+            _ = try callTm(th, caller, ci, h, t, key, v, 0) orelse return;
+            return;
         }
         t = h;
         org = .none;
@@ -2110,7 +2194,7 @@ fn setError(th: *Thread, e: Table.SetError) Error {
 
 /// A binary or unary metamethod for `event` over `a` and `b` into stack
 /// slot `dest`, or the error the manual gives when neither operand has one
-/// (`luaT_trybinTM`). False when a Lua metamethod frame was pushed.
+/// (`luaT_trybinTM`).
 noinline fn arithSlow(
     th: *Thread,
     comptime caller: Caller,
@@ -2121,7 +2205,7 @@ noinline fn arithSlow(
     oa: Origin,
     ob: Origin,
     dest: u32,
-) Error!bool {
+) Error!void {
     @branchHint(.cold);
     const a = a_ptr.*;
     const b = b_ptr.*;
@@ -2130,7 +2214,8 @@ noinline fn arithSlow(
             .band, .bor, .bxor, .shl, .shr, .bnot => {
                 if (a.isNumber() and b.isNumber()) {
                     var buf: [128]u8 = undefined;
-                    const o = if (toIntStrict(a) == null) oa else ob;
+                    var n: i64 = undefined;
+                    const o = if (!toIntStrict(a, &n)) oa else ob;
                     return th.runError("number{s} has no integer representation", .{debuginfo.varInfo(th, o, &buf)});
                 }
                 if (!a.isNumber()) return typeError(th, a, "perform bitwise operation on", oa);
@@ -2143,9 +2228,9 @@ noinline fn arithSlow(
         }
     };
     // The call can move the stack: index it after (see `getSlow`).
-    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return false;
+    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return;
     th.stack[dest] = r;
-    return true;
+    return;
 }
 
 noinline fn lenSlow(
@@ -2155,44 +2240,47 @@ noinline fn lenSlow(
     v_ptr: *const Value,
     origin: Origin,
     dest: u32,
-) Error!bool {
+) Error!void {
     @branchHint(.cold);
     const v = v_ptr.*;
     const h = th.state.tmOf(v, .len) orelse {
         if (v.tag == .table) {
             th.stack[dest] = .int(@bitCast(v.asTable().length()));
-            return true;
+            return;
         }
         return typeError(th, v, "get length of", origin);
     };
     // The call can move the stack: index it after (see `getSlow`).
-    const r = try callTm(th, caller, ci, h, v, v, null, 1) orelse return false;
+    const r = try callTm(th, caller, ci, h, v, v, null, 1) orelse return;
     th.stack[dest] = r;
-    return true;
+    return;
 }
 
-/// `a == b` for operands not both numbers; null when a Lua `__eq` frame
-/// was pushed.
+/// `a == b` for operands not both numbers, into `out`, unless a Lua
+/// `__eq` frame was left pushed.
 noinline fn equalSlow(
     th: *Thread,
     comptime caller: Caller,
     ci: *Frame,
     a_ptr: *const Value,
     b_ptr: *const Value,
-) Error!?bool {
+    out: *bool,
+) Error!void {
     @branchHint(.cold);
     const a = a_ptr.*;
     const b = b_ptr.*;
-    if (Value.rawEquals(a, b)) return true;
-    if (a.tag != b.tag or (a.tag != .table and a.tag != .userdata)) return false;
+    out.* = true;
+    if (Value.rawEquals(a, b)) return;
+    out.* = false;
+    if (a.tag != b.tag or (a.tag != .table and a.tag != .userdata)) return;
     const h = th.state.fastTm(th.state.metatableOf(a), .eq) orelse
-        th.state.fastTm(th.state.metatableOf(b), .eq) orelse return false;
-    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return null;
-    return !r.isFalsy();
+        th.state.fastTm(th.state.metatableOf(b), .eq) orelse return;
+    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return;
+    out.* = !r.isFalsy();
 }
 
-/// `a < b` or `a <= b` for operands not both numbers; null when a Lua
-/// metamethod frame was pushed.
+/// `a < b` or `a <= b` for operands not both numbers, into `out`, unless
+/// a Lua metamethod frame was left pushed.
 noinline fn orderSlow(
     th: *Thread,
     comptime caller: Caller,
@@ -2200,14 +2288,19 @@ noinline fn orderSlow(
     a_ptr: *const Value,
     b_ptr: *const Value,
     event: Tm,
-) Error!?bool {
+    out: *bool,
+) Error!void {
     @branchHint(.cold);
     const a = a_ptr.*;
     const b = b_ptr.*;
-    if (a.isNumber() and b.isNumber()) return if (event == .lt) lessThanNum(a, b) else lessEqualNum(a, b);
+    if (a.isNumber() and b.isNumber()) {
+        out.* = if (event == .lt) lessThanNum(a, b) else lessEqualNum(a, b);
+        return;
+    }
     if (a.isString() and b.isString()) {
         const ord = std.mem.order(u8, a.asString().bytes(), b.asString().bytes());
-        return if (event == .lt) ord == .lt else ord != .gt;
+        out.* = if (event == .lt) ord == .lt else ord != .gt;
+        return;
     }
     const h = th.state.tmOf(a, event) orelse th.state.tmOf(b, event) orelse {
         const ta = th.state.typeName(a);
@@ -2215,8 +2308,8 @@ noinline fn orderSlow(
         if (std.mem.eql(u8, ta, tb)) return th.runError("attempt to compare two {s} values", .{ta});
         return th.runError("attempt to compare {s} with {s}", .{ ta, tb });
     };
-    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return null;
-    return !r.isFalsy();
+    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return;
+    out.* = !r.isFalsy();
 }
 
 /// Longest string a concatenation may build, PUC-Rio's `MAX_SIZE` less the
@@ -2229,9 +2322,9 @@ inline fn isConcatable(v: Value) bool {
 
 /// Concatenates the `total` values below `top` into one at `top - total`
 /// (`luaV_concat`), strings and numbers directly and anything else through
-/// `__concat`, right to left. False when a Lua `__concat` frame was pushed
-/// (only for `.vm`); `finishOp` continues from there.
-noinline fn concatValues(th: *Thread, comptime caller: Caller, total_in: u32) Error!bool {
+/// `__concat`, right to left. For `.vm`, a Lua `__concat` handler is left
+/// pushed, to run in the loop; `finishOp` continues from there.
+noinline fn concatValues(th: *Thread, comptime caller: Caller, total_in: u32) Error!void {
     var total = total_in;
     while (total > 1) {
         const top = th.top;
@@ -2239,8 +2332,8 @@ noinline fn concatValues(th: *Thread, comptime caller: Caller, total_in: u32) Er
         const b = th.stack[top - 1];
         if (!isConcatable(a) or !isConcatable(b)) {
             const h = th.state.tmOf(a, .concat) orelse th.state.tmOf(b, .concat) orelse {
-                if (isConcatable(a)) return typeError(th, b, "concatenate", .{ .slot = top - 1 });
-                return typeError(th, a, "concatenate", .{ .slot = top - 2 });
+                if (isConcatable(a)) return typeError(th, b, "concatenate", .slot(top - 1));
+                return typeError(th, a, "concatenate", .slot(top - 2));
             };
             // The handler goes on top, so `top` still marks the operands.
             try th.ensureStack(3);
@@ -2248,9 +2341,11 @@ noinline fn concatValues(th: *Thread, comptime caller: Caller, total_in: u32) Er
             th.push(a);
             th.push(b);
             if (caller == .vm) {
-                if (try preCall(th, top, 1)) {
+                const depth = th.frames.items.len;
+                try preCall(th, top, 1);
+                if (th.frames.items.len > depth) {
                     th.frame().flags.finish_op = true;
-                    return false;
+                    return;
                 }
             } else {
                 try call(th, top, 1);
@@ -2289,7 +2384,6 @@ noinline fn concatValues(th: *Thread, comptime caller: Caller, total_in: u32) Er
         total -= n - 1;
         th.top -= n - 1;
     }
-    return true;
 }
 
 fn copyParts(parts: []const Value, out: []u8) void {
@@ -2329,14 +2423,14 @@ noinline fn getNative(th: *Thread, t: Value, key: Value) Error!Value {
     try th.ensureStack(1);
     const dest = th.top;
     th.top += 1;
-    _ = try getSlow(th, .native, th.frame(), &t, &key, .none, dest);
+    try getSlow(th, .native, th.frame(), &t, &key, .none, dest);
     th.top = dest;
     return th.stack[dest];
 }
 
 /// `t[key] = v` with `__newindex` (`lua_settable`).
 pub fn set(th: *Thread, t: Value, key: Value, v: Value) Error!void {
-    _ = try setSlow(th, .native, th.frame(), &t, &key, &v, .none);
+    try setSlow(th, .native, th.frame(), &t, &key, &v, .none);
 }
 
 /// The arithmetic and bitwise operators, in `lua_arith`'s order.
@@ -2379,7 +2473,7 @@ pub fn arith(th: *Thread, o: ArithOp, a: Value, b_in: Value) Error!Value {
     try th.ensureStack(1);
     const dest = th.top;
     th.top += 1;
-    _ = try arithSlow(th, .native, th.frame(), &a, &b, o.event(), .none, .none, dest);
+    try arithSlow(th, .native, th.frame(), &a, &b, o.event(), .none, .none, dest);
     th.top = dest;
     return th.stack[dest];
 }
@@ -2389,8 +2483,9 @@ pub fn arith(th: *Thread, o: ArithOp, a: Value, b_in: Value) Error!Value {
 pub fn rawArith(th: *Thread, o: ArithOp, a: Value, b: Value) Error!?Value {
     switch (o) {
         .band, .bor, .bxor, .shl, .shr, .bnot => {
-            const x = toIntStrict(a) orelse return null;
-            const y = toIntStrict(b) orelse return null;
+            var x: i64 = undefined;
+            var y: i64 = undefined;
+            if (!toIntStrict(a, &x) or !toIntStrict(b, &y)) return null;
             return .int(switch (o) {
                 .band => x & y,
                 .bor => x | y,
@@ -2425,17 +2520,23 @@ pub fn rawArith(th: *Thread, o: ArithOp, a: Value, b: Value) Error!?Value {
 /// `a == b` with `__eq` (`lua_compare` with `LUA_OPEQ`).
 pub fn equal(th: *Thread, a: Value, b: Value) Error!bool {
     if (a.isNumber() and b.isNumber()) return Value.rawEquals(a, b);
-    return (try equalSlow(th, .native, th.frame(), &a, &b)).?;
+    var r: bool = undefined;
+    try equalSlow(th, .native, th.frame(), &a, &b, &r);
+    return r;
 }
 
 /// `a < b` with `__lt` (`lua_compare` with `LUA_OPLT`).
 pub fn lessThan(th: *Thread, a: Value, b: Value) Error!bool {
-    return (try orderSlow(th, .native, th.frame(), &a, &b, .lt)).?;
+    var r: bool = undefined;
+    try orderSlow(th, .native, th.frame(), &a, &b, .lt, &r);
+    return r;
 }
 
 /// `a <= b` with `__le` (`lua_compare` with `LUA_OPLE`).
 pub fn lessEqual(th: *Thread, a: Value, b: Value) Error!bool {
-    return (try orderSlow(th, .native, th.frame(), &a, &b, .le)).?;
+    var r: bool = undefined;
+    try orderSlow(th, .native, th.frame(), &a, &b, .le, &r);
+    return r;
 }
 
 /// `#v` with `__len` (`lua_len`).
@@ -2446,7 +2547,7 @@ pub fn length(th: *Thread, v: Value) Error!Value {
             try th.ensureStack(1);
             const dest = th.top;
             th.top += 1;
-            _ = try lenSlow(th, .native, th.frame(), &v, .none, dest);
+            try lenSlow(th, .native, th.frame(), &v, .none, dest);
             th.top = dest;
             return th.stack[dest];
         },
@@ -2461,7 +2562,7 @@ pub fn concat(th: *Thread, n: u32) Error!void {
         th.push(.string(try th.state.newString("")));
         return;
     }
-    _ = try concatValues(th, .native, n);
+    try concatValues(th, .native, n);
 }
 
 /// A number, or a string that converts to one by the manual's rules
@@ -2486,7 +2587,8 @@ pub fn stringToNumber(s: []const u8) ?Value {
 /// A number or numeric string with an exact integer value, as an integer
 /// (`lua_tointeger`).
 pub inline fn toInteger(v: Value) ?i64 {
-    return toIntStrict(toNumber(v) orelse return null);
+    var n: i64 = undefined;
+    return if (toIntStrict(toNumber(v) orelse return null, &n)) n else null;
 }
 
 /// A string as is, or a number converted to one, else null
@@ -2534,7 +2636,7 @@ noinline fn callError(th: *Thread, func: u32) Error {
     const info = if (debuginfo.callerName(th, th.frames.items.len - 1)) |n|
         debuginfo.format(n, &buf)
     else
-        debuginfo.varInfo(th, .{ .slot = func }, &buf);
+        debuginfo.varInfo(th, .slot(func), &buf);
     return th.runError("attempt to call a {s} value{s}", .{ th.state.typeName(th.stack[func]), info });
 }
 
@@ -2583,14 +2685,18 @@ noinline fn adjustVarargs(th: *Thread, ci: *Frame, p: *const Proto) Error!void {
     th.stack[ci.func + nfix + 1] = .nil;
 }
 
-/// Copies `wanted` extra arguments (all of them for -1, setting `top`) to
-/// stack slot `where` (`VARARG`, `luaT_getvarargs`), from below the frame
-/// or, when `vatab` names its register, from the vararg table.
-noinline fn getVarargs(th: *Thread, ci: *Frame, where: u32, wanted_in: i32, vatab: ?u32) Error!void {
+/// Runs `VARARG` instruction `i` of frame `ci` (`luaT_getvarargs`):
+/// copies C - 1 extra arguments (all of them for -1, setting `top`) to
+/// register A, from below the frame or, with k set, from the vararg
+/// table in register B. It takes the instruction, not its operands, so
+/// the loop builds no optional for B (`results/stack-20261031.md`).
+noinline fn getVarargs(th: *Thread, ci: *Frame, i: Instruction) Error!void {
+    const where = ci.base() + getA(i);
+    const wanted_in = @as(i32, @intCast(getC(i))) - 1;
     var h: ?*Table = null;
     var nargs: u32 = ci.extra_args;
-    if (vatab) |r| {
-        const tv = th.stack[ci.base() + r];
+    if (getK(i)) {
+        const tv = th.stack[ci.base() + getB(i)];
         const nv: Value = if (tv.tag == .table) tv.asTable().getShortStr(th.state.n_key) else .nil;
         if (nv.tag != .int or @as(u64, @bitCast(nv.payload.int)) > std.math.maxInt(i32) / 2)
             return th.runError("vararg table has no proper 'n'", .{});
@@ -2617,11 +2723,12 @@ noinline fn getVarargs(th: *Thread, ci: *Frame, where: u32, wanted_in: i32, vata
     for (touse..wanted) |j| th.stack[where + j] = .nil;
 }
 
-/// Prepares a numeric for loop at `ra` (`FORPREP`, `forprep`). True when
-/// the loop runs zero times. Strings convert, as everywhere a number is
-/// expected.
-noinline fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
+/// Prepares a numeric for loop at `ra` (`FORPREP`, `forprep`). Sets
+/// `skip` when the loop runs zero times. Strings convert, as everywhere a
+/// number is expected.
+noinline fn forPrep(th: *Thread, ra: [*]Value, skip: *bool) Error!void {
     @branchHint(.cold);
+    skip.* = true;
     const init = ra[0];
     const limit = ra[1];
     const step = ra[2];
@@ -2636,14 +2743,14 @@ noinline fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
             const f = toFloatCoerce(limit) orelse return forError(th, limit, "limit");
             // A float out of the integer range, or NaN.
             if (f > 0) {
-                if (s < 0) return true;
+                if (s < 0) return;
                 lim = std.math.maxInt(i64);
             } else {
-                if (s > 0) return true;
+                if (s > 0) return;
                 lim = std.math.minInt(i64);
             }
         }
-        if (if (s > 0) start > lim else start < lim) return true;
+        if (if (s > 0) start > lim else start < lim) return;
         var count: u64 = undefined;
         if (s > 0) {
             count = @as(u64, @bitCast(lim)) -% @as(u64, @bitCast(start));
@@ -2655,17 +2762,18 @@ noinline fn forPrep(th: *Thread, ra: [*]Value) Error!bool {
         ra[0] = .int(@bitCast(count));
         ra[1] = .int(s);
         ra[2] = .int(start);
-        return false;
+        skip.* = false;
+        return;
     }
     const fl = toFloatCoerce(limit) orelse return forError(th, limit, "limit");
     const fs = toFloatCoerce(step) orelse return forError(th, step, "step");
     const fi = toFloatCoerce(init) orelse return forError(th, init, "initial value");
     if (fs == 0) return th.runError("'for' step is zero", .{});
-    if (if (0 < fs) fl < fi else fi < fl) return true;
+    if (if (0 < fs) fl < fi else fi < fl) return;
     ra[0] = .float(fl);
     ra[1] = .float(fs);
     ra[2] = .float(fi);
-    return false;
+    skip.* = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2698,14 +2806,20 @@ inline fn floatArith(a: ArithOp, x: f64, y: f64) f64 {
     };
 }
 
-/// An integer, or a float with an exact integer value, as an integer; no
-/// string conversion (`tointegerns`).
-inline fn toIntStrict(v: Value) ?i64 {
-    return switch (v.tag) {
-        .int => v.payload.int,
-        .float => number.floatToInt(v.payload.float, .exact),
-        else => null,
-    };
+/// An integer, or a float with an exact integer value, as an integer in
+/// `out`; no string conversion (`tointegerns`). False for anything else.
+/// Not an optional result: in the interpreter loop, where this inlines
+/// twenty times, Zig's `null` becomes a copy from a constant that LLVM
+/// reaches through a choice of pointers, which it cannot keep in
+/// registers, and each call site kept two 16-byte stack slots
+/// (`results/stack-20261031.md`).
+inline fn toIntStrict(v: Value, out: *i64) bool {
+    switch (v.tag) {
+        .int => out.* = v.payload.int,
+        .float => out.* = number.floatToInt(v.payload.float, .exact) orelse return false,
+        else => return false,
+    }
+    return true;
 }
 
 /// A number or numeric string as an integer, rounding a float as `mode`

@@ -11,6 +11,7 @@ const Thread = @import("../Thread.zig");
 const State = @import("../State.zig");
 const Table = @import("../Table.zig");
 const number = @import("../number.zig");
+const vm = @import("../vm.zig");
 const auxlib = @import("auxlib.zig");
 
 const Error = Value.Error;
@@ -231,40 +232,51 @@ const Sorter = struct {
     cmp: Value,
 
     /// Pushes `t[i]`.
-    fn geti(s: Sorter, i: u32) Error!void {
+    fn geti(s: *const Sorter, i: u32) Error!void {
         const v = try getI(s.th, s.t, i);
         try s.th.ensureStack(1);
         s.th.push(v);
     }
 
     /// Pops the top value into `t[i]`.
-    fn seti(s: Sorter, i: u32) Error!void {
+    fn seti(s: *const Sorter, i: u32) Error!void {
         try setI(s.th, s.t, i, s.th.stack[s.th.top - 1]);
         s.th.top -= 1;
     }
 
-    fn set2(s: Sorter, i: u32, j: u32) Error!void {
+    fn set2(s: *const Sorter, i: u32, j: u32) Error!void {
         try s.seti(i);
         try s.seti(j);
     }
 
-    fn pop(s: Sorter, n: u32) void {
+    fn pop(s: *const Sorter, n: u32) void {
         s.th.top -= n;
     }
 
     /// Whether the value `a` slots below the top sorts before the one `b`
-    /// slots below it (`sort_comp` with negative indices).
-    fn less(s: Sorter, a: u32, b: u32) Error!bool {
+    /// slots below it (`sort_comp` with negative indices). Out of line: the
+    /// comparator's call is on the native stack of every level of a sort
+    /// inside a comparator, and inlined, each of its six uses kept its own
+    /// arguments in `sort`'s frame (`results/stack-20261031.md`).
+    noinline fn less(s: *const Sorter, a: u32, b: u32) Error!bool {
         const th = s.th;
         const x = th.stack[th.top - a];
         const y = th.stack[th.top - b];
         if (s.cmp.isNil()) return auxlib.lessThan(th, x, y);
-        return !(try auxlib.call1(th, s.cmp, &.{ x, y })).isFalsy();
+        // Pushed here rather than through `auxlib.call1`, one frame less.
+        try th.ensureStack(3);
+        const func = th.top;
+        th.push(s.cmp);
+        th.push(x);
+        th.push(y);
+        try vm.call(th, func, 1);
+        th.top = func;
+        return !th.stack[func].isFalsy();
     }
 
     /// Partitions `t[lo..up]` around the pivot P on top of the stack, with
     /// `a[lo] <= P == a[up-1] <= a[up]`; returns P's final index.
-    fn partition(s: Sorter, lo: u32, up: u32) Error!u32 {
+    fn partition(s: *const Sorter, lo: u32, up: u32) Error!u32 {
         var i = lo;
         var j = up - 1;
         while (true) {
@@ -295,7 +307,7 @@ const Sorter = struct {
         }
     }
 
-    fn sort(s: Sorter, lo_in: u32, up_in: u32, rnd_in: u32) Error!void {
+    fn sort(s: *const Sorter, lo_in: u32, up_in: u32, rnd_in: u32) Error!void {
         var lo = lo_in;
         var up = up_in;
         var rnd = rnd_in;
@@ -354,14 +366,23 @@ fn randomPivot(th: *Thread) u32 {
 
 fn sort(th: *Thread, base: u32) Error!u32 {
     const a: Args = .init(th, base, "sort");
-    const n = try getn(a, 1, .{ .read = true, .write = true });
+    const n = try sortLength(a);
     if (n > 1) {
-        if (n >= c_int_max) return a.argError(1, "array too big", .{});
-        if (!a.isNoneOrNil(2) and !a.get(2).isFunction()) return a.typeError(2, "function");
         const s: Sorter = .{ .th = th, .t = a.get(1), .cmp = a.get(2) };
-        try s.sort(1, @intCast(n), 0);
+        try s.sort(1, n, 0);
     }
     return 0;
+}
+
+/// `sort`'s checks, and the length of the table. Out of line: `sort`'s
+/// frame is on the native stack of every level of a sort inside a
+/// comparator, and these locals need not be (`results/stack-20261031.md`).
+noinline fn sortLength(a: Args) Error!u32 {
+    const n = try getn(a, 1, .{ .read = true, .write = true });
+    if (n <= 1) return 0;
+    if (n >= c_int_max) return a.argError(1, "array too big", .{});
+    if (!a.isNoneOrNil(2) and !a.get(2).isFunction()) return a.typeError(2, "function");
+    return @intCast(n);
 }
 
 // ---------------------------------------------------------------------------

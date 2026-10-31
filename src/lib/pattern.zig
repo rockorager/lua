@@ -465,7 +465,11 @@ pub const GsubResult = struct {
 /// for a string or number replacement; a table or function replacement reads
 /// `m.capture(0, match)` or the `m.resultCount()` captures, and when the Lua
 /// value is false or nil, writes the original text and returns false.
-pub fn gsub(m: *Matcher, max_n: i64, w: *Writer, replacer: anytype) !GsubResult {
+///
+/// Out of line, one instance per replacer: inlined into `string.gsub`,
+/// the three instances' locals all sat in its frame, which is on the
+/// native stack of every level of a `gsub` inside a replacement function.
+pub noinline fn gsub(m: *Matcher, max_n: i64, w: *Writer, replacer: anytype) !GsubResult {
     var src: usize = 0;
     var last: ?usize = null;
     var n: i64 = 0;

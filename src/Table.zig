@@ -229,11 +229,26 @@ inline fn rel(to: u32, from: u32) i32 {
 
 // Lookups.
 
-/// Raw `t[key]` for an integer key.
+/// Raw `t[key]` for an integer key. This and `getShortStrCached` build
+/// their result from one payload and one tag variable: returns of
+/// different values made LLVM choose between their addresses, so the
+/// interpreter loop kept a stack slot for each, and a `Value` variable
+/// went through memory, written in pieces and read back whole, which
+/// stalls store forwarding. `getShortStr` keeps the plain form, which
+/// costs `GETTABLE` 32 bytes of frame and saves hash_string 3 to 10%
+/// (`results/stack-20261031.md`).
 pub inline fn getInt(t: *const Table, key: i64) Value {
     const k: u64 = @bitCast(key -% 1);
-    if (k < t.asize) return t.arrayGet(@intCast(k));
-    return if (t.getIntNode(key)) |n| n.value() else .nil;
+    var payload: Payload = Value.nil.payload;
+    var tag: Value.Tag = .nil;
+    if (k < t.asize) {
+        payload = t.payloadPtr(@intCast(k)).*;
+        tag = t.tagPtr(@intCast(k)).*;
+    } else if (t.getIntNode(key)) |n| {
+        payload = n.val;
+        tag = n.val_tag;
+    }
+    return .{ .payload = payload, .tag = tag };
 }
 
 fn getIntNode(t: *const Table, key: i64) ?*Node {
@@ -254,7 +269,13 @@ pub inline fn getShortStr(t: *const Table, s: *const String) Value {
 /// `getShortStr` through an inline cache: `slot` holds the node where the
 /// key was last found, which is tried before hashing (`GETTABUP`).
 pub inline fn getShortStrCached(t: *const Table, s: *const String, slot: *u32) Value {
-    return if (t.cachedNode(s, slot)) |n| n.value() else .nil;
+    var payload: Payload = Value.nil.payload;
+    var tag: Value.Tag = .nil;
+    if (t.cachedNode(s, slot)) |n| {
+        payload = n.val;
+        tag = n.val_tag;
+    }
+    return .{ .payload = payload, .tag = tag };
 }
 
 /// `replaceShortStr` through an inline cache, as `getShortStrCached`
@@ -295,13 +316,16 @@ pub fn getStr(t: *const Table, s: *String) Value {
 
 /// Raw `t[key]`.
 pub fn get(t: *const Table, key: Value) Value {
-    return switch (key.tag) {
+    const v: Value = switch (key.tag) {
         .short_string => t.getShortStr(key.asString()),
         .int => t.getInt(key.payload.int),
         .nil => .nil,
         .float => if (Value.floatToInt(key.payload.float)) |i| t.getInt(i) else t.getGeneric(key),
         else => t.getGeneric(key),
     };
+    // Field by field: the whole value, read back after its fields were
+    // written to a temporary, stalled store forwarding.
+    return .{ .payload = v.payload, .tag = v.tag };
 }
 
 fn getGeneric(t: *const Table, key: Value) Value {
@@ -354,16 +378,24 @@ pub fn set(t: *Table, heap: *gc.Heap, key: Value, val: Value) SetError!void {
 
 /// Raw `t[key] = val` for an integer key.
 pub inline fn setInt(t: *Table, heap: *gc.Heap, key: i64, val: Value) error{OutOfMemory}!void {
-    const k: u64 = @bitCast(key -% 1);
-    if (k < t.asize) {
-        t.arraySet(@intCast(k), val);
-        gc.barrierBack(heap, t, val);
-        return;
-    }
-    return t.setIntHash(heap, key, val);
+    return t.setIntAt(heap, key, &val);
 }
 
-fn setIntHash(t: *Table, heap: *gc.Heap, key: i64, val: Value) error{OutOfMemory}!void {
+/// `setInt` with the value by pointer, for the interpreter loop: a
+/// `Value` argument to the hash part's call makes the loop copy the
+/// operand to a stack slot of its own at each call site.
+pub inline fn setIntAt(t: *Table, heap: *gc.Heap, key: i64, vp: *const Value) error{OutOfMemory}!void {
+    const k: u64 = @bitCast(key -% 1);
+    if (k < t.asize) {
+        t.arraySet(@intCast(k), vp.*);
+        gc.barrierBack(heap, t, vp.*);
+        return;
+    }
+    return t.setIntHash(heap, key, vp);
+}
+
+fn setIntHash(t: *Table, heap: *gc.Heap, key: i64, vp: *const Value) error{OutOfMemory}!void {
+    const val = vp.*;
     if (t.getIntNode(key)) |n| return t.writeNode(heap, n, val);
     if (val.isNil()) return;
     t.newKey(heap, .int(key), val) catch |e| switch (e) {

@@ -99,13 +99,15 @@ pub const ExpKind = enum(u8) {
 
 /// An expression whose code may still be pending, plus its lists of jumps
 /// out when true and when false (from `and`/`or`). lparser.h's `expdesc`,
-/// with its union's members as separate fields.
+/// with its union's members as separate fields but for the constant.
 pub const ExpDesc = struct {
     k: ExpKind = .void,
     info: i32 = 0,
-    ival: i64 = 0,
-    nval: f64 = 0,
-    strval: *String = undefined,
+    /// The constant of a `kint`, `kflt`, or `kstr`, which `k` tells
+    /// apart, as lparser.h's union: an `ExpDesc` is 40 bytes instead of
+    /// 64, and the parser's recursion keeps several in each frame
+    /// (`results/stack-20261031.md`).
+    u: extern union { ival: i64, nval: f64, strval: *String } = .{ .ival = 0 },
     ind: Ind = .{},
     /// `local`, `vargvar`: the register and the active-variable index.
     ridx: u8 = 0,
@@ -297,7 +299,7 @@ pub const FuncState = struct {
             .false => v.* = .false,
             .true => v.* = .true,
             .nil => v.* = .nil,
-            .kstr => v.* = .string(e.strval),
+            .kstr => v.* = .string(e.u.strval),
             .@"const" => v.* = fs.const2val(e).*,
             else => return toNumeral(e, v),
         }
@@ -664,7 +666,7 @@ pub const FuncState = struct {
 
     fn str2K(fs: *FuncState, e: *ExpDesc) Error!i32 {
         std.debug.assert(e.k == .kstr);
-        e.info = try fs.stringK(e.strval);
+        e.info = try fs.stringK(e.u.strval);
         e.k = .k;
         return e.info;
     }
@@ -740,8 +742,8 @@ pub const FuncState = struct {
                 if (e.k == .kstr) _ = try fs.str2K(e);
                 _ = try fs.codeK(reg, e.info);
             },
-            .kflt => try fs.float(reg, e.nval),
-            .kint => try fs.int(reg, e.ival),
+            .kflt => try fs.float(reg, e.u.nval),
+            .kint => try fs.int(reg, e.u.ival),
             .reloc => setA(fs.inst(e.info), reg),
             .nonreloc => if (reg != e.info) {
                 _ = try fs.codeAbc(.move, reg, e.info, 0);
@@ -843,9 +845,9 @@ pub const FuncState = struct {
             .true => try fs.boolT(),
             .false => try fs.boolF(),
             .nil => try fs.nilK(),
-            .kint => try fs.intK(e.ival),
-            .kflt => try fs.numberK(e.nval),
-            .kstr => try fs.stringK(e.strval),
+            .kint => try fs.intK(e.u.ival),
+            .kflt => try fs.numberK(e.u.nval),
+            .kstr => try fs.stringK(e.u.strval),
             .k => e.info,
             else => return false,
         };
@@ -978,7 +980,7 @@ pub const FuncState = struct {
         e.k = .nonreloc;
         try fs.reserveRegs(2);
         std.debug.assert(key.k == .kstr);
-        if (key.strval.isShort() and try fs.exp2K(key)) {
+        if (key.u.strval.isShort() and try fs.exp2K(key)) {
             _ = try fs.codeAbck(.self, base, ereg, key.info, false);
         } else {
             _ = try fs.exp2anyreg(key);
@@ -1011,7 +1013,7 @@ pub const FuncState = struct {
                 t.ind.idx = k.info;
                 t.k = .indexstr;
             } else if (isCint(k)) {
-                t.ind.idx = @intCast(k.ival);
+                t.ind.idx = @intCast(k.u.ival);
                 t.k = .indexi;
             } else {
                 t.ind.idx = try fs.exp2anyreg(k);
@@ -1067,7 +1069,7 @@ pub const FuncState = struct {
         event: State.Tm,
     ) Error!void {
         std.debug.assert(e2.k == .kint);
-        const v2: i32 = opcodes.int2sc(@intCast(e2.ival));
+        const v2: i32 = opcodes.int2sc(@intCast(e2.u.ival));
         try fs.finishBinExpVal(e1, e2, o, v2, flip, line, .mmbini, event);
     }
 
@@ -1082,7 +1084,7 @@ pub const FuncState = struct {
     /// `r1 + -I` for `r1 - I`); the metamethod keeps the original operand.
     fn finishBinExpNeg(fs: *FuncState, e1: *ExpDesc, e2: *ExpDesc, o: OpCode, line: u32, event: State.Tm) Error!bool {
         if (!isKint(e2)) return false;
-        const imm = e2.ival;
+        const imm = e2.u.ival;
         if (!(fitsC(imm) and fitsC(-%imm))) return false;
         const v2: i32 = @intCast(imm);
         try fs.finishBinExpVal(e1, e2, o, opcodes.int2sc(-v2), false, line, .mmbini, event);
@@ -1178,7 +1180,7 @@ pub const FuncState = struct {
 
     /// Applies prefix operator `opr` to `e`.
     pub fn prefix(fs: *FuncState, opr: UnOpr, e: *ExpDesc, line: u32) Error!void {
-        const ef: ExpDesc = .{ .k = .kint, .ival = 0 };
+        const ef: ExpDesc = .{ .k = .kint, .u = .{ .ival = 0 } };
         try fs.dischargeVars(e);
         switch (opr) {
             .minus, .bnot => {
@@ -1356,10 +1358,10 @@ fn toNumeral(e: *const ExpDesc, v: ?*Value) bool {
     if (e.hasJumps()) return false;
     switch (e.k) {
         .kint => if (v) |p| {
-            p.* = .int(e.ival);
+            p.* = .int(e.u.ival);
         },
         .kflt => if (v) |p| {
-            p.* = .float(e.nval);
+            p.* = .float(e.u.nval);
         },
         else => return false,
     }
@@ -1370,18 +1372,18 @@ fn const2exp(v: Value, e: *ExpDesc) void {
     switch (v.tag) {
         .int => {
             e.k = .kint;
-            e.ival = v.asInt();
+            e.u.ival = v.asInt();
         },
         .float => {
             e.k = .kflt;
-            e.nval = v.asFloat();
+            e.u.nval = v.asFloat();
         },
         .bool_false => e.k = .false,
         .bool_true => e.k = .true,
         .nil => e.k = .nil,
         .short_string, .long_string => {
             e.k = .kstr;
-            e.strval = v.asString();
+            e.u.strval = v.asString();
         },
         else => unreachable,
     }
@@ -1393,12 +1395,12 @@ fn isKint(e: *const ExpDesc) bool {
 
 /// An integer constant that fits in a C operand.
 fn isCint(e: *const ExpDesc) bool {
-    return isKint(e) and @as(u64, @bitCast(e.ival)) <= opcodes.max_c;
+    return isKint(e) and @as(u64, @bitCast(e.u.ival)) <= opcodes.max_c;
 }
 
 /// An integer constant that fits in an sC operand.
 fn isSCint(e: *const ExpDesc) bool {
-    return isKint(e) and fitsC(e.ival);
+    return isKint(e) and fitsC(e.u.ival);
 }
 
 /// The sB/sC field for an integer or integral float constant that fits,
@@ -1406,9 +1408,9 @@ fn isSCint(e: *const ExpDesc) bool {
 fn isSCnumber(e: *const ExpDesc, isfloat: *bool) ?i32 {
     var i: i64 = undefined;
     if (e.k == .kint) {
-        i = e.ival;
+        i = e.u.ival;
     } else if (e.k == .kflt) {
-        i = number.floatToInt(e.nval, .exact) orelse return null;
+        i = number.floatToInt(e.u.nval, .exact) orelse return null;
         isfloat.* = true;
     } else return null;
     if (!e.hasJumps() and fitsC(i)) return opcodes.int2sc(@intCast(i));
@@ -1448,7 +1450,7 @@ fn constFolding(o: FoldOp, e1: *ExpDesc, e2: *const ExpDesc) bool {
             const x = toIntExact(v1).?;
             const y = toIntExact(v2).?;
             e1.k = .kint;
-            e1.ival = switch (o) {
+            e1.u.ival = switch (o) {
                 .band => x & y,
                 .bor => x | y,
                 .bxor => x ^ y,
@@ -1463,7 +1465,7 @@ fn constFolding(o: FoldOp, e1: *ExpDesc, e2: *const ExpDesc) bool {
             const x = v1.asInt();
             const y = v2.asInt();
             e1.k = .kint;
-            e1.ival = switch (o) {
+            e1.u.ival = switch (o) {
                 .add => x +% y,
                 .sub => x -% y,
                 .mul => x *% y,
@@ -1491,7 +1493,7 @@ fn constFolding(o: FoldOp, e1: *ExpDesc, e2: *const ExpDesc) bool {
     };
     if (std.math.isNan(n) or n == 0) return false;
     e1.k = .kflt;
-    e1.nval = n;
+    e1.u.nval = n;
     return true;
 }
 

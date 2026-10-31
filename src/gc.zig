@@ -979,9 +979,10 @@ fn udata2finalize(heap: *Heap) *Header {
 }
 
 /// Whether `th` can run a finalizer now (`luaD_checkminstack`): room for
-/// nested native calls and a basic stack.
+/// nested native calls, in levels and in native stack, and a basic stack.
 fn checkMinStack(th: *Thread) bool {
     if (th.native_calls >= Thread.max_native_calls - 2) return false;
+    if (th.state.nearStackLimit(Thread.max_native_stack / 100)) return false;
     const old_top = th.top;
     defer th.top = old_top;
     th.top = finalizerTop(th);

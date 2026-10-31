@@ -117,6 +117,7 @@ const Labeldesc = struct {
 pub fn compile(th: *Thread, source: [:0]const u8, chunkname: []const u8) Value.Error!*Proto {
     const state = th.state;
     const gpa = state.heap.allocator();
+    if (th.native_calls == 0) state.markStack();
     var ls: Parser = .{
         .th = th,
         .state = state,
@@ -159,7 +160,8 @@ fn newString(ls: *Parser, b: []const u8) Error!*String {
 }
 
 /// Sets the error message, "chunk:line: msg near 'tok'", and fails.
-fn fail(ls: *Parser, line: u32, near: ?Token, comptime fmt: []const u8, args: anytype) Error {
+noinline fn fail(ls: *Parser, line: u32, near: ?Token, comptime fmt: []const u8, args: anytype) Error {
+    @branchHint(.cold);
     var aw: std.Io.Writer.Allocating = .fromArrayList(ls.gpa, &ls.msg);
     defer ls.msg = aw.toArrayList();
     aw.clearRetainingCapacity();
@@ -176,24 +178,28 @@ fn fail(ls: *Parser, line: u32, near: ?Token, comptime fmt: []const u8, args: an
 }
 
 /// A syntax error at the current token, `luaX_syntaxerror`.
-pub fn syntaxError(ls: *Parser, msg: []const u8) Error {
+pub noinline fn syntaxError(ls: *Parser, msg: []const u8) Error {
+    @branchHint(.cold);
     return ls.fail(ls.lx.line, ls.t, "{s}", .{msg});
 }
 
 /// A semantic error: no "near" part, at the line of the last token,
 /// `luaK_semerror`.
-fn semError(ls: *Parser, comptime fmt: []const u8, args: anytype) Error {
+noinline fn semError(ls: *Parser, comptime fmt: []const u8, args: anytype) Error {
+    @branchHint(.cold);
     return ls.fail(ls.lastline, null, fmt, args);
 }
 
-fn errorExpected(ls: *Parser, kind: Kind) Error {
+noinline fn errorExpected(ls: *Parser, kind: Kind) Error {
+    @branchHint(.cold);
     var buf: [32]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     Lexer.writeKind(&w, kind) catch unreachable;
     return ls.fail(ls.lx.line, ls.t, "{s} expected", .{w.buffered()});
 }
 
-pub fn errorLimit(ls: *Parser, fs: *FuncState, limit: i32, what: []const u8) Error {
+pub noinline fn errorLimit(ls: *Parser, fs: *FuncState, limit: i32, what: []const u8) Error {
+    @branchHint(.cold);
     const line = fs.f.linedefined;
     if (line == 0) return ls.fail(ls.lx.line, ls.t, "too many {s} (limit is {d}) in main function", .{ what, limit });
     return ls.fail(ls.lx.line, ls.t, "too many {s} (limit is {d}) in function at line {d}", .{ what, limit, line });
@@ -205,11 +211,17 @@ fn checkLimit(ls: *Parser, fs: *FuncState, v: i32, l: i32, what: []const u8) Err
 
 fn enterLevel(ls: *Parser) Error!void {
     ls.level += 1;
-    if (ls.level >= max_levels) {
-        ls.msg.clearRetainingCapacity();
-        try ls.msg.appendSlice(ls.gpa, "C stack overflow");
-        return error.SyntaxError;
-    }
+    if (ls.level >= max_levels or ls.state.nearStackLimit(0)) return ls.levelError();
+}
+
+/// "C stack overflow": too many levels of nesting, counted with the
+/// native calls under the compiler, or its native stack past the budget
+/// (`Thread.max_native_stack`).
+noinline fn levelError(ls: *Parser) Error {
+    @branchHint(.cold);
+    ls.msg.clearRetainingCapacity();
+    try ls.msg.appendSlice(ls.gpa, "C stack overflow");
+    return error.SyntaxError;
 }
 
 fn leaveLevel(ls: *Parser) void {
@@ -274,6 +286,11 @@ fn checkCondition(ls: *Parser, c: bool, msg: []const u8) Error!void {
 /// Skips `what`, which must close `who` opened at line `where`.
 fn checkMatch(ls: *Parser, what: Kind, who: Kind, where: u32) Error!void {
     if (try ls.testNext(what)) return;
+    return ls.matchError(what, who, where);
+}
+
+noinline fn matchError(ls: *Parser, what: Kind, who: Kind, where: u32) Error {
+    @branchHint(.cold);
     if (where == ls.lx.line) return ls.errorExpected(what);
     var bw: [32]u8 = undefined;
     var w1: std.Io.Writer = .fixed(&bw);
@@ -293,7 +310,7 @@ fn strCheckName(ls: *Parser) Error!*String {
 }
 
 fn codeString(s: *String) ExpDesc {
-    return .{ .k = .kstr, .strval = s };
+    return .{ .k = .kstr, .u = .{ .strval = s } };
 }
 
 fn codeName(ls: *Parser) Error!ExpDesc {
@@ -764,7 +781,9 @@ const ConsControl = struct {
     maxtostore: i32,
 };
 
-fn recField(ls: *Parser, cc: *ConsControl) Error!void {
+/// Out of line, so its three expressions are not in `constructor`'s frame
+/// on every level of nested list constructors.
+noinline fn recField(ls: *Parser, cc: *ConsControl) Error!void {
     const fs = ls.fs.?;
     const reg = fs.freereg;
     var key: ExpDesc = undefined;
@@ -973,8 +992,15 @@ fn primaryExp(ls: *Parser, v: *ExpDesc) Error!void {
 }
 
 fn suffixedExp(ls: *Parser, v: *ExpDesc) Error!void {
-    const fs = ls.fs.?;
     try ls.primaryExp(v);
+    try ls.suffixes(v);
+}
+
+/// The `{ '.' NAME | '[' exp ']' | ':' NAME funcargs | funcargs }` part of
+/// `suffixedexp`, out of line so a parenthesized expression's nesting
+/// does not carry its locals.
+noinline fn suffixes(ls: *Parser, v: *ExpDesc) Error!void {
+    const fs = ls.fs.?;
     while (true) {
         switch (ls.t.kind) {
             .dot => try ls.fieldSel(v),
@@ -1001,8 +1027,8 @@ fn suffixedExp(ls: *Parser, v: *ExpDesc) Error!void {
 
 fn simpleExp(ls: *Parser, v: *ExpDesc) Error!void {
     switch (ls.t.kind) {
-        .float => v.* = .{ .k = .kflt, .nval = ls.t.raw.data.float },
-        .int => v.* = .{ .k = .kint, .ival = ls.t.raw.data.int },
+        .float => v.* = .{ .k = .kflt, .u = .{ .nval = ls.t.raw.data.float } },
+        .int => v.* = .{ .k = .kint, .u = .{ .ival = ls.t.raw.data.int } },
         .string => v.* = codeString(ls.t.ts),
         .nil => v.* = .init(.nil, 0),
         .true => v.* = .init(.true, 0),
@@ -1078,7 +1104,9 @@ const unary_priority = 12;
 
 /// subexpr -> (simpleexp | unop subexpr) { binop subexpr }, for binary
 /// operators with priority above `limit`. Returns the first operator it
-/// did not handle.
+/// did not handle. The code generator's calls stay out of line: their
+/// locals would sit in this frame, which every level of nesting repeats
+/// on the native stack (`results/stack-20261031.md`).
 fn subExpr(ls: *Parser, v: *ExpDesc, limit: u8) Error!BinOpr {
     try ls.enterLevel();
     const uop = getUnOpr(ls.t.kind);
@@ -1086,7 +1114,7 @@ fn subExpr(ls: *Parser, v: *ExpDesc, limit: u8) Error!BinOpr {
         const line = ls.lx.line;
         try ls.next();
         _ = try ls.subExpr(v, unary_priority);
-        try ls.fs.?.prefix(uop, v, line);
+        try @call(.never_inline, FuncState.prefix, .{ ls.fs.?, uop, v, line });
     } else {
         try ls.simpleExp(v);
     }
@@ -1095,9 +1123,9 @@ fn subExpr(ls: *Parser, v: *ExpDesc, limit: u8) Error!BinOpr {
         var v2: ExpDesc = .{};
         const line = ls.lx.line;
         try ls.next();
-        try ls.fs.?.infix(op, v);
+        try @call(.never_inline, FuncState.infix, .{ ls.fs.?, op, v });
         const nextop = try ls.subExpr(&v2, priority[@intFromEnum(op)][1]);
-        try ls.fs.?.posfix(op, v, &v2, line);
+        try @call(.never_inline, FuncState.posfix, .{ ls.fs.?, op, v, &v2, line });
         op = nextop;
     }
     ls.leaveLevel();

@@ -9,6 +9,7 @@
 const Thread = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gc = @import("gc.zig");
 const Value = @import("Value.zig");
 const Proto = @import("Proto.zig");
@@ -115,6 +116,14 @@ const error_space = 200;
 pub const extra_stack = 5;
 /// Deepest nesting of native-to-Lua calls, `LUAI_MAXCCALLS`.
 pub const max_native_calls = 200;
+/// Native stack that nested native-to-Lua calls, and the compiler's
+/// nesting, may use below the host's call into Lua before "C stack
+/// overflow", whatever the count of levels: with it a host thread of
+/// 256 KiB runs any script, where some natives (`string.gsub` with a
+/// function, as in the reference) need more than 1 KiB a level. Debug
+/// builds' frames are several times larger, so they get more
+/// (`results/stack-20261031.md`).
+pub const max_native_stack: usize = if (builtin.mode == .Debug) 4 << 20 else 192 << 10;
 
 const initial_stack = 2 * min_stack;
 
@@ -371,7 +380,8 @@ pub fn throwRaw(th: *Thread, v: Value) Error {
 
 /// Raises "error in error handling", without the message handler: a
 /// stack overflow while handling one, or runaway nesting of handlers.
-pub fn errorInErrorHandling(th: *Thread) Error {
+pub noinline fn errorInErrorHandling(th: *Thread) Error {
+    @branchHint(.cold);
     th.err = .string(try th.state.newString("error in error handling"));
     th.errerr = true;
     return error.LuaError;
@@ -379,7 +389,8 @@ pub fn errorInErrorHandling(th: *Thread) Error {
 
 /// Raises a formatted error message, prefixed with the chunk and line of
 /// the running Lua function as `error` with level 1 does.
-pub fn runError(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
+pub noinline fn runError(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
+    @branchHint(.cold);
     var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
     defer aw.deinit();
     const w = &aw.writer;

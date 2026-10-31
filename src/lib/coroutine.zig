@@ -32,7 +32,8 @@ pub fn open(state: *State) Error!void {
     try state.globals.setStr(&state.heap, try state.newString("coroutine"), .table(t));
 }
 
-fn argError(th: *Thread, arg: u32, comptime fmt: []const u8, args: anytype) Error {
+noinline fn argError(th: *Thread, arg: u32, comptime fmt: []const u8, args: anytype) Error {
+    @branchHint(.cold);
     var msgbuf: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&msgbuf, fmt, args) catch "?";
     return debuginfo.argError(th, arg, "?", msg);

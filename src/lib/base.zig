@@ -132,7 +132,8 @@ fn typeNameForError(th: *Thread, v: ?Value) []const u8 {
 
 /// "bad argument #arg to 'fname' (expected expected, got type)",
 /// `luaL_typeerror`.
-pub fn typeError(th: *Thread, base: u32, arg: u32, fname: []const u8, expected: []const u8) Error {
+pub noinline fn typeError(th: *Thread, base: u32, arg: u32, fname: []const u8, expected: []const u8) Error {
+    @branchHint(.cold);
     var buf: [128]u8 = undefined;
     const got = typeNameForError(th, opt(th, base, arg));
     const msg = std.fmt.bufPrint(&buf, "{s} expected, got {s}", .{ expected, got }) catch &buf;
