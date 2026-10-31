@@ -163,7 +163,7 @@ diff *FILES:
     done
     [ ${#failed[@]} -eq 0 ]
 
-[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, io handles shared with C (stream.c, luaposix's posix.stdio), the own tests of lpeg, lua-cjson, and luafilesystem, and the C-API build's io and os on files.lua and test/diff")]
+[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, io handles shared with C (stream.c, luaposix's posix.stdio), libraries closed with the state (unload.c), the own tests of lpeg, lua-cjson, and luafilesystem, and the C-API build's io and os on files.lua and test/diff")]
 [group("test")]
 capi-test:
     #!/usr/bin/env bash
@@ -230,6 +230,10 @@ capi-test:
         cc "${cflags[@]}" -w -I"$LUAPOSIX_SRC/ext/include" -DPACKAGE='"luaposix"' -DVERSION='"test"' -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -o "$p/posix/$m.so" "$LUAPOSIX_SRC/ext/posix/$m.c"
     done
     run posix test/capi cat sh -c 'LUA_CPATH="'"$p"'/?.so" "$LUA" posix.lua'
+    # Libraries close with the state, after every finalizer, the last
+    # loaded first.
+    for n in 1 2; do cc "${cflags[@]}" -DN=$n -o "$out/unload$n.so" test/capi/unload.c; done
+    run unload test/capi cat sh -c 'LUA_CPATH="'"$out"'/?.so" "$LUA" unload.lua'
     # The C-API build's io is C's stdio, not the default build's: the
     # suite's files.lua (but its clock line) and every differential test.
     run files test/lua-5.5.1-tests "grep -v ^test.done.on" sh -c '"$LUA" -e"_U=true _soft=true _port=true _nomsg=true" files.lua'

@@ -1,14 +1,15 @@
 //! C libraries for the package library in a C-API build, after
 //! loadlib.c's `LUA_USE_DLOPEN` part: `dlopen` with `RTLD_NOW`, global
 //! symbols only for `loadlib(path, "*")`, handles kept in the registry's
-//! `_CLIBS` by path, and `luaopen_` names with `.` as `_` and the part
-//! before a `-` tried first. Libraries stay loaded until the process
-//! exits; the reference closes them with the state.
+//! `_CLIBS` by path and in load order, and `luaopen_` names with `.` as
+//! `_` and the part before a `-` tried first. `closeLibs` closes them when
+//! the state closes.
 
 const std = @import("std");
 const Value = @import("../Value.zig");
 const String = @import("../String.zig");
 const Thread = @import("../Thread.zig");
+const State = @import("../State.zig");
 const package = @import("../lib/package.zig");
 const capi = @import("capi.zig");
 
@@ -53,7 +54,10 @@ pub fn lookForFunc(th: *Thread, path_in: []const u8, sym_in: []const u8) Error!L
     if (handle == null) {
         // `key`'s bytes end in a zero, as dlopen needs.
         handle = open(key.bytesZ().ptr, sym.len > 0 and sym[0] == '*') orelse return .{ .open = dlerror() };
+        const n: i64 = @intCast(clibs.length() + 1);
+        // On a memory error the handle stays open until the process ends.
         try clibs.setStr(&state.heap, key, .lightUserdata(handle));
+        try clibs.setInt(&state.heap, n, .lightUserdata(handle));
     }
     if (sym.len > 0 and sym[0] == '*') return .{ .ok = .true };
     var buf: [256]u8 = undefined;
@@ -83,4 +87,20 @@ pub fn loadFunc(th: *Thread, filename: *String, modname_in: []const u8) Error!Lo
         return lookForFunc(th, filename.bytes(), buf[0 .. "luaopen_".len + rest.len]);
     }
     return lookForFunc(th, filename.bytes(), buf[0 .. "luaopen_".len + name.len]);
+}
+
+/// Closes the libraries `lookForFunc` opened, the last opened first, as
+/// the reference does when `lua_close` frees each library's string: after
+/// every finalizer has run, so no `__gc` of a module runs after its code
+/// is unmapped. `State.destroy` calls it.
+pub fn closeLibs(state: *State) void {
+    const key = state.newString("_CLIBS") catch return;
+    const v = state.registry.getStr(key);
+    if (v.tag != .table) return;
+    const clibs = v.asTable();
+    var n: i64 = @intCast(clibs.length());
+    while (n >= 1) : (n -= 1) {
+        const h = clibs.get(.int(n));
+        if (h.tag == .light_userdata) _ = std.c.dlclose(h.asLightUserdata().?);
+    }
 }

@@ -11,6 +11,8 @@ const String = @import("String.zig");
 const Table = @import("Table.zig");
 const Thread = @import("Thread.zig");
 const vm = @import("vm.zig");
+const lua_options = @import("lua_options");
+const loadlib = @import("capi/loadlib.zig");
 
 const Error = Value.Error;
 
@@ -166,6 +168,9 @@ fn fixedString(state: *State, b: []const u8) error{OutOfMemory}!*String {
 /// thread and every pending finalizer.
 pub fn destroy(state: *State) void {
     vm.closeState(state);
+    // C libraries go once nothing can call into them, before their
+    // objects are freed, as lua_close's order has it.
+    if (lua_options.c_api) loadlib.closeLibs(state);
     if (state.gsub_scratch) |b| state.heap.raw().free(b);
     const gpa = state.heap.backing;
     gc.freeAll(&state.heap);
