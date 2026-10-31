@@ -152,10 +152,17 @@ reference.
     reference's, instruction for instruction. `just bytecode` diffs our
     listing (`zig build listing`, `Code.writeListing`, luac's
     `PrintFunction` format) with `luac -l -l -p` for every suite and bench
-    file, addresses masked: 49 of 49 identical. Keep it that way; a
+    file, addresses masked: 54 of 54 identical. Keep it that way; a
     deliberate divergence goes in the recipe with the reason. Line info is
     one absolute line per instruction (`Proto.lineinfo`), not luac's
-    delta encoding; `dump.zig` re-encodes it for `string.dump`.
+    delta encoding; `dump.zig` re-encodes it for `string.dump`. That
+    costs about 3 bytes per instruction against luac's encoding (185 KiB
+    of bench/config.lua's chunk); measure luac's encoding when the memory
+    of loaded code matters. Wave 6 took two store forwarding stalls out
+    of the compiler, the token returned by value and the constant
+    cache's generic hash: building and loading a large table constructor
+    64 times runs 24% faster than on the reference
+    (`results/compiler-config-20261031.md`).
 14. **Binary chunks are luac's.** Landed: `dump.zig` (`string.dump`) and
     `undump.zig` (`load` of a chunk starting with ESC) read and write
     5.5.1's format exactly, so `luac -o` output runs here and our dumps
@@ -193,7 +200,11 @@ reference.
     API alone, nothing left internal. The existing API paths cost what they
     did (geomean +0.3%; `zig_calls_lua` +2.2%, layout-sized); `lua` on the API
     matches `lua` on the engine (−0.26% time, +0.01% peak RSS)
-    (`results/api-wave5-20261031.md`).
+    (`results/api-wave5-20261031.md`). Wave 6 finished the status
+    switch (`vm.pcall` and `vm.closeThread` return `vm.Status`; a dead
+    coroutine keeps its kind in `Thread.died`, which `coroutine.wrap`
+    reads) and added `Coroutine.close`, `Coroutine.status`, and
+    `State.len`, with which `lua` counts `#arg` through `__len`.
 
 ## Hot-path rules
 
@@ -250,6 +261,10 @@ upvalues, method calls through metatables, and coroutines. `just bench-compare`
 runs each on our binary and on reference Lua 5.5.1, interleaved and pinned to
 one core, and prints benchstat input: wall time, and each process's peak RSS
 (GNU time's `%M`) as the `peak-RSS-KiB` unit. Memory is a gate like time.
+Four programs are shaped like real workloads rather than one feature: a
+pure-Lua JSON encoder and decoder (`json`), templated HTML and text
+reports (`template`), a class-based simulation (`oop`), and a large
+table constructor compiled with `load` and queried (`config`).
 
 ## Order of work
 
@@ -315,3 +330,11 @@ by the loader instead of before each dispatch (both under the hot-path
 rules), and the hash part against open addressing (decision 8, kept). The
 comparison with the reference at the end of wave 5 is
 `results/bench-compare-wave5-20261031.md`.
+
+Wave 6: the API cleanups left from wave 5 (under decision 16), four
+realistic benchmark programs, and the compiler's two stalls (decision
+13). Inherited method lookups that repeat the object's and the class's
+lookup in `getSlow` were measured and not landed: the gain (methods
+−6%) is the size of the loop's layout noise
+(`results/index-chain-20261031.md`). The comparison with the reference
+at the end of wave 6 is `results/bench-compare-wave6-20261031.md`.
