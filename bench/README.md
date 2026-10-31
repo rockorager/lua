@@ -38,7 +38,7 @@ Each program is plain Lua 5.5 with no modules. It takes one size argument, `lua 
 | `ref`  | the dev shell's `lua`: reference C Lua 5.5.1 from nixpkgs |
 | `ours` | `zig-out/bin/lua` from `zig build -Doptimize=ReleaseFast` |
 
-`just optimize=ReleaseSafe bench-compare` builds our arm in another mode. Several modes, as in `just optimize="ReleaseFast ReleaseSafe" bench-compare`, give one arm each, named `ours-ReleaseFast` and `ours-ReleaseSafe`.
+`just optimize=ReleaseSafe bench-compare` builds our arm in another mode. Several modes, as in `just optimize="ReleaseFast ReleaseSafe" bench-compare`, give one arm each, named `ours-ReleaseFast` and `ours-ReleaseSafe`. A mode ending in `-capi`, as in `just optimize="ReleaseFast ReleaseFast-capi" bench-compare`, builds that arm with the C API (`-Dc-api=true`).
 
 Until `build.zig` installs `zig-out/bin/lua`, `just bench-compare` says so and times the reference alone.
 
@@ -53,3 +53,7 @@ Every run's output must match the reference's first run. A program whose output 
 ## The embedding API
 
 `bench/api/main.zig` is a Zig program, not a Lua one: it times calls through the embedding API (`lua.State`) against the same work written directly on the engine, as the standard library writes it. `just bench-api [ROUNDS] [SCENARIOS...]` runs both arms in interleaved rounds pinned to the last core, checks that they did the same work, and compares time per operation and peak RSS with benchstat.
+
+## The C API
+
+`bench/capi/capibench.c` is a C module built against the installed headers, and `bench/capi/calls.lua` calls its functions in a tight loop. `just bench-capi [ROUNDS] [N]` builds our `lua` with `-Dc-api=true`, times the cost of a call into C (an empty function, one with argument checks, and one that calls back into Lua) on it and on the reference, the startup time and peak memory of `lua -e ''` on the reference and both of our builds, and the native stack each C-to-Lua call level takes.

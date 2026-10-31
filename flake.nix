@@ -42,7 +42,17 @@
               # Profiling the interpreter: `perf record` and `perf annotate`
               # on a ReleaseFast build.
               perf
+              # `just capi-test`: lua-cjson's tests generate their UTF-8
+              # data with Perl. The C compiler is mkShell's.
+              perl
             ];
+
+            # `just capi-test` builds these real C modules against
+            # include/ and runs their own tests on the C-API lua: the
+            # sources nixpkgs pins for its Lua 5.5 packages.
+            LPEG_SRC = pkgs.lua5_5.pkgs.lpeg.src;
+            LUA_CJSON_SRC = pkgs.lua5_5.pkgs.lua-cjson.src;
+            LFS_SRC = pkgs.lua5_5.pkgs.luafilesystem.src;
           };
         };
     };

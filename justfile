@@ -163,8 +163,114 @@ diff *FILES:
     done
     [ ${#failed[@]} -eq 0 ]
 
+[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, and the own tests of lpeg, lua-cjson, and luafilesystem")]
+[group("test")]
+capi-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    zig build -Dc-api=true -Doptimize=ReleaseSafe
+    ours=$PWD/zig-out/bin/lua
+    ref=$(command -v lua)
+    inc=$PWD/zig-out/include
+    out=$PWD/zig-out/capi
+    rm -rf "$out" && mkdir -p "$out"
+    cflags=(-Wall -O2 "-I$inc" -fPIC -shared)
+    failed=()
+    # run NAME DIR FILTER CMD...: CMD on both interpreters ($LUA in it),
+    # output and exit status compared after FILTER, addresses masked.
+    run() {
+        local name=$1 dir=$2 filter=$3
+        shift 3
+        for arm in ref ours; do
+            local bin=$ref
+            [ $arm = ours ] && bin=$ours
+            local status=0
+            (cd "$dir" && LUA=$bin "$@") > "$out/$name.$arm" 2>&1 || status=$?
+            echo "exit status $status" >> "$out/$name.$arm"
+            sed -i -E 's/0x[0-9a-f]+/ADDR/g; s#^'"$bin"':#lua:#' "$out/$name.$arm"
+        done
+        if cmp -s <($filter < "$out/$name.ref") <($filter < "$out/$name.ours"); then
+            echo "same     $name"
+        else
+            echo "DIFFERS  $name"
+            diff <($filter < "$out/$name.ref") <($filter < "$out/$name.ours") | head -n 20 || true
+            failed+=("$name")
+        fi
+    }
+    # The suite's C modules, built as its makefile builds them.
+    s=$out/suite
+    mkdir -p "$s/libs/P1"
+    cp test/lua-5.5.1-tests/attrib.lua "$s/"
+    for lib in lib1 lib11 lib2 lib21; do cc "${cflags[@]}" -o "$s/libs/$lib.so" "test/lua-5.5.1-tests/libs/$lib.c"; done
+    cc "${cflags[@]}" -o "$s/libs/lib2-v2.so" test/lua-5.5.1-tests/libs/lib22.c
+    run attrib "$s" cat sh -c '"$LUA" -e"_U=true _soft=true _nomsg=true" attrib.lua'
+    # Errors, continuations, and lauxlib.
+    cc "${cflags[@]}" -o "$out/capitest.so" test/capi/capitest.c
+    run capitest test/capi cat sh -c 'LUA_CPATH="'"$out"'/?.so" "$LUA" -W errors.lua'
+    # lpeg.
+    mkdir -p "$out/lpeg" && tar xzf "$LPEG_SRC" -C "$out/lpeg" --strip-components=1
+    (cd "$out/lpeg" && cc "${cflags[@]}" -std=c99 -o lpeg.so lpvm.c lpcap.c lptree.c lpcode.c lpprint.c lpcset.c)
+    run lpeg "$out/lpeg" cat sh -c '"$LUA" test.lua'
+    # lua-cjson: its table output follows hash order, which differs, so
+    # only the verdicts compare.
+    cp -r "$LUA_CJSON_SRC" "$out/cjson" && chmod -R u+w "$out/cjson"
+    (cd "$out/cjson" && cc "${cflags[@]}" -o cjson.so lua_cjson.c strbuf.c fpconv.c && cd tests && perl genutf8.pl > utf8.dat 2> /dev/null)
+    run cjson "$out/cjson/tests" "grep -E ^(==>|exit)" sh -c 'LUA_PATH="../lua/?.lua;;" LUA_CPATH="../?.so" "$LUA" test.lua'
+    # luafilesystem, without `lfs.setmode` on an io file: that needs io's
+    # files to be luaL_Stream with a FILE*, which they are not.
+    cp -r "$LFS_SRC" "$out/lfs" && chmod -R u+w "$out/lfs"
+    (cd "$out/lfs" && cc "${cflags[@]}" -o lfs.so src/lfs.c)
+    sed -i '/-- Checking text\/binary modes/,/bad error message for setmode/d' "$out/lfs/tests/test.lua"
+    run lfs "$out/lfs/tests" cat sh -c 'LUA_CPATH="../?.so" "$LUA" test.lua'
+    [ ${#failed[@]} -eq 0 ] || { printf 'differs: %s\n' "${failed[@]}"; exit 1; }
+
+[doc("The C API's costs (bench/capi): CPU ns per call of a C function in a tight loop (nop, add, callback, and the empty loop), our C-API lua against the reference, and startup (`lua -e ''`) wall time and peak RSS on the reference, our default build, and our C-API build, in interleaved rounds on one core, then benchstat; and the native stack bytes per level of C -> lua_call -> Lua nesting")]
+[group("bench")]
+bench-capi ROUNDS="10" N="10000000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=$PWD/zig-out/bench-capi
+    rm -rf "$out" && mkdir -p "$out"
+    zig build -Doptimize=ReleaseFast --prefix "$out/default"
+    zig build -Doptimize=ReleaseFast -Dc-api=true --prefix "$out/capi"
+    cc -Wall -O2 "-I$out/capi/include" -fPIC -shared -o "$out/capibench.so" bench/capi/capibench.c
+    declare -A bin=([ref]="$(command -v lua)" [default]="$out/default/bin/lua" [capi]="$out/capi/bin/lua")
+    cpu=$(grep -m1 '^model name' /proc/cpuinfo | sed 's/^model name[[:space:]]*:[[:space:]]*/cpu: /')
+    for f in calls-ref calls-capi start-ref start-default start-capi; do echo "$cpu" > "$out/$f.txt"; done
+    gnutime=$(type -P time)
+    core=$(( $(nproc) - 1 ))
+    export LUA_CPATH="$out/?.so"
+    for round in $(seq 0 $(( {{ ROUNDS }} - 1 ))); do
+        echo "round $(( round + 1 ))/{{ ROUNDS }}" >&2
+        calls=(ref capi)
+        for s in loop nop add callback; do
+            for i in 0 1; do
+                arm=${calls[$(( (round + i) % 2 ))]}
+                (cd bench/capi && taskset -c "$core" "${bin[$arm]}" calls.lua $s {{ N }} 2> "$out/sum.$arm.$s") >> "$out/calls-$arm.txt"
+            done
+            cmp -s "$out/sum.ref.$s" "$out/sum.capi.$s" || { echo "the arms computed different sums on $s" >&2; exit 1; }
+        done
+        # Startup: 20 runs of `lua -e ''` per row. GNU time runs under
+        # taskset, not over it: ru_maxrss keeps the high-water mark across
+        # exec, so taskset's own 2.3 MiB would floor every arm.
+        starts=(ref default capi)
+        for i in 0 1 2; do
+            arm=${starts[$(( (round + i) % 3 ))]}
+            start=${EPOCHREALTIME/[.,]/}
+            for _ in $(seq 20); do taskset -c "$core" "$gnutime" -f %M -o "$out/rss" "${bin[$arm]}" -e ''; done
+            end=${EPOCHREALTIME/[.,]/}
+            printf 'BenchmarkStartup\t20\t%d ns/op\t%d peak-RSS-KiB\n' $(( (end - start) * 50 )) "$(tail -n 1 "$out/rss")" >> "$out/start-$arm.txt"
+        done
+    done
+    benchstat ref="$out/calls-ref.txt" capi="$out/calls-capi.txt" | tee "$out/benchstat.txt"
+    benchstat ref="$out/start-ref.txt" default="$out/start-default.txt" capi="$out/start-capi.txt" | tee -a "$out/benchstat.txt"
+    for arm in ref capi; do
+        echo "native stack per C -> Lua level, $arm: $(cd bench/capi && "${bin[$arm]}" calls.lua stack 100) bytes" | tee -a "$out/benchstat.txt"
+    done
+
 # The build modes `just bench-compare` times our lua in, one arm each:
 # `just optimize=ReleaseSafe bench-compare`, or "ReleaseFast ReleaseSafe".
+# A mode with a `-capi` suffix builds with -Dc-api=true.
 optimize := "ReleaseFast"
 
 [doc("Time every bench/ program, or only PROGRAMS, on our lua (built in each of `optimize`'s modes, ReleaseFast by default) and the reference lua: interleaved rounds on one core, wall time and peak RSS per run, checksums checked, then benchstat. The numbers are not claims")]
@@ -181,7 +287,9 @@ bench-compare ROUNDS="10" *PROGRAMS:
     modes=({{ optimize }})
     for mode in "${modes[@]}"; do
         rm -f zig-out/bin/lua
-        zig build -Doptimize="$mode"
+        capi=false
+        [ "${mode%-capi}" != "$mode" ] && capi=true
+        zig build -Doptimize="${mode%-capi}" -Dc-api=$capi
         if [ ! -x zig-out/bin/lua ]; then
             echo "skipping our arm: build.zig does not install zig-out/bin/lua yet, so this times the reference alone"
             break
