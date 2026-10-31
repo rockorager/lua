@@ -262,7 +262,7 @@ fn runChunk(th: *Thread, src: [:0]const u8, n: u32) Error!i64 {
     const func = th.top;
     th.push(f);
     th.push(.int(n));
-    if (!internal.vm.pcall(th, func, 1)) return error.LuaError;
+    if (internal.vm.pcall(th, func, 1) != .ok) return error.LuaError;
     const r = th.stack[func].asInt();
     th.top = func;
     return r;
@@ -291,7 +291,7 @@ fn runInternal(state: *lua.State, scenario: Scenario, n: u32) !i64 {
                 th.push(s.registry.getInt(@intFromEnum(r)));
                 th.push(.int(acc));
                 th.push(.int(@intCast(i)));
-                if (!internal.vm.pcall(th, func, 1)) return error.LuaError;
+                if (internal.vm.pcall(th, func, 1) != .ok) return error.LuaError;
                 const v = th.stack[func];
                 acc = if (v.isInt()) v.asInt() else internal.auxlib.toInteger(v) orelse return error.LuaError;
                 th.top = func;
@@ -350,7 +350,7 @@ fn runInternal(state: *lua.State, scenario: Scenario, n: u32) !i64 {
                 const func = th.top;
                 th.push(s.registry.getInt(@intFromEnum(r)));
                 th.push(.int(@intCast(i)));
-                if (!internal.vm.pcall(th, func, -1)) return error.LuaError;
+                if (internal.vm.pcall(th, func, -1) != .ok) return error.LuaError;
                 for (th.stack[func..th.top]) |v| acc +%= if (v.isInt()) v.asInt() else internal.auxlib.toInteger(v) orelse return error.LuaError;
                 th.top = func;
             }

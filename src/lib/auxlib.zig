@@ -464,7 +464,7 @@ pub const testing = struct {
         try th.ensureStack(@intCast(args.len + 1));
         th.push(f);
         for (args) |v| th.push(v);
-        if (!vm.pcall(th, 1, -1)) return .{ .err = th.stack[1] };
+        if (vm.pcall(th, 1, -1) != .ok) return .{ .err = th.stack[1] };
         return .{ .ok = th.stack[1..th.top] };
     }
 

@@ -924,11 +924,11 @@ fn callFinalizer(state: *State, th: *Thread) void {
     th.push(v);
     const caller = th.frames.items.len - 1;
     th.frames.items[caller].flags.fin = true;
-    const ok = vm.pcall(th, func, 0);
+    const status = vm.pcall(th, func, 0);
     th.frames.items[caller].flags.fin = false;
     th.allowhook = old_allowhook;
     heap.stopped = old_stopped;
-    if (!ok) warnError(state, th.stack[func], "__gc");
+    if (status != .ok) warnError(state, th.stack[func], "__gc");
     th.top = old_top;
 }
 

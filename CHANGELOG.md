@@ -41,6 +41,8 @@ All notable changes to lua are recorded here. The format follows
 - ReleaseSafe builds no longer check each instruction's opcode before dispatching it, since the compiler and the binary loader only produce valid ones: dispatch-heavy programs run 5–12% faster in ReleaseSafe.
 - `state.decode` and `state.decodeAlloc` take a `lua.DecodeOptions` last; pass `.{}` for the old behavior.
 - A script that raises "not enough memory" itself now returns `error.Runtime`; `error.OutOfMemory` means an allocation failed.
+- `vm.pcall` and `vm.closeThread` return a `vm.Status` instead of a `bool`; test for `.ok`.
+- A function made by `coroutine.wrap` adds the caller's position to an error raised as `error("not enough memory", 0)` inside it, like any other error; only a failed allocation passes through unpositioned.
 - `state.errorTraceback()` for an error object whose `__tostring` returns a string is that string, as the standalone `lua` prints it.
 - The standalone `lua` is built on the embedding API. An error in `_PROMPT`'s `__tostring` now ends it, a non-string error from `print` in the interactive loop shows as "(null)", and a `__tostring` that returns a non-string gives "(error object is a table value)" and a traceback, as with the reference.
 

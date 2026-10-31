@@ -708,10 +708,11 @@ fn loadFromReader(th: *Thread, reader: Value, name: []const u8, mode: []const u8
         try th.ensureStack(1);
         const func = th.top;
         th.push(reader);
-        if (!vm.pcall(th, func, 1)) {
+        const status = vm.pcall(th, func, 1);
+        if (status != .ok) {
             const e = th.stack[func];
             th.top = func;
-            return th.throw(e);
+            return if (status == .memory) error.OutOfMemory else th.throw(e);
         }
         const piece = th.stack[func];
         th.top = func;

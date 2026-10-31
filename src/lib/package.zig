@@ -410,7 +410,7 @@ pub const testing = struct {
         try lib.openLibs(th, &host);
         const func = th.top;
         th.push(try base.loadChunk(th, src, "=test", "t"));
-        if (!vm.pcall(th, func, 1)) {
+        if (vm.pcall(th, func, 1) != .ok) {
             const e = th.stack[func];
             std.debug.print("error: {s}\n", .{if (e.isString()) e.asString().bytes() else "?"});
             return error.TestUnexpectedResult;

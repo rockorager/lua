@@ -186,3 +186,12 @@ local fh = io.open(fname, "w") fh:write("local a = coroutine.yield('in dofile') 
 local dco = coroutine.wrap(function() return dofile(fname) end)
 print(dco()) print(dco(21))
 os.remove(fname)
+
+-- "not enough memory" raised by Lua through wrap is an ordinary error,
+-- positioned at the caller; so is resuming the dead coroutine again.
+-- (Raised at level 0 the reference makes it a memory error, as
+-- `lua_error` does for that exact string; here only a failed allocation
+-- is one.)
+local memco = coroutine.wrap(function() error("not enough memory") end)
+print(pcall(function() return memco() end))
+print(pcall(function() return memco() end))

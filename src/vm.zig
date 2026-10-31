@@ -125,12 +125,12 @@ pub const Status = enum {
     handler,
 };
 
-/// `call` in protected mode. On an error the stack is unwound to `func`,
-/// pending to-be-closed variables are closed, the error object is left at
-/// `func`, `top` is `func + 1`, and the result is false. Allocation failure
-/// leaves the "not enough memory" string. `pcallMsgh` says which error.
-pub fn pcall(th: *Thread, func: u32, nresults: i16) bool {
-    return pcallMsgh(th, func, nresults, 0) == .ok;
+/// `call` in protected mode, and how it ended. On an error the stack is
+/// unwound to `func`, pending to-be-closed variables are closed, the error
+/// object is left at `func`, and `top` is `func + 1`. Allocation failure
+/// leaves the "not enough memory" string.
+pub fn pcall(th: *Thread, func: u32, nresults: i16) Status {
+    return pcallMsgh(th, func, nresults, 0);
 }
 
 /// `pcall` with a message handler and its status (`lua_pcall`): `msgh` is
@@ -481,6 +481,7 @@ pub fn resumeThread(co: *Thread, from: ?*Thread, nargs: u32) Error!Resumed {
         .yield => return .{ .status = .yield, .nres = co.frame().aux },
         .err => |e| {
             co.status = .dead;
+            co.died = e.status;
             const f = co.frame();
             if (f.flags.lua and co.top < f.top) co.top = f.top;
             try co.ensureStack(2);
@@ -603,13 +604,16 @@ fn recoverAt(th: *Thread, level: usize, err: Value) void {
 /// Closes coroutine `co`: unwinds its frames, closes its pending
 /// to-be-closed variables, and empties its stack (`lua_closethread`).
 /// A dead coroutine passes its error object to the `__close` handlers.
-/// Returns true when it ends without an error; otherwise the error (the
-/// coroutine's or one a handler raised) is on top of `co`'s stack.
-pub fn closeThread(co: *Thread, from: ?*Thread) bool {
+/// Returns `.ok` when it ends without an error; otherwise the error (the
+/// coroutine's or one a handler raised) is on top of `co`'s stack, and
+/// the status says which kind it is.
+pub fn closeThread(co: *Thread, from: ?*Thread) Status {
     co.native_calls = if (from) |f| f.native_calls else 0;
-    const err: ?Value = if (co.status == .dead) co.stack[co.top - 1] else null;
+    const dead = co.status == .dead;
+    const err: ?Value = if (dead) co.stack[co.top - 1] else null;
+    var status: Status = if (dead) co.died else .ok;
     co.resetFrames();
-    const result = closeProtected(co, 1, err, null);
+    const result = closeProtected(co, 1, err, &status);
     // Closing from inside a handler ended this close too, unless this is
     // that inner close itself.
     if (from != co) co.closed_self = false;
@@ -620,7 +624,9 @@ pub fn closeThread(co: *Thread, from: ?*Thread) bool {
         co.top = 1;
     }
     co.shrinkStack();
-    return result == null;
+    // A `closeSelf` from a handler leaves its result without a status.
+    if (result == null) return .ok;
+    return if (status == .ok) .runtime else status;
 }
 
 /// What `lua_close` does before freeing the state, for a native that ends
@@ -3217,7 +3223,7 @@ test "runtime errors carry position and unwind to pcall" {
     const th = state.main;
     const func = th.top;
     th.push(.luaClosure(try mainClosure(state, p)));
-    try testing.expect(!pcall(th, func, -1));
+    try testing.expectEqual(Status.runtime, pcall(th, func, -1));
     try testing.expectEqualStrings("test:2: attempt to index a nil value", th.stack[func].asString().bytes());
     try testing.expectEqual(func + 1, th.top);
     try testing.expectEqual(@as(usize, 1), th.frames.items.len);
@@ -3236,7 +3242,7 @@ test "runtime errors carry position and unwind to pcall" {
     });
     th.top = func;
     th.push(.luaClosure(try mainClosure(state, q)));
-    try testing.expect(!pcall(th, func, -1));
+    try testing.expectEqual(Status.runtime, pcall(th, func, -1));
     try testing.expectEqualStrings("?:?: attempt to divide by zero", th.stack[func].asString().bytes());
 
     // Calling nil.
@@ -3246,7 +3252,7 @@ test "runtime errors carry position and unwind to pcall" {
     });
     th.top = func;
     th.push(.luaClosure(try mainClosure(state, r)));
-    try testing.expect(!pcall(th, func, -1));
+    try testing.expectEqual(Status.runtime, pcall(th, func, -1));
     try testing.expectEqualStrings("?:?: attempt to call a nil value", th.stack[func].asString().bytes());
 }
 
@@ -3389,7 +3395,7 @@ test "deep Lua recursion uses heap, and overflow is a catchable error" {
     const th = state.main;
     const func = th.top;
     th.push(.luaClosure(try mainClosure(state, main)));
-    try testing.expect(!pcall(th, func, -1));
+    try testing.expectEqual(Status.runtime, pcall(th, func, -1));
     try testing.expectEqualStrings("?:?: stack overflow", th.stack[func].asString().bytes());
 }
 

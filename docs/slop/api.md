@@ -63,12 +63,21 @@ Writes go through `Table.set`/`setStr`/`setInt`, `State.setMetatable`, and
   a `__close` handler raises over the error. The API maps `memory` to
   `error.OutOfMemory` and the rest to `error.Runtime`, so a Lua
   `error("not enough memory")` is `error.Runtime` now; wave 4 compared the
-  object with the interned memerr string. `vm.pcall` stays a `bool`
-  (`pcallMsgh(...) == .ok`) because `auxlib.testing.call`, in another
-  orb's file, tests it with `!`; its other callers want success alone.
-  `coroutine.wrap`'s `auxWrap` still compares with memerr to decide
-  whether to add a position (lcorolib checks `LUA_ERRMEM`); it could use
-  `Resumed.err` once `auxResume` passes it on.
+  object with the interned memerr string. Wave 6 finished the switch:
+  `vm.pcall` returns the `Status` too, and every caller tests it
+  (`auxlib.testing.call`, `gc`'s finalizer call, `load`'s reader, which
+  passes a memory error on as `error.OutOfMemory`). A coroutine that dies
+  keeps its kind in `Thread.died` (a dead coroutine's `lua_status`), and
+  `vm.closeThread` returns a `Status` that starts from it and takes a
+  `__close` handler's error over it, as `lua_closethread` does; so
+  `coroutine.wrap`'s `auxWrap` adds a position unless closing says
+  `.memory`, lcorolib's `LUA_ERRMEM` test. One divergence stays on
+  purpose: the reference's `lua_error` turns an error object that _is_
+  the memerr string into a memory error, so
+  `error("not enough memory", 0)` is `LUA_ERRMEM` there (unpositioned
+  through `wrap`, no message handler, `lua_pcall` returns `LUA_ERRMEM`);
+  here only a failed allocation is one. `error("not enough memory")` at
+  the default level carries a position and is an ordinary error in both.
 - **Inside a Zig function**: `call` is unprotected (`vm.call`), so an error
   propagates to Lua's caller with its traceback and handlers intact when the
   host `try`s it, and costs nothing extra. On error `call` leaves the stack
@@ -301,4 +310,3 @@ standalone `lua` on the API against the one on the engine.
 - A `Coroutine.close` (`coroutine.close`) and a status query, if hosts want
   them; a coroutine that died with pending to-be-closed variables keeps
   them until Lua code calls `coroutine.close` on it.
-- `vm.pcall` returning `vm.Status` once `auxlib.testing.call` reads it.

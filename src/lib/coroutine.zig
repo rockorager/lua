@@ -114,13 +114,14 @@ fn auxWrap(th: *Thread, base: u32) Error!u32 {
     const co = self.upvalues()[0].asThread();
     if (try auxResume(th, co, th.top - base)) |n| return n;
     var err = th.stack[th.top - 1];
+    var stat: vm.Status = .runtime;
     if (co.status == .dead) {
         // An error in the coroutine: close its variables first.
-        _ = vm.closeThread(co, th);
+        stat = vm.closeThread(co, th);
         err = co.stack[co.top - 1];
         co.top -= 1;
     }
-    if (err.isString() and err.asString() != th.state.memerr) {
+    if (stat != .memory and err.isString()) {
         var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
         defer aw.deinit();
         debuginfo.where(th, 1, &aw.writer) catch return error.OutOfMemory;
@@ -176,7 +177,7 @@ fn close(th: *Thread, base: u32) Error!u32 {
     const co = try getOptCo(th, base);
     switch (coStatus(th, co)) {
         .dead, .suspended => {
-            if (vm.closeThread(co, th)) {
+            if (vm.closeThread(co, th) == .ok) {
                 th.push(.true);
                 return 1;
             }
@@ -190,5 +191,33 @@ fn close(th: *Thread, base: u32) Error!u32 {
             if (co == th.state.main) return debuginfo.raise(th, "cannot close main thread", .{});
             return vm.closeSelf(co);
         },
+    }
+}
+
+fn raiseMemoryMessage(th: *Thread, _: u32) Error!u32 {
+    return th.throw(.string(th.state.memerr));
+}
+
+fn failAllocation(_: *Thread, _: u32) Error!u32 {
+    return error.OutOfMemory;
+}
+
+test "wrap positions an error raised as \"not enough memory\", not a memory error" {
+    const testing = @import("auxlib.zig").testing;
+    const state = try testing.newState();
+    defer state.destroy();
+    const th = state.main;
+    const cases = .{
+        .{ &raiseMemoryMessage, "test:7: not enough memory" },
+        .{ &failAllocation, "not enough memory" },
+    };
+    inline for (cases) |c| {
+        th.top = 1;
+        th.push(.native(c[0]));
+        _ = try wrap(th, 1);
+        switch (try testing.callFromLua(state, th.stack[th.top - 1], &.{})) {
+            .ok => return error.TestExpectedError,
+            .err => |e| try std.testing.expectEqualStrings(c[1], e.asString().bytes()),
+        }
     }
 }

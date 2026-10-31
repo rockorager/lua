@@ -39,6 +39,9 @@ err: Value = .nil,
 /// `.yield` while the coroutine is suspended, and while a yield unwinds
 /// as `error.LuaError`; `.dead` once an error ended it.
 status: Status = .ok,
+/// With `status` `.dead`, which kind of error ended the coroutine, as a
+/// dead coroutine's `lua_status` says; `vm.closeThread` starts from it.
+died: vm.Status = .ok,
 /// Nested entries into the interpreter from native code, which each use
 /// Zig stack (PUC-Rio's C calls): `vm.call` from a native function, and a
 /// coroutine resumed from this one counts its resumer's.
