@@ -531,6 +531,20 @@ fuzz TARGET="all" SECONDS="60" *ARGS:
     done
     exit $status
 
+[doc("The C-API fuzzers for SECONDS each, on a -Dc-api=true build in zig-out/fuzz-capi: `run capi`, allocation failure at every index through the calls of test/fuzz/capifuzz.c, a C module, and `capi-diff`, generated C-API workloads on our lua and the reference with the same capifuzz.so. ARGS go to the driver. Findings go to zig-out/fuzz/")]
+[group("fuzz")]
+fuzz-capi SECONDS="60" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=zig-out/fuzz-capi
+    zig build fuzz -Dc-api=true -Doptimize={{ fuzz_mode }} --prefix "$out"
+    zig build -Dc-api=true -Doptimize={{ fuzz_mode }} --prefix "$out"
+    cc -Wall -Wextra -O2 "-I$out/include" -fPIC -shared -o "$out/lib/capifuzz.so" test/fuzz/capifuzz.c
+    status=0
+    "$out/bin/fuzz" run capi --module "$out/lib" --seconds {{ SECONDS }} {{ ARGS }} || status=1
+    "$out/bin/fuzz" capi-diff --ours "$out/bin/lua" --module "$out/lib" --seconds {{ SECONDS }} {{ ARGS }} || status=1
+    exit $status
+
 [doc("Fuzz under collector stress for SECONDS each: grammar and oom in process with --gc-stress full, and diff on a lua built with -Dgc-stress=full. Findings go to zig-out/fuzz/stress/")]
 [group("fuzz")]
 fuzz-stress SECONDS="60" *ARGS:

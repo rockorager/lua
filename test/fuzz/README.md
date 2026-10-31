@@ -8,6 +8,7 @@ just fuzz diff 600            # one fuzzer, ten minutes
 just fuzz "parse binary" 300 --seed 7
 just fuzz-stress 120          # under collector stress
 just fuzz-zig 1M              # Zig's coverage-guided fuzzer
+just fuzz-capi 120            # the C API, on a -Dc-api=true build
 just fuzz_mode=Debug fuzz binary 600
 ```
 
@@ -27,10 +28,14 @@ A finding is written under `zig-out/fuzz/<fuzzer>/` with its input, a minimized 
 | `bytecode`    | generated programs, with more syntax: deep nesting, many locals and constants, `global`, `goto`    | the same listing as `luac -l -l -p`                                                                                                                                                                                                                      |
 | `messages`    | the `parse` inputs, in batches through `load`                                                      | the same result as the reference: the same syntax error message, or success                                                                                                                                                                              |
 | `binary-diff` | the `binary` inputs, in batches through `load(..., "b")`                                           | the same result as the reference, except that the loader refuses an invalid opcode where the reference loads it                                                                                                                                          |
+| `capi`        | generated C-API workloads that load `capifuzz.c` with `require`, with the Nth allocation failing   | as for `oom`, for every N through the C module's calls: "not enough memory", no leak, no crash, and the state still runs code                                                                                                                            |
+| `capi-diff`   | generated C-API workloads, on our C-API `lua` and the reference with the same `capifuzz.so`        | the same stdout, stderr, and exit status                                                                                                                                                                                                                 |
 
 The generator (`gen.zig`) writes programs that print what they compute: arithmetic on integer and float edges, strings and the string library, tables, metatables and every metamethod, closures and varargs, coroutines, `goto`, to-be-closed variables, `load`, and errors raised inside `pcall`, whose messages carry variable names. Programs are deterministic: `pairs` goes through sorted keys, `math.randomseed(42)` comes first, and nothing reads the clock or prints an address.
 
 The in-process fuzzers run inputs in a forked child that reports each input to the parent through shared memory before running it, so a crash or a hang is caught with the input that caused it. `--stack KIB` runs them on a thread with a small stack, as a host's worker thread.
+
+`capifuzz.c` is a C module whose `run(ops)` reads four bytes per operation and makes one or a few C-API calls for each: pushes and conversions, tables raw and through metamethods, arithmetic, comparison, and concatenation, calls and protected calls, Lua chunks it loads, coroutines resumed and yielding through `lua_callk`, C closures and upvalues, userdata and user values, metatables, buffers, references, argument checks, to-be-closed slots, errors, the collector, and the debug interface. Eight registers hold values across operations and calls; each operation notes what it got, with addresses masked, and an operation that raises notes the error. Any byte string is a valid program. `just fuzz-capi` builds the driver, `lua`, and `capifuzz.so` with `-Dc-api=true` into `zig-out/fuzz-capi` and runs both fuzzers; `fuzz gen SEED capi` prints a workload.
 
 `zig_fuzz.zig` holds the same compiler and loader properties as tests for Zig's own fuzzer, which is guided by coverage: `zig build fuzz-zig` runs each once, and `just fuzz-zig` fuzzes.
 

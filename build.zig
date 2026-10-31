@@ -153,6 +153,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "lua", .module = mod }},
         }),
     });
+    // With -Dc-api, its `capi` target loads test/fuzz/capifuzz.c, a C
+    // module, which links against the driver's own lua_* symbols.
+    const fuzz_options = b.addOptions();
+    fuzz_options.addOption(bool, "capi_module", c_api);
+    fuzz.root_module.addOptions("fuzz_options", fuzz_options);
+    fuzz.rdynamic = c_api;
     b.step("fuzz", "Build the fuzz driver").dependOn(&b.addInstallArtifact(fuzz, .{}).step);
 
     // Coverage-guided fuzz tests on Zig's own fuzzer: `zig build

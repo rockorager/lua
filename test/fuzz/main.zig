@@ -24,6 +24,10 @@
 //!                (later allocations succeed) and from then on: the error
 //!                is error.OutOfMemory or "not enough memory", nothing
 //!                leaks, and the state still runs code or closes.
+//!   run capi     the same sweep over generated C-API workloads, which
+//!                load test/fuzz/capifuzz.c from --module and call it:
+//!                allocation failure at every index through C module
+//!                calls. Needs a fuzz driver built with -Dc-api=true.
 //!
 //! The differential commands compare with the dev shell's reference:
 //!
@@ -33,20 +37,23 @@
 //!   messages  malformed sources through `load` on both, in batches: the
 //!             same syntax error, or the same success.
 //!   binary-diff  corrupted dumps through `load(..., "b")` on both.
+//!   capi-diff generated C-API workloads, which call capifuzz.so from
+//!             --module, on our C-API `lua` and the reference.
 
 const std = @import("std");
 const lua = @import("lua");
+const fuzz_options = @import("fuzz_options");
 const Gen = @import("gen.zig");
 const linux = std.os.linux;
 
 const max_input = 1 << 20;
 
 const usage =
-    \\usage: fuzz run (parse|grammar|binary|oom) [options]
-    \\       fuzz (diff|bytecode|messages|binary-diff) [options]
+    \\usage: fuzz run (parse|grammar|binary|oom|capi) [options]
+    \\       fuzz (diff|bytecode|messages|binary-diff|capi-diff) [options]
     \\       fuzz repro (parse|grammar|binary) FILE
-    \\       fuzz repro oom FILE N (once|always) [lax]
-    \\       fuzz gen SEED [diff|wild]
+    \\       fuzz repro (oom|capi) FILE N (once|always) [lax]
+    \\       fuzz gen SEED [diff|wild|capi]
     \\options:
     \\  --seconds N     how long to run (default 60)
     \\  --seed N        the first seed (default: from the clock)
@@ -54,6 +61,7 @@ const usage =
     \\  --ours PATH     our lua for the differential commands (zig-out/bin/lua)
     \\  --out DIR       where findings go (zig-out/fuzz)
     \\  --stack KIB     run in-process inputs on a thread with this much stack
+    \\  --module DIR    the directory of capifuzz.so (zig-out/fuzz-capi/lib)
     \\
 ;
 
@@ -67,6 +75,8 @@ const Options = struct {
     /// Run the inputs on a thread with this much stack, as a host's
     /// worker thread might, instead of the main thread's 8 MiB.
     stack: ?usize = null,
+    /// Where `capi` and `capi-diff` find capifuzz.so.
+    module: []const u8 = "zig-out/fuzz-capi/lib",
 };
 
 var io: std.Io = undefined;
@@ -94,6 +104,8 @@ pub fn main(init: std.process.Init) !void {
             opts.ours = try gpa.dupe(u8, it.next() orelse return fail());
         } else if (std.mem.eql(u8, a, "--stack")) {
             opts.stack = 1024 * try std.fmt.parseInt(usize, it.next() orelse return fail(), 10);
+        } else if (std.mem.eql(u8, a, "--module")) {
+            opts.module = try gpa.dupe(u8, it.next() orelse return fail());
         } else if (std.mem.eql(u8, a, "--out")) {
             opts.out = try gpa.dupe(u8, it.next() orelse return fail());
         } else try args.append(gpa, try gpa.dupe(u8, a));
@@ -104,8 +116,13 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "gen")) {
         if (args.items.len < 2) return fail();
         var buf: std.ArrayList(u8) = .empty;
-        const mode: Gen.Mode = if (args.items.len > 2 and std.mem.eql(u8, args.items[2], "wild")) .wild else .diff;
-        try Gen.program(gpa, &buf, try std.fmt.parseInt(u64, args.items[1], 10), mode);
+        const program_seed = try std.fmt.parseInt(u64, args.items[1], 10);
+        if (args.items.len > 2 and std.mem.eql(u8, args.items[2], "capi")) {
+            try capiProgram(&buf, program_seed, opts.module);
+        } else {
+            const mode: Gen.Mode = if (args.items.len > 2 and std.mem.eql(u8, args.items[2], "wild")) .wild else .diff;
+            try Gen.program(gpa, &buf, program_seed, mode);
+        }
         try std.Io.File.stdout().writeStreamingAll(io, buf.items);
         return;
     }
@@ -120,9 +137,10 @@ pub fn main(init: std.process.Init) !void {
         const data = try std.Io.Dir.cwd().readFileAlloc(io, args.items[2], gpa, .limited(max_input));
         var ctx: Ctx = .{ .opts = opts, .rng = undefined, .corpus = &.{} };
         var case: u64 = 0;
-        if (target == .oom) {
+        if (target.sweeps()) {
             if (args.items.len < 5) return fail();
             ctx.oom_lax = args.items.len > 5 and std.mem.eql(u8, args.items[5], "lax");
+            ctx.capi = target == .capi;
             const n = try std.fmt.parseInt(u64, args.items[3], 10);
             const always: u64 = @intFromBool(std.mem.eql(u8, args.items[4], "always"));
             case = n << 1 | always;
@@ -233,7 +251,18 @@ const Counting = struct {
 // In-process targets
 // ---------------------------------------------------------------------
 
-const Target = enum { parse, grammar, binary, oom };
+const Target = enum {
+    parse,
+    grammar,
+    binary,
+    oom,
+    capi,
+
+    /// Whether the target sweeps allocation failures over fixed programs.
+    fn sweeps(t: Target) bool {
+        return t == .oom or t == .capi;
+    }
+};
 
 const Outcome = union(enum) {
     ok,
@@ -275,6 +304,12 @@ const Ctx = struct {
     /// and a state left unusable count.
     oom_extra: []const []const u8 = &.{},
     oom_lax: bool = false,
+    /// The programs a sweep goes through, and how many of them, from the
+    /// first, are strict: any error must be "not enough memory".
+    oom_set: []const []const u8 = &.{},
+    oom_strict: usize = 0,
+    /// The programs load capifuzz, so the state needs `package`.
+    capi: bool = false,
 };
 
 /// Runs one input in this process. For `oom`, `case` is the allocation
@@ -284,7 +319,7 @@ fn runOne(ctx: *Ctx, target: Target, input: []const u8, case: u64) Outcome {
         .parse => runParse(ctx, input),
         .grammar => runGrammar(ctx, input),
         .binary => runBinary(ctx, input),
-        .oom => runOom(ctx, input, case),
+        .oom, .capi => runOom(ctx, input, case),
     };
 }
 
@@ -448,7 +483,15 @@ fn runOom(ctx: *Ctx, input: []const u8, case: u64) Outcome {
 
 fn oomCase(ctx: *Ctx, counting: *Counting, input: []const u8) Outcome {
     var discard: std.Io.Writer.Discarding = .init(&discard_buf);
-    const state = lua.State.init(counting.allocator(), .{ .seed = 1, .stdout = &discard.writer, .gc_stress = ctx.opts.gc_stress }) catch |e| {
+    var libs = lua.safe_libs;
+    if (ctx.capi) libs.insert(.package);
+    const state = lua.State.init(counting.allocator(), .{
+        .seed = 1,
+        .stdout = &discard.writer,
+        .gc_stress = ctx.opts.gc_stress,
+        .libs = libs,
+        .io = if (ctx.capi) io else null,
+    }) catch |e| {
         return if (e == error.OutOfMemory) .ok else .{ .wrong = "State.init failed without running out of memory" };
     };
     defer state.close();
@@ -658,7 +701,7 @@ fn makeInput(ctx: *Ctx, target: Target, buf: *std.ArrayList(u8), iter: u64) !voi
             try buf.appendSlice(gpa, ctx.dumps[r.uintLessThan(usize, ctx.dumps.len)]);
             try mutate(ctx, buf, true);
         },
-        .oom => unreachable,
+        .oom, .capi => unreachable,
     }
 }
 
@@ -732,7 +775,7 @@ fn timeoutMs(target: Target) i64 {
         .parse => 5_000,
         .grammar => 20_000,
         .binary => 10_000,
-        .oom => 20_000,
+        .oom, .capi => 20_000,
     });
 }
 
@@ -744,15 +787,15 @@ fn childLoop(ctx: *Ctx, target: Target, deadline: i64) noreturn {
     const shared = ctx.shared.?;
     var buf: std.ArrayList(u8) = .empty;
     var iter: u64 = shared.done;
-    if (target == .oom) {
+    if (target.sweeps()) {
         // Each case is (program, N, once or always), in order; `done`
         // says where the previous child stopped.
-        const total = oom_programs.len + 1 + ctx.oom_extra.len;
+        const total = ctx.oom_set.len;
         var prog: usize = @intCast(shared.case >> 32);
         var n: u64 = shared.case & 0xffff_ffff;
         while (prog < total and nowMs() < deadline) {
-            const text: []const u8 = if (prog < oom_programs.len) oom_programs[prog] else if (prog == oom_programs.len) "api" else ctx.oom_extra[prog - oom_programs.len - 1];
-            ctx.oom_lax = prog > oom_programs.len;
+            const text = ctx.oom_set[prog];
+            ctx.oom_lax = prog >= ctx.oom_strict;
             var finished = true;
             for ([_]u64{ 0, 1 }) |always| {
                 @memcpy(shared.data[0..text.len], text);
@@ -920,10 +963,30 @@ fn supervise(target: Target, opts_in: Options, seed: u64) !void {
     var ctx: Ctx = .{ .opts = opts, .rng = undefined, .corpus = corpus, .shared = shared };
     if (target == .binary) ctx.dumps = try makeDumps(corpus);
     if (target == .oom) {
-        ctx.oom_extra = try loadCorpus(&.{"test/diff"});
-        // Each program must succeed when nothing fails.
-        for (oom_programs ++ [_][]const u8{"api"}) |p| {
-            const outcome = runOne(&ctx, .oom, p, std.math.maxInt(u64) - 1);
+        const strict = oom_programs ++ [_][]const u8{"api"};
+        ctx.oom_set = try std.mem.concat(perm, []const u8, &.{ &strict, try loadCorpus(&.{"test/diff"}) });
+        ctx.oom_strict = strict.len;
+    }
+    if (target == .capi) {
+        if (!fuzz_options.capi_module) {
+            std.debug.print("fuzz capi: build the driver with -Dc-api=true\n", .{});
+            return error.NoCApi;
+        }
+        // Workloads from the seed: each sweep takes a while.
+        var set: std.ArrayList([]const u8) = .empty;
+        for (0..capi_workloads) |i| {
+            var buf: std.ArrayList(u8) = .empty;
+            try capiWorkload(&buf, programSeed(seed, i), opts.module, 12);
+            try set.append(perm, buf.items);
+        }
+        ctx.oom_set = set.items;
+        ctx.oom_strict = set.items.len;
+        ctx.capi = true;
+    }
+    if (target.sweeps()) {
+        // Each strict program must succeed when nothing fails.
+        for (ctx.oom_set[0..ctx.oom_strict]) |p| {
+            const outcome = runOne(&ctx, target, p, std.math.maxInt(u64) - 1);
             if (outcome != .ok) {
                 std.debug.print("oom program fails on its own: {s}\n{s}\n", .{ p, outcome.describe() });
                 return error.BadProgram;
@@ -948,9 +1011,9 @@ fn supervise(target: Target, opts_in: Options, seed: u64) !void {
         const phase: Phase = @enumFromInt(shared.phase);
         const input = try gpa.dupe(u8, shared.data[0..shared.len]);
         const log = readLog(log_path);
-        const case = if (target == .oom) shared.done else 0;
+        const case = if (target.sweeps()) shared.done else 0;
         // Resume after the failing input.
-        if (target == .oom) shared.case += 1 else shared.done += 1;
+        if (target.sweeps()) shared.case += 1 else shared.done += 1;
         shared.phase = 0;
         if (target == .grammar and kind == .hang and try referenceHangs(input)) {
             // The program is slow on the reference too: the generator's
@@ -965,7 +1028,7 @@ fn supervise(target: Target, opts_in: Options, seed: u64) !void {
         try record(&ctx, target, dir, finding, is_known, status);
     }
     const ran = shared.done;
-    std.debug.print("fuzz {t}: {d} inputs in {d}s, {d} findings, {d} known-limit, {d} slow on the reference too, {d} restarts\n", .{ target, if (target == .oom) shared.case >> 32 else ran, @divTrunc(nowMs() - start, 1000), findings, known, slow, restarts });
+    std.debug.print("fuzz {t}: {d} inputs in {d}s, {d} findings, {d} known-limit, {d} slow on the reference too, {d} restarts\n", .{ target, if (target.sweeps()) shared.case >> 32 else ran, @divTrunc(nowMs() - start, 1000), findings, known, slow, restarts });
     if (findings != 0) std.process.exit(1);
 }
 
@@ -985,16 +1048,16 @@ fn record(ctx: *Ctx, target: Target, dir: []const u8, f: Finding, known: bool, s
     const sig = signature(f.log);
     const hash = std.hash.Wyhash.hash(0, f.input) % 1_000_000;
     const sub = if (known) "known" else "findings";
-    const base = if (target == .oom)
+    const base = if (target.sweeps())
         try std.fmt.allocPrint(gpa, "{s}/{s}/{t}-{d}-n{d}{s}", .{ dir, sub, f.kind, hash, f.case >> 1, if (f.case & 1 == 1) "-always" else "" })
     else
         try std.fmt.allocPrint(gpa, "{s}/{s}/{t}-{d}", .{ dir, sub, f.kind, hash });
     try std.Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, sub }));
-    std.debug.print("{s}: {t} in {t} ({s}), {d} bytes{s}\n", .{ if (known) "known limit" else "FINDING", f.kind, f.phase, sig, f.input.len, if (target == .oom or known) "" else ", minimizing" });
+    std.debug.print("{s}: {t} in {t} ({s}), {d} bytes{s}\n", .{ if (known) "known limit" else "FINDING", f.kind, f.phase, sig, f.input.len, if (target.sweeps() or known) "" else ", minimizing" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.input", .{base}), .data = f.input });
     const info = try std.fmt.allocPrint(gpa, "target: {t}\nkind: {t}\nphase: {t}\nstatus: {any}\ncase: n={d} {s}\nsignature: {s}\n\n{s}", .{ target, f.kind, f.phase, status, f.case >> 1, if (f.case & 1 == 1) "always" else "once", sig, f.log });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.txt", .{base}), .data = info });
-    if (target == .oom or known) return;
+    if (target.sweeps() or known) return;
     // One minimized input per signature and kind is enough.
     const key = try std.fmt.allocPrint(gpa, "{t}|{t}|{s}", .{ f.kind, f.phase, sig });
     if (minimized.contains(key)) return;
@@ -1058,7 +1121,7 @@ fn minimize(ctx: *Ctx, target: Target, f: Finding, sig: []const u8, dir: []const
 // Differential fuzzing against the reference
 // ---------------------------------------------------------------------
 
-const DiffCommand = enum { diff, bytecode, messages, @"binary-diff" };
+const DiffCommand = enum { diff, bytecode, messages, @"binary-diff", @"capi-diff" };
 
 const Run = struct {
     out: []const u8,
@@ -1145,14 +1208,19 @@ const DiffCtx = struct {
     timeout: u32 = 20,
     /// The outputs of the last comparison.
     last: [2][]const u8 = .{ "", "" },
+    /// capifuzz.so's directory, absolute, for `capi-diff`.
+    module: []const u8 = "",
+    /// What every program starts with, which minimizing keeps: for
+    /// `capi-diff`, the lines that load capifuzz.
+    header: []const u8 = "",
 };
 
 /// Whether `src` still shows the difference; for `diff`, both arms must
 /// finish, so a timeout never counts.
 fn differs(d: *DiffCtx, src: []const u8) !bool {
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}/prog.lua", .{d.dir}), .data = src });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}/prog.lua", .{d.dir}), .data = try std.mem.concat(gpa, u8, &.{ d.header, src }) });
     switch (d.cmd) {
-        .diff => {
+        .diff, .@"capi-diff" => {
             const a = try runProcess(&.{ d.ref, "prog.lua" }, d.dir, d.timeout);
             if (a.timed_out) return false;
             const b = try runProcess(&.{ d.ours, "prog.lua" }, d.dir, d.timeout);
@@ -1201,7 +1269,15 @@ fn differential(cmd: DiffCommand, opts: Options, seed: u64) !void {
         .luac = try which("luac"),
         .ours = try std.fs.path.resolve(perm, &.{ abs, opts.ours }),
         .listing = try std.fs.path.resolve(perm, &.{ abs, opts.listing }),
+        .module = try std.fs.path.resolve(perm, &.{ abs, opts.module }),
     };
+    if (cmd == .@"capi-diff") {
+        const so = try std.fmt.allocPrint(perm, "{s}/capifuzz.so", .{d.module});
+        std.Io.Dir.cwd().access(io, so, .{}) catch {
+            std.debug.print("fuzz capi-diff: no {s}; `just fuzz-capi` builds it\n", .{so});
+            return error.NoModule;
+        };
+    }
     const start = nowMs();
     const deadline = start + @as(i64, @intCast(opts.seconds)) * 1000;
     var iter: u64 = 0;
@@ -1214,23 +1290,30 @@ fn differential(cmd: DiffCommand, opts: Options, seed: u64) !void {
     while (nowMs() < deadline) : (iter += 1) {
         _ = arena.reset(.retain_capacity);
         switch (cmd) {
-            .diff, .bytecode => {
+            .diff, .bytecode, .@"capi-diff" => {
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(gpa);
-                try Gen.program(gpa, &buf, programSeed(seed, iter), if (cmd == .diff) .diff else .wild);
+                if (cmd == .@"capi-diff") {
+                    try capiProgram(&buf, programSeed(seed, iter), d.module);
+                    // The two lines that load capifuzz stay; the rest
+                    // is what differs and gets minimized.
+                    const split = std.mem.indexOfScalarPos(u8, buf.items, std.mem.indexOfScalar(u8, buf.items, '\n').? + 1, '\n').? + 1;
+                    if (d.header.len == 0) d.header = try perm.dupe(u8, buf.items[0..split]);
+                    try buf.replaceRange(gpa, 0, split, &.{});
+                } else try Gen.program(gpa, &buf, programSeed(seed, iter), if (cmd == .diff) .diff else .wild);
                 cases += 1;
                 if (!try differs(&d, buf.items)) continue;
                 found += 1;
                 const first = d.last;
                 const name = try std.fmt.allocPrint(gpa, "{s}/{t}-{d}.lua", .{ dir, cmd, programSeed(seed, iter) });
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.full", .{name}), .data = buf.items });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.full", .{name}), .data = try std.mem.concat(gpa, u8, &.{ d.header, buf.items }) });
                 try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.full.ref", .{name}), .data = first[0] });
                 try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.full.ours", .{name}), .data = first[1] });
                 std.debug.print("DIFFERS: {s}.full ({d} bytes), minimizing\n", .{ name, buf.items.len });
                 d.timeout = 3;
                 const min = try minimizeText(&d, buf.items, nowMs() + 180_000);
                 d.timeout = 20;
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = name, .data = min });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = name, .data = try std.mem.concat(gpa, u8, &.{ d.header, min }) });
                 _ = try differs(&d, min);
                 try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.ref", .{name}), .data = d.last[0] });
                 try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.ours", .{name}), .data = d.last[1] });
@@ -1250,6 +1333,28 @@ fn differential(cmd: DiffCommand, opts: Options, seed: u64) !void {
 /// different seeds do not overlap. `fuzz gen` takes this number.
 fn programSeed(seed: u64, iter: u64) u64 {
     return (seed *% 1_000_003 +% iter) % 1_000_000_000_000;
+}
+
+/// How many workloads one `run capi` sweeps.
+const capi_workloads = 1000;
+
+/// A C-API workload: LINES calls of capifuzz's `run`, each with up to
+/// eight random operations, printing what they noted. Registers persist
+/// across lines, so later lines see what earlier ones built.
+fn capiWorkload(buf: *std.ArrayList(u8), seed: u64, module: []const u8, lines: u32) !void {
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const r = prng.random();
+    try buf.print(gpa, "package.cpath = \"{s}/?.so\"\nlocal run = require(\"capifuzz\").run\n", .{module});
+    for (0..lines) |_| {
+        try buf.appendSlice(gpa, "print(run(\"");
+        for (0..4 * (1 + r.uintLessThan(u32, 8))) |_| try buf.print(gpa, "\\{d}", .{r.int(u8)});
+        try buf.appendSlice(gpa, "\"))\n");
+    }
+}
+
+/// The workload `capi-diff` runs and `fuzz gen SEED capi` prints.
+fn capiProgram(buf: *std.ArrayList(u8), seed: u64, module: []const u8) !void {
+    try capiWorkload(buf, seed, module, 40);
 }
 
 fn minimizeText(d: *DiffCtx, src: []const u8, deadline: i64) ![]const u8 {
