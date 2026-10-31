@@ -899,7 +899,11 @@ fn inLineLookup(log: []const u8) bool {
     var lines = std.mem.splitScalar(u8, log[i..], '\n');
     _ = lines.next();
     const frame = lines.next() orelse return false;
-    return std.mem.indexOf(u8, frame, "/src/Proto.zig:") != null;
+    if (std.mem.indexOf(u8, frame, "/src/Proto.zig:") == null) return false;
+    // Proto.zig's closure helpers inline into the loop too: a crash in
+    // one, from a chunk's bad upvalue index, is the known limit.
+    const source = lines.next() orelse return false;
+    return std.mem.indexOf(u8, source, "line") != null or std.mem.indexOf(u8, source, "abs") != null;
 }
 
 fn readLog(path: []const u8) []const u8 {
