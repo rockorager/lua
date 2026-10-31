@@ -30,12 +30,20 @@ const Scenario = enum {
     userdata_method,
     /// The host reads a table of four fields into a struct.
     decode_struct,
+    /// Lua calls a Zig function bound to a pointer (a native closure with
+    /// a light userdata upvalue) in a loop.
+    lua_calls_bound,
+    /// The host calls a Lua function that returns three values, and takes
+    /// them all.
+    call_values,
+    /// The host resumes a Lua coroutine that yields a counter.
+    zig_resumes,
 
     fn defaultN(s: Scenario) u32 {
         return switch (s) {
-            .lua_calls_zig, .userdata_method => 20_000_000,
-            .callback => 5_000_000,
-            .zig_calls_lua, .zig_calls_lua_notb => 10_000_000,
+            .lua_calls_zig, .userdata_method, .lua_calls_bound => 20_000_000,
+            .callback, .zig_resumes => 5_000_000,
+            .zig_calls_lua, .zig_calls_lua_notb, .call_values => 10_000_000,
             .globals, .decode_struct => 10_000_000,
         };
     }
@@ -102,6 +110,11 @@ fn newCounter(state: *lua.State) !*Counter {
 
 const Fields = struct { a: i64, b: f64, c: []const u8, d: bool };
 
+fn addTo(total: *i64, x: i64) i64 {
+    total.* +%= x;
+    return total.*;
+}
+
 fn runApi(state: *lua.State, scenario: Scenario, n: u32) !i64 {
     switch (scenario) {
         .lua_calls_zig => {
@@ -134,14 +147,38 @@ fn runApi(state: *lua.State, scenario: Scenario, n: u32) !i64 {
             const t = try state.ref(try state.doString(lua.Value, fields_table, .{}));
             var acc: i64 = 0;
             for (0..n) |_| {
-                const f = try state.decode(Fields, t);
+                const f = try state.decode(Fields, t, .{});
                 acc +%= f.a + @as(i64, @intFromFloat(f.b)) + @as(i64, @intCast(f.c.len)) + @intFromBool(f.d);
             }
+            return acc;
+        },
+        .lua_calls_bound => {
+            var total: i64 = 0;
+            try state.setGlobal("add_to", try state.function(&total, addTo));
+            return state.call(i64, try state.load(loop_bound, .{}), .{n});
+        },
+        .call_values => {
+            const f = try state.ref(try state.doString(lua.Function, three_values, .{}));
+            var acc: i64 = 0;
+            for (0..n) |i| {
+                for (try state.call(lua.Values, f, .{@as(i64, @intCast(i))})) |v| acc +%= try state.decode(i64, v, .{});
+            }
+            return acc;
+        },
+        .zig_resumes => {
+            const co = try state.newCoroutine(try state.doString(lua.Function, generator, .{}));
+            const r = try state.ref(co);
+            defer state.unref(r);
+            var acc: i64 = 0;
+            for (0..n) |_| acc +%= (try co.@"resume"(state, i64, .{})).yielded;
             return acc;
         },
     }
 }
 
+const loop_bound = "local n = ... local f = add_to local s = 0 for i = 1, n do s = f(1) end return s";
+const three_values = "return function(i) return i, 1, 2 end";
+const generator = "return function() local i = 0 while true do i = i + 1 coroutine.yield(i) end end";
 const loop_add = "local n = ... local add = add local s = 0 for i = 1, n do s = add(s, i) end return s";
 const loop_apply =
     "local n = ... local apply = apply local f = function(x) return x + 1 end " ++
@@ -164,6 +201,14 @@ fn addInternal(th: *Thread, b: u32) Error!u32 {
     const x = try a.checkInteger(1);
     const y = try a.checkInteger(2);
     th.push(.int(x +% y));
+    return 1;
+}
+
+fn addToInternal(th: *Thread, b: u32) Error!u32 {
+    const total: *i64 = @ptrCast(@alignCast(th.stack[b - 1].asNativeClosure().upvalues()[0].asLightUserdata().?));
+    const a = Args.init(th, b, "add_to");
+    total.* +%= try a.checkInteger(1);
+    th.push(.int(total.*));
     return 1;
 }
 
@@ -287,6 +332,43 @@ fn runInternal(state: *lua.State, scenario: Scenario, n: u32) !i64 {
                 if (!a.isInt() or !b.isNumber() or !c.isString()) return error.LuaError;
                 const f: Fields = .{ .a = a.asInt(), .b = b.asNumber(), .c = c.asString().bytes(), .d = !d.isFalsy() };
                 acc +%= f.a + @as(i64, @intFromFloat(f.b)) + @as(i64, @intCast(f.c.len)) + @intFromBool(f.d);
+            }
+            return acc;
+        },
+        .lua_calls_bound => {
+            var total: i64 = 0;
+            const c = try internal.Proto.NativeClosure.create(&s.heap, &addToInternal, 1);
+            c.setUpvalue(&s.heap, 0, .lightUserdata(&total));
+            try setGlobal(th, "add_to", .nativeClosure(c));
+            return runChunk(th, loop_bound, n);
+        },
+        .call_values => {
+            const r = try state.ref(try state.doString(lua.Function, three_values, .{}));
+            var acc: i64 = 0;
+            for (0..n) |i| {
+                try th.ensureStack(2);
+                const func = th.top;
+                th.push(s.registry.getInt(@intFromEnum(r)));
+                th.push(.int(@intCast(i)));
+                if (!internal.vm.pcall(th, func, -1)) return error.LuaError;
+                for (th.stack[func..th.top]) |v| acc +%= if (v.isInt()) v.asInt() else internal.auxlib.toInteger(v) orelse return error.LuaError;
+                th.top = func;
+            }
+            return acc;
+        },
+        .zig_resumes => {
+            const f = try state.doString(lua.Function, generator, .{});
+            const co = try Thread.create(s);
+            co.push(f.raw);
+            const r = try state.ref(lua.Value{ .raw = .thread(co) });
+            defer state.unref(r);
+            var acc: i64 = 0;
+            for (0..n) |_| {
+                const res = try internal.vm.resumeThread(co, th, 0);
+                if (res.status != .yield) return error.LuaError;
+                const v = co.stack[co.top - 1];
+                acc +%= if (v.isInt()) v.asInt() else return error.LuaError;
+                co.top -= res.nres;
             }
             return acc;
         },

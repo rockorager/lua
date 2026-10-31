@@ -22,7 +22,14 @@ All notable changes to lua are recorded here. The format follows
 - To-be-closed variables (`local x <close>`), `__concat`, and named vararg tables (`function f(...t)`) run instead of raising "not implemented yet".
 - The collector is Lua 5.5's: weak tables (`__mode` "k", "v", "kv") with ephemerons, `__gc` finalizers on tables and userdata (set with the metatable, run in reverse order, resurrection, errors as "error in __gc" warnings, every pending one at `State.destroy` and `os.exit(code, true)`), incremental collection, and generational mode; `collectgarbage` supports every 5.5 option, and the standalone `lua` runs in generational mode as the reference's does. Files left open close when collected.
 - `lua.Options.strings`, an allocator for string objects, and `SmallAllocator`, a single-threaded allocator with size classes 8 bytes apart up to 128 bytes; the standalone `lua` allocates strings with it.
+- `lua.Values`, any number of results borrowed from the state without allocating: `state.call(lua.Values, f, args)`, as a Zig function's return type, and in place of the argument tuple.
+- `lua.Coroutine`: `state.newCoroutine(f)` and `co.@"resume"(state, R, args)`, which returns `.yielded` or `.returned` values; a Zig function yields with `return state.yield(values)`.
+- `state.function(ctx, f)`, a Lua function that passes `ctx` (a pointer, or a copy of a value) to the Zig function `f` as its first parameter.
+- `state.pcall`, a call in protected mode inside a Zig function, so the host can handle a Lua error in Zig.
+- `Table.rawGet` and `Table.rawSet`, which skip `__index` and `__newindex`.
 - `lua.Options.stdout`, a `*std.Io.Writer` for `print` and `io.write` in place of the process's standard output, and `state.stdout()`, the writer in use.
+- `lua.DecodeOptions` with `.unknown_keys = .reject`, which fails a decode on a table key the struct has no field for and names its path ("unknown key 'keybinds[2].acton'").
+- `lua.Options.noenv` (as `lua -E`), `gc_mode`, and `gc_stress`, `state.warn`, and `state.loadFile(null, mode)` for standard input.
 
 ### Changed
 
@@ -32,8 +39,11 @@ All notable changes to lua are recorded here. The format follows
 - Reading and writing a global variable (a field of `_ENV` with a constant name) goes through a per-function cache of where the name sits in the table, so code written with globals runs faster (bench/globals.lua 9% faster).
 - `auxlib.Buffer` is declared `var b: auxlib.Buffer = .init(state)` instead of `undefined` followed by `b.init(state)`, so ReleaseSafe builds no longer clear 1 KiB on every `string.format`, `table.concat`, `gsub`, `string.pack`, or `string.dump` call (format 21–28% faster in ReleaseSafe).
 - ReleaseSafe builds no longer check each instruction's opcode before dispatching it, since the compiler and the binary loader only produce valid ones: dispatch-heavy programs run 5–12% faster in ReleaseSafe.
+- `state.decode` and `state.decodeAlloc` take a `lua.DecodeOptions` last; pass `.{}` for the old behavior.
 - A script that raises "not enough memory" itself now returns `error.Runtime`; `error.OutOfMemory` means an allocation failed.
+- `state.errorTraceback()` for an error object whose `__tostring` returns a string is that string, as the standalone `lua` prints it.
 
 ### Fixed
 
 - `load` of a binary chunk with an instruction whose opcode is not one of Lua 5.5.1's fails with "bad binary format (invalid opcode)" instead of loading a function that crashes when called.
+- A Zig function that calls Lua with `state.call` no longer leaves a coroutine that fails inside that call with a corrupt stack for `debug.traceback`.

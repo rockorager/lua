@@ -263,7 +263,7 @@ bench-api ROUNDS="10" *SCENARIOS:
     bin=zig-out/bin/bench-api
     scenarios=({{ SCENARIOS }})
     if [ ${#scenarios[@]} -eq 0 ]; then
-        scenarios=(lua_calls_zig zig_calls_lua zig_calls_lua_notb callback globals userdata_method decode_struct)
+        scenarios=(lua_calls_zig zig_calls_lua zig_calls_lua_notb callback globals userdata_method decode_struct lua_calls_bound call_values zig_resumes)
     fi
     arms=(internal api)
     for arm in "${arms[@]}"; do

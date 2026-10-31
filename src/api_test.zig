@@ -91,6 +91,10 @@ test "errors come back as Zig errors with the message and a traceback" {
     try testing.expectError(error.Runtime, state.doString(void, "error({code = 42})", .{}));
     try testing.expectEqualStrings("(error object is a table value)", state.errorMessage());
     try testing.expectEqual(42, try state.getField(i64, state.errorValue(), "code"));
+    // One with `__tostring` is shown by it, as the standalone `lua` does.
+    const shown = "error(setmetatable({}, {__tostring = function() return 'E!' end}))";
+    try testing.expectError(error.Runtime, state.doString(void, shown, .{}));
+    try testing.expectEqualStrings("E!", state.errorTraceback().?);
 
     // The kind of error comes from the engine, not from the message.
     try expectRuntime(state, "not enough memory", state.doString(void, "error('not enough memory', 0)", .{}));
@@ -267,6 +271,7 @@ test "structs and tables convert both ways" {
         []const []const u8,
         ar.allocator(),
         try state.doString(lua.Value, "return {'a', 'bc', 3}", .{}),
+        .{},
     );
     try testing.expectEqual(3, names.len);
     try testing.expectEqualStrings("bc", names[1]);
@@ -274,7 +279,7 @@ test "structs and tables convert both ways" {
     try expectRuntime(
         state,
         "field '[2]': number expected, got string",
-        state.decodeAlloc([]i64, ar.allocator(), try state.doString(lua.Value, "return {1, 'x'}", .{})),
+        state.decodeAlloc([]i64, ar.allocator(), try state.doString(lua.Value, "return {1, 'x'}", .{}), .{}),
     );
 }
 
@@ -288,7 +293,7 @@ test "light userdata and copied strings" {
     try testing.expectEqual(&x, back);
     try expectRuntime(state, "global 'q': light userdata expected, got nil", state.getGlobal(*anyopaque, "q"));
     const str = try state.doString(lua.Value, "return 'abc' .. 1", .{});
-    const owned = try state.decodeAlloc([]u8, testing.allocator, str);
+    const owned = try state.decodeAlloc([]u8, testing.allocator, str, .{});
     defer testing.allocator.free(owned);
     try testing.expectEqualStrings("abc1", owned);
 }
@@ -302,7 +307,7 @@ test "iterating a table" {
     var keys: usize = 0;
     var it = t.iterator();
     while (it.next()) |e| {
-        sum += try state.decode(i64, e.value);
+        sum += try state.decode(i64, e.value, .{});
         keys += 1;
     }
     try testing.expectEqual(35, sum);
@@ -416,7 +421,7 @@ test "references keep values alive and their slots are reused" {
     state.unref(r);
     const r2 = try state.ref("again");
     try testing.expectEqual(r, r2);
-    try testing.expectEqualStrings("again", try state.decode([]const u8, r2));
+    try testing.expectEqualStrings("again", try state.decode([]const u8, r2, .{}));
     try testing.expectEqual(lua.Ref.nil, try state.ref(null));
     state.unref(r2);
 }
@@ -469,10 +474,8 @@ test "the API stays correct when the collector runs at every safe point" {
     defer log.deinit(testing.allocator);
     var ctx: Ctx = .{ .arena = .init(testing.allocator), .log = &log };
     defer ctx.arena.deinit();
-    const state = try lua.State.init(testing.allocator, .{ .context = &ctx });
+    const state = try lua.State.init(testing.allocator, .{ .context = &ctx, .gc_stress = .full });
     defer state.close();
-    const th: *lua.internal.Thread = @ptrCast(@alignCast(state));
-    th.state.heap.stress = true;
     try state.setGlobal("Counter", newCounter);
     try state.setGlobal("callBack", callBack);
     try state.setGlobal("cfg", Config{ .font_size = 10, .window = .{ .title = "stress" } });
@@ -531,4 +534,234 @@ test "print and io.stdout write where the host says" {
     }
     // `close` flushed what io.write left buffered.
     try testing.expectEqualStrings("x2y\nz", out.written());
+}
+
+test "decoding can reject keys the struct does not have" {
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    const C = struct {
+        name: []const u8 = "",
+        keybinds: []const struct { key: []const u8, action: []const u8 } = &.{},
+    };
+    var ar: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer ar.deinit();
+    const v = try state.doString(lua.Value,
+        \\return { name = "n", keybinds = { {key = "a", action = "x"}, {key = "b", acton = "y"} } }
+    , .{});
+    // Ignored by default, so the misspelled field reads as missing.
+    try expectRuntime(
+        state,
+        "field 'keybinds[2].action': string expected, got nil",
+        state.decodeAlloc(C, ar.allocator(), v, .{}),
+    );
+    const reject: lua.DecodeOptions = .{ .unknown_keys = .reject };
+    try expectRuntime(state, "unknown key 'keybinds[2].acton'", state.decodeAlloc(C, ar.allocator(), v, reject));
+    const Name = struct { name: []const u8 = "" };
+    const typo = try state.doString(lua.Value, "return {nam = 1}", .{});
+    try expectRuntime(state, "unknown key 'nam'", state.decode(Name, typo, reject));
+    const list = try state.doString(lua.Value, "return {1}", .{});
+    try expectRuntime(state, "unknown key '[1]'", state.decode(Name, list, reject));
+    const ok = try state.decode(Name, try state.doString(lua.Value, "return {name = 'n'}", .{}), reject);
+    try testing.expectEqualStrings("n", ok.name);
+}
+
+fn relay(state: *lua.State, f: lua.Function) !lua.Values {
+    return state.call(lua.Values, f, .{});
+}
+
+fn sumAll(state: *lua.State, f: lua.Function, n: u32) !i64 {
+    var s: i64 = 0;
+    for (0..n) |_| {
+        for (try state.call(lua.Values, f, .{})) |v| s += try state.decode(i64, v, .{});
+    }
+    return s;
+}
+
+test "any number of values, borrowed from the stack" {
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    const vals = try state.doString(lua.Values, "return 1, 'two', nil", .{});
+    try testing.expectEqual(3, vals.len);
+    try testing.expectEqual(2, try state.decode(i64, vals[0], .{}) + 1);
+    try testing.expectEqualStrings("two", try state.decode([]const u8, vals[1], .{}));
+    try testing.expect(vals[2].isNil());
+    try testing.expectEqual(0, (try state.doString(lua.Values, "", .{})).len);
+
+    // Results passed straight back as arguments, from the slots they sit
+    // in, and enough of them that the stack grows first.
+    const sum = try state.ref(try state.doString(lua.Function,
+        \\return function(...) local s = 0 for _, v in ipairs{...} do s = s + v end return s end
+    , .{}));
+    defer state.unref(sum);
+    try testing.expectEqual(6, try state.call(i64, sum, try state.doString(lua.Values, "return 1, 2, 3", .{})));
+    const many = try state.doString(lua.Values,
+        \\local t = {} for i = 1, 5000 do t[i] = i end return table.unpack(t)
+    , .{});
+    try testing.expectEqual(5000, many.len);
+    try testing.expectEqual(12502500, try state.call(i64, sum, many));
+
+    // They stay put while other calls read and convert, even when a
+    // metamethod runs and the collector with it.
+    try state.doString(void, "setmetatable(_G, {__index = function(_, k) collectgarbage() return k .. '!' end})", .{});
+    const kept = try state.doString(lua.Values, "return 'a' .. 1, {x = 5}", .{});
+    try testing.expectEqualStrings("y!", try state.getGlobal([]const u8, "y"));
+    try testing.expectEqualStrings("12", try state.decode([]const u8, try state.value(12), .{}));
+    try testing.expectEqualStrings("a1", try state.decode([]const u8, kept[0], .{}));
+    try testing.expectEqual(5, try state.getField(i64, kept[1], "x"));
+    const tostring = try state.getGlobal(lua.Function, "tostring");
+    try testing.expectEqualStrings("a1", try state.call([]const u8, tostring, kept));
+
+    // A Zig function asking for them over and over keeps one set.
+    try state.setGlobal("sumAll", sumAll);
+    const loop = "return sumAll(function() return 1, 2, 3 end, 400000)";
+    try testing.expectEqual(2_400_000, try state.doString(i64, loop, .{}));
+
+    // A Zig function returns them as its results.
+    try state.setGlobal("relay", relay);
+    const count3 = "return select('#', relay(function() return 1, 2, 3 end))";
+    try testing.expectEqual(3, try state.doString(i64, count3, .{}));
+    const second = "return select(2, relay(function() return 'a', 'b' end))";
+    try testing.expectEqualStrings("b", try state.doString([]const u8, second, .{}));
+}
+
+test "raw access skips metamethods" {
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    const t = try state.doString(lua.Table,
+        \\return setmetatable({}, {__index = function() return 'meta' end, __newindex = function() error('no') end})
+    , .{});
+    try testing.expectEqualStrings("meta", try state.getField([]const u8, t, "k"));
+    try testing.expectEqual(null, try t.rawGet(state, ?[]const u8, "k"));
+    try t.rawSet(state, "k", "raw");
+    try t.rawSet(state, 1, 10);
+    try testing.expectEqualStrings("raw", try state.getField([]const u8, t, "k"));
+    try testing.expectEqual(10, try t.rawGet(state, i64, 1));
+    try expectRuntime(state, "table index is nil", t.rawSet(state, null, 1));
+    try expectRuntime(state, "field 'k': number expected, got string", t.rawGet(state, i64, "k"));
+}
+
+const Tally = struct {
+    n: i64 = 0,
+
+    fn bump(tally: *Tally, by: i64) i64 {
+        tally.n += by;
+        return tally.n;
+    }
+};
+
+fn scaled(factor: i64, x: i64) i64 {
+    return factor * x;
+}
+
+fn named(tally: *Tally, state: *lua.State, s: []const u8) ![]const u8 {
+    tally.n += 1;
+    return state.toString(s);
+}
+
+test "Zig functions bound to a context" {
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    // A pointer: the host's own tally.
+    var tally: Tally = .{};
+    try state.setGlobal("bump", try state.function(&tally, Tally.bump));
+    try testing.expectEqual(5, try state.doString(i64, "bump(2) return bump(3)", .{}));
+    try testing.expectEqual(5, tally.n);
+    try state.setGlobal("named", try state.function(&tally, named));
+    try testing.expectEqualStrings("x", try state.doString([]const u8, "return named('x')", .{}));
+    try testing.expectEqual(6, tally.n);
+    // A value is copied: each function keeps its own, by value or by pointer.
+    try state.setGlobal("triple", try state.function(@as(i64, 3), scaled));
+    try state.setGlobal("count", try state.function(Tally{}, Tally.bump));
+    try state.setGlobal("count2", try state.function(Tally{ .n = 100 }, Tally.bump));
+    try testing.expectEqual(21, try state.doString(i64, "return triple(7)", .{}));
+    const counts = "count(1) count(1) count2(1) return count(1) + count2(1)";
+    try testing.expectEqual(105, try state.doString(i64, counts, .{}));
+    try testing.expectEqual(6, tally.n);
+    // Arguments are checked after the context.
+    try expectRuntime(
+        state,
+        "[string \"triple()\"]:1: bad argument #1 to 'triple' (number expected, got no value)",
+        state.doString(void, "triple()", .{}),
+    );
+    state.collect();
+    try testing.expectEqual(24, try state.doString(i64, "return triple(8)", .{}));
+}
+
+fn guarded(state: *lua.State, f: lua.Function) ![]const u8 {
+    state.pcall(void, f, .{}) catch |e| switch (e) {
+        error.Runtime => return state.errorMessage(),
+        else => return e,
+    };
+    return "fine";
+}
+
+test "a protected call inside a Zig function catches the error" {
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    try state.setGlobal("guarded", guarded);
+    const oops = "return guarded(function() error('oops') end)";
+    try testing.expectEqualStrings("c:1: oops", try state.doString([]const u8, oops, .{ .name = "=c" }));
+    try testing.expect(std.mem.startsWith(u8, state.errorTraceback().?, "c:1: oops\nstack traceback:\n"));
+    try testing.expectEqualStrings("fine", try state.doString([]const u8, "return guarded(function() end)", .{}));
+}
+
+fn ask(state: *lua.State, question: []const u8) !lua.Values {
+    return state.yield(.{ question, @as(i64, 42) });
+}
+
+fn callBackTwice(state: *lua.State, f: lua.Function) !void {
+    try state.call(void, f, .{});
+}
+
+test "coroutines resumed from the host, and Zig functions that yield" {
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    try state.setGlobal("ask", ask);
+    try state.setGlobal("callBackTwice", callBackTwice);
+
+    // A generator: two yields, then a return.
+    const gen = try state.newCoroutine(try state.doString(lua.Function,
+        \\return function(a) local b = coroutine.yield(a + 1) coroutine.yield(b * 2) return "done" end
+    , .{}));
+    try testing.expectEqual(11, (try gen.@"resume"(state, i64, .{10})).yielded);
+    try testing.expectEqual(14, (try gen.@"resume"(state, i64, .{7})).yielded);
+    try testing.expectEqualStrings("done", (try gen.@"resume"(state, []const u8, .{})).returned);
+    try expectRuntime(state, "cannot resume dead coroutine", gen.@"resume"(state, void, .{}));
+
+    // A Zig function yields its values, and returns what the next resume
+    // passes.
+    const co = try state.newCoroutine(try state.doString(lua.Function,
+        \\return function() local name, n = ask("name?") return "hi " .. name, n end
+    , .{}));
+    const q = (try co.@"resume"(state, struct { []const u8, i64 }, .{})).yielded;
+    try testing.expectEqualStrings("name?", q[0]);
+    try testing.expectEqual(42, q[1]);
+    const r = (try co.@"resume"(state, lua.Values, .{ "bob", 7 })).returned;
+    try testing.expectEqual(2, r.len);
+    try testing.expectEqualStrings("hi bob", try state.decode([]const u8, r[0], .{}));
+
+    // Errors kill the coroutine and keep its traceback.
+    const body = "return function() local x = nil; return x.y end";
+    const bad = try state.newCoroutine(try state.doString(lua.Function, body, .{ .name = "=co" }));
+    try expectRuntime(state, "co:1: attempt to index a nil value (local 'x')", bad.@"resume"(state, void, .{}));
+    try testing.expect(std.mem.startsWith(
+        u8,
+        state.errorTraceback().?,
+        "co:1: attempt to index a nil value (local 'x')\nstack traceback:\n\tco:1: in function",
+    ));
+
+    // Yields the reference refuses.
+    try expectRuntime(state, "attempt to yield from outside a coroutine", state.doString(void, "ask('x')", .{}));
+    const nested = "return function() callBackTwice(function() ask('x') end) end";
+    const across = try state.newCoroutine(try state.doString(lua.Function, nested, .{}));
+    try expectRuntime(state, "attempt to yield across a C-call boundary", across.@"resume"(state, void, .{}));
+
+    // Coroutines cross as values, and Lua can resume one the host made.
+    const lc = try state.newCoroutine(ask);
+    try state.setGlobal("lc", lc);
+    const from_lua = "local ok, v = coroutine.resume(lc, 'q') return v";
+    try testing.expectEqualStrings("q", try state.doString([]const u8, from_lua, .{}));
+    try testing.expectEqualStrings("suspended", try state.doString([]const u8, "return coroutine.status(lc)", .{}));
+    const back = try state.getGlobal(lua.Coroutine, "lc");
+    try testing.expectEqual(5, (try back.@"resume"(state, i64, .{5})).returned);
 }

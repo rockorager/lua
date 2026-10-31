@@ -84,7 +84,7 @@ pub fn start(host: *Host, io: ?std.Io, source: []const u8, name: []const u8) !*l
 pub fn readConfig(state: *lua.State, arena: std.mem.Allocator) !Config {
     const v = state.getGlobal(lua.Value, "config") catch |e| return report(state, e);
     if (v.isNil()) return .{};
-    return state.decodeAlloc(Config, arena, v) catch |e| report(state, e);
+    return state.decodeAlloc(Config, arena, v, .{ .unknown_keys = .reject }) catch |e| report(state, e);
 }
 
 /// Sends a key press to every handler and returns the first answer. A
@@ -195,6 +195,19 @@ test "key presses reach the plugin's handlers, and a failing one is reported" {
     out.clearRetainingCapacity();
     try testing.expectEqual(null, try press(state, "shrink"));
     try testing.expectEqualStrings("handler failed: init.lua:21: window size must be positive\n", out.written());
+}
+
+test "a misspelled key in the config is reported by its path" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const state = try testHost(&out,
+        \\config = { keybinds = { { key = "a", action = "x" }, { key = "b", acton = "y" } } }
+    );
+    defer stopTest(state);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.Runtime, readConfig(state, arena.allocator()));
+    try testing.expectEqualStrings("lua: unknown key 'keybinds[2].acton'\n", out.written());
 }
 
 test "a script that does not run is reported with its traceback" {

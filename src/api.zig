@@ -20,7 +20,9 @@ const IState = @import("State.zig");
 const Thread = @import("Thread.zig");
 const ITable = @import("Table.zig");
 const Userdata = @import("Userdata.zig");
+const Proto = @import("Proto.zig");
 const vm = @import("vm.zig");
+const gc = @import("gc.zig");
 const debuginfo = @import("debuginfo.zig");
 const lib = @import("lib/init.zig");
 const base = lib.base;
@@ -96,6 +98,19 @@ pub const Value = struct {
     }
 };
 
+comptime {
+    // `Values` reinterprets the engine's stack slots as `Value`s.
+    std.debug.assert(@sizeOf(Value) == @sizeOf(IValue) and @offsetOf(Value, "raw") == 0);
+}
+
+/// Any number of Lua values, borrowed from the state's stack: valid until
+/// the next call into the state. As the result type of `call` (and
+/// `doString`, `Coroutine.resume`) it takes every result; returned from a
+/// Zig function, each value is a result; passed as `call`'s arguments in
+/// place of a tuple, each value is an argument. Elsewhere, such as a struct
+/// field, a slice of `Value` converts to a sequence like any slice.
+pub const Values = []const Value;
+
 /// A Lua table, borrowed.
 pub const Table = struct {
     /// The engine's table; not part of the API.
@@ -108,6 +123,23 @@ pub const Table = struct {
     /// The raw length `#t` (a border), without `__len`.
     pub fn len(t: Table) u64 {
         return t.raw.length();
+    }
+
+    /// `t[key]` as a `T`, raw (`rawget`): no `__index`. `key` is any
+    /// value the API converts.
+    pub fn rawGet(t: Table, state: *State, comptime T: type, key: anytype) Error!T {
+        const th = state.thread();
+        const k = try toLua(th, key);
+        const v = t.raw.get(k);
+        if (decodeFast(T, v)) |x| return x;
+        return fieldSlow(T, th, k, v);
+    }
+
+    /// `t[key] = x`, raw (`rawset`): no `__newindex`.
+    pub fn rawSet(t: Table, state: *State, key: anytype, x: anytype) Error!void {
+        const th = state.thread();
+        const k = try toLua(th, key);
+        return rawSetValue(th, t.raw, k, try toLua(th, x));
     }
 
     /// Visits every key and value, raw, in `next`'s order. Do not add keys
@@ -139,6 +171,61 @@ pub const Function = struct {
 
     pub inline fn value(f: Function) Value {
         return .{ .raw = f.raw };
+    }
+};
+
+/// A Lua coroutine (a thread), borrowed. `State.newCoroutine` makes one;
+/// `resume` runs it until it yields or returns.
+pub const Coroutine = struct {
+    /// The engine's thread; not part of the API.
+    raw: *Thread,
+
+    pub inline fn value(co: Coroutine) Value {
+        return .{ .raw = .thread(co.raw) };
+    }
+
+    /// What a resume gives back, each converted to `R`: the values the
+    /// coroutine yielded, or, once its body returns, its results.
+    pub fn Result(comptime R: type) type {
+        return union(enum) { yielded: R, returned: R };
+    }
+
+    /// Starts or continues the coroutine, as `coroutine.resume` does,
+    /// passing `args` (a tuple, or `Values`): the body's arguments on the
+    /// first resume, and the results of the `yield` it is suspended in
+    /// after that. `state` is the caller: the state at the top level, or
+    /// the one a Zig function got. An error inside the coroutine kills it
+    /// and comes back as `error.Runtime` (with `State.errorTraceback` set
+    /// to the coroutine's traceback) or `error.OutOfMemory`; so does
+    /// resuming one that is dead or running. `R` converts the values as
+    /// `State.call` does; they are borrowed until the next call into the
+    /// state.
+    pub fn @"resume"(co: Coroutine, state: *State, comptime R: type, args: anytype) Error!Result(R) {
+        const th = state.thread();
+        const c = co.raw;
+        if (c == th) return state.raise("cannot resume non-suspended coroutine", .{});
+        const n: u32 = @intCast(argCount(args));
+        const from = stackIndex(c, args);
+        if (!(vm.checkStack(c, n) catch return error.OutOfMemory))
+            return state.raise("too many arguments to resume", .{});
+        try placeArgs(c, c.top, args, from);
+        c.top += n;
+        // The coroutine runs anchored on the caller's stack.
+        dropKept(th);
+        ensure(th, 1) catch |e| {
+            c.top -= n;
+            return e;
+        };
+        const bottom = th.top;
+        defer th.top = bottom;
+        th.push(.thread(c));
+        extraOf(th.state).trace.clearRetainingCapacity();
+        const r = vm.resumeThread(c, th, n) catch |e| return mapError(e);
+        if (r.status == .err) return resumeError(th, c, r.err);
+        const first = c.top - r.nres;
+        defer c.top = first;
+        const out = try results(R, th, c.stack[first..].ptr, r.nres);
+        return if (r.status == .ok) .{ .returned = out } else .{ .yielded = out };
     }
 };
 
@@ -212,6 +299,10 @@ pub const Options = struct {
     /// The environment for `os.getenv` and `package`'s paths; none when
     /// null. It must outlive the state.
     environ: ?*const std.process.Environ.Map = null,
+    /// `package.path` and `package.cpath` ignore `LUA_PATH` and
+    /// `LUA_CPATH` and take their defaults, as with `lua -E`; `os.getenv`
+    /// still reads `environ`.
+    noenv: bool = false,
     /// Record a traceback when a call from the host fails, for
     /// `State.errorTraceback`. It costs a stack slot per call, and the
     /// traceback is written only on error.
@@ -222,6 +313,20 @@ pub const Options = struct {
     seed: ?u64 = null,
     /// An allocator for string objects; the state's allocator when null.
     strings: ?std.mem.Allocator = null,
+    /// The collector's mode from the start, as `collectgarbage` sets it;
+    /// the standalone `lua` runs generational.
+    gc_mode: enum { incremental, generational } = .incremental,
+    /// Collector stress, for finding values a host holds borrowed past
+    /// their lifetime: `full` collects at every safe point, `step` takes
+    /// one incremental step at each. Slow.
+    gc_stress: @FieldType(IState.Options, "gc_stress") = .off,
+};
+
+pub const DecodeOptions = struct {
+    /// A table key that names no field of the struct being read is
+    /// ignored, or, with `.reject`, an error that gives its path, such as
+    /// "unknown key 'keybinds[2].acton'". Catches typos in configuration.
+    unknown_keys: enum { ignore, reject } = .ignore,
 };
 
 /// What the API keeps beside the engine's state: the libraries' host and
@@ -267,11 +372,17 @@ pub const State = opaque {
         extra.host.init(options.io orelse .failing);
         if (options.stdout) |w| extra.host.stdout = w;
         extra.host.environ = options.environ;
-        const s = try IState.create(gpa, .{ .seed = options.seed, .strings = options.strings });
+        extra.host.noenv = options.noenv;
+        const s = try IState.create(gpa, .{
+            .seed = options.seed,
+            .strings = options.strings,
+            .gc_stress = options.gc_stress,
+        });
         errdefer s.destroy();
         extra.types = try s.newTable(0, 0);
         try s.registry.setStr(&s.heap, try s.newString("_ZIG_TYPES"), .table(extra.types));
         lib.openSome(s.main, &extra.host, libs) catch |e| return mapError(e);
+        if (options.gc_mode == .generational) gc.changeMode(s.main, .gen_minor);
         return .of(s.main);
     }
 
@@ -304,6 +415,13 @@ pub const State = opaque {
         return extraOf(state.thread().state).host.stdout;
     }
 
+    /// Emits a warning, as `warn` does (`lua_warning`): pieces with
+    /// `tocont` set continue the message, and "@on" and "@off" turn
+    /// warnings on and off. Warnings start off.
+    pub fn warn(state: *State, msg: []const u8, tocont: bool) void {
+        base.warnf(&extraOf(state.thread().state).host, msg, tocont);
+    }
+
     // -----------------------------------------------------------------
     // Chunks and calls
     // -----------------------------------------------------------------
@@ -320,8 +438,9 @@ pub const State = opaque {
         return .{ .raw = f };
     }
 
-    /// `load` for a file read through `Options.io`, named "@path".
-    pub fn loadFile(state: *State, path: []const u8, mode: Mode) Error!Function {
+    /// `load` for a file read through `Options.io`, named "@path", or
+    /// standard input, named "=stdin", when `path` is null.
+    pub fn loadFile(state: *State, path: ?[]const u8, mode: Mode) Error!Function {
         const th = state.thread();
         const f = base.loadFile(th, path, modeString(mode)) catch |e| return loadError(th, e);
         return .{ .raw = f };
@@ -333,34 +452,38 @@ pub const State = opaque {
     }
 
     /// Loads and runs a file, and returns its results as `R` (see `call`).
-    pub fn doFile(state: *State, comptime R: type, path: []const u8, mode: Mode) Error!R {
+    pub fn doFile(state: *State, comptime R: type, path: ?[]const u8, mode: Mode) Error!R {
         return state.call(R, try state.loadFile(path, mode), .{});
     }
 
     /// Calls `f`, any Lua value, with the tuple `args` converted to Lua
-    /// values. `R` says what comes back: `void` for nothing, a tuple type
-    /// for several results, or one type for one result, each converted
-    /// as `decode` does.
+    /// values, or with `Values`. `R` says what comes back: `void` for
+    /// nothing, a tuple type for several results, `Values` for all of
+    /// them, or one type for one result, each converted as `decode` does.
     pub fn call(state: *State, comptime R: type, f: anytype, args: anytype) Error!R {
         const th = state.thread();
-        const nres = comptime resultCount(R);
-        try ensure(th, @typeInfo(@TypeOf(args)).@"struct".fields.len + 2);
+        const from = stackIndex(th, args);
+        dropKept(th);
+        try ensure(th, argCount(args) + 2);
         const bottom = th.top;
-        defer th.top = bottom;
-        if (th.frames.items.len == 1) {
-            const extra = extraOf(th.state);
-            if (extra.traceback) th.push(.native(&messageHandler));
-            const func = th.top;
-            try pushCall(th, f, args);
-            extra.trace.clearRetainingCapacity();
-            const status = vm.pcallMsgh(th, func, nres, if (extra.traceback) bottom else 0);
-            if (status != .ok) return protectedError(th, func, status);
-            return results(R, th, func);
-        }
-        const func = th.top;
-        try pushCall(th, f, args);
-        vm.call(th, func, nres) catch |e| return mapError(e);
-        return results(R, th, func);
+        if (th.frames.items.len == 1) return protectedCall(R, th, f, args, from, bottom);
+        // An error leaves the stack to the protected call that catches
+        // it, with the frames it unwinds intact for a traceback.
+        try placeCall(th, bottom, f, args, from);
+        vm.call(th, bottom, comptime resultCount(R)) catch |e| return mapError(e);
+        return finishCall(R, th, bottom, bottom);
+    }
+
+    /// `call` in protected mode wherever it runs, as `lua_pcall`: inside a
+    /// Zig function an error comes back as a Zig error, with the message
+    /// and traceback, instead of propagating to Lua's caller. At the top
+    /// level it is `call`.
+    pub fn pcall(state: *State, comptime R: type, f: anytype, args: anytype) Error!R {
+        const th = state.thread();
+        const from = stackIndex(th, args);
+        dropKept(th);
+        try ensure(th, argCount(args) + 2);
+        return protectedCall(R, th, f, args, from, th.top);
     }
 
     // -----------------------------------------------------------------
@@ -428,6 +551,61 @@ pub const State = opaque {
         return .{ .raw = try state.thread().state.newTable(0, 0) };
     }
 
+    /// Zig function `f` as a Lua function bound to `ctx`, which `f` gets
+    /// as its first parameter on every call; the rest are as for
+    /// `function`. A pointer is held as is (a light userdata), and must
+    /// outlive the function; any other value is copied into memory the
+    /// function owns, and `f` takes it by value or as a pointer to the
+    /// copy, which it may change.
+    pub fn function(state: *State, ctx: anytype, comptime f: anytype) Error!Function {
+        const th = state.thread();
+        const C = @TypeOf(ctx);
+        const heap = th.heap();
+        const up: IValue = if (comptime byPointer(C)) .lightUserdata(@ptrCast(@constCast(ctx))) else blk: {
+            comptime std.debug.assert(@alignOf(C) <= 16);
+            const u = try Userdata.create(heap, @sizeOf(C), 0);
+            @as(*C, @ptrCast(@alignCast(u.bytes().ptr))).* = ctx;
+            break :blk .userdata(u);
+        };
+        // No collection runs before the closure holds the userdata.
+        const c = try Proto.NativeClosure.create(heap, &Native(f, C).call, 1);
+        c.setUpvalue(heap, 0, up);
+        return .{ .raw = .nativeClosure(c) };
+    }
+
+    /// A new coroutine with body `f`, any value the API converts, as
+    /// `coroutine.create` makes it. Borrowed like any value: take a `Ref`
+    /// to keep it across calls into Lua.
+    pub fn newCoroutine(state: *State, f: anytype) Error!Coroutine {
+        const th = state.thread();
+        const fv = try toLua(th, f);
+        const co = try Thread.create(th.state);
+        co.inheritHook(th);
+        co.push(fv);
+        return .{ .raw = co };
+    }
+
+    /// Suspends the coroutine running the Zig function that calls it,
+    /// passing `values` (a tuple, or `Values`) to its resumer, as
+    /// `lua_yield` does. Only as the function's return value: `return
+    /// state.yield(.{x});` in a function returning an error union. The
+    /// next resume's values become the function's results. Outside a
+    /// coroutine, or under a call that cannot yield, it raises the
+    /// reference's error.
+    pub fn yield(state: *State, values: anytype) Error {
+        const th = state.thread();
+        if (!vm.isYieldable(th)) {
+            if (th.frames.items.len == 1) extraOf(th.state).trace.clearRetainingCapacity();
+            return mapError(vm.yield(th, 0));
+        }
+        const from = stackIndex(th, values);
+        const n: u32 = @intCast(argCount(values));
+        try ensure(th, n);
+        try placeArgs(th, th.top, values, from);
+        th.top += n;
+        return mapError(vm.yield(th, n));
+    }
+
     /// The Lua value `x` (a `Value`, `Table`, `Function`, or `Ref`) as a
     /// `T`, with Lua's conversions as the reference's `luaL_check`
     /// functions make them: numbers from numeric strings and strings from
@@ -438,20 +616,26 @@ pub const State = opaque {
     /// reads a sequence. Strings borrow Lua's bytes; slices other than
     /// strings need `decodeAlloc`. A value of the wrong type fails with
     /// `error.Runtime` and a message naming what was expected.
-    pub fn decode(state: *State, comptime T: type, x: anytype) Error!T {
+    pub fn decode(state: *State, comptime T: type, x: anytype, options: DecodeOptions) Error!T {
         const th = state.thread();
         const v = try toLua(th, x);
         if (decodeFast(T, v)) |r| return r;
-        var d: Decoder = .{ .th = th, .ctx = .value };
+        var d: Decoder = .{ .th = th, .ctx = .value, .reject = options.unknown_keys == .reject };
         return decodeAny(T, false, &d, v);
     }
 
     /// `decode`, copying strings into `gpa` and allocating slices from
     /// sequences. On error what was allocated so far is not freed: pass
     /// an arena.
-    pub fn decodeAlloc(state: *State, comptime T: type, gpa: std.mem.Allocator, x: anytype) Error!T {
+    pub fn decodeAlloc(
+        state: *State,
+        comptime T: type,
+        gpa: std.mem.Allocator,
+        x: anytype,
+        options: DecodeOptions,
+    ) Error!T {
         const th = state.thread();
-        var d: Decoder = .{ .th = th, .ctx = .value, .gpa = gpa };
+        var d: Decoder = .{ .th = th, .ctx = .value, .gpa = gpa, .reject = options.unknown_keys == .reject };
         return decodeAny(T, true, &d, try toLua(th, x));
     }
 
@@ -589,7 +773,31 @@ pub const State = opaque {
 /// `error.Runtime` raises the message already set (`State.raise`), and
 /// any other error its name.
 pub fn function(comptime f: anytype) Value {
-    return .{ .raw = .native(&Native(f).call) };
+    return .{ .raw = .native(&Native(f, void).call) };
+}
+
+/// Whether a context of type `C` is held by pointer (a light userdata)
+/// rather than copied into a userdata.
+fn byPointer(comptime C: type) bool {
+    return switch (@typeInfo(C)) {
+        .pointer => |p| p.size == .one,
+        else => false,
+    };
+}
+
+/// A bound function's context, from its upvalue, as parameter type `P`:
+/// the pointer itself, or for a copied value the value or a pointer to
+/// the copy.
+inline fn boundContext(comptime P: type, comptime C: type, up: IValue) P {
+    if (comptime byPointer(C)) {
+        if (P != C) @compileError("the first parameter of a function bound to a " ++ @typeName(C) ++ " must be one");
+        return @ptrCast(@alignCast(up.asLightUserdata().?));
+    }
+    const p: *C = @ptrCast(@alignCast(up.asUserdata().bytes().ptr));
+    if (P == C) return p.*;
+    if (P == *C or P == *const C) return p;
+    @compileError("the first parameter of a function bound to a " ++ @typeName(C) ++
+        " must be one, or a pointer to one");
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +813,7 @@ inline fn mapError(e: IError) Error {
 
 fn loadError(th: *Thread, e: IError) Error {
     @branchHint(.cold);
-    if (th.frames.items.len == 1) extraOf(th.state).trace.clearRetainingCapacity();
+    extraOf(th.state).trace.clearRetainingCapacity();
     return switch (e) {
         error.LuaError => error.Syntax,
         error.OutOfMemory => error.OutOfMemory,
@@ -624,10 +832,63 @@ inline fn ensure(th: *Thread, n: usize) Error!void {
     th.ensureStack(@intCast(n)) catch |e| return mapError(e);
 }
 
-/// Pushes `f` and the tuple `args` for a call.
-inline fn pushCall(th: *Thread, f: anytype, args: anytype) error{OutOfMemory}!void {
-    th.push(try toLua(th, f));
-    inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |field| th.push(try toLua(th, @field(args, field.name)));
+/// How many values `args`, a tuple or `Values`, holds.
+inline fn argCount(args: anytype) usize {
+    if (@TypeOf(args) == Values) return args.len;
+    return @typeInfo(@TypeOf(args)).@"struct".fields.len;
+}
+
+/// Where `Values` borrowed from `th`'s stack start in it, taken before
+/// the stack can move; null for anything else.
+inline fn stackIndex(th: *const Thread, args: anytype) ?u32 {
+    if (@TypeOf(args) != Values) return null;
+    const p = @intFromPtr(args.ptr);
+    const lo = @intFromPtr(th.stack.ptr);
+    if (p < lo or p >= lo + th.stack.len * @sizeOf(IValue)) return null;
+    return @intCast((p - lo) / @sizeOf(IValue));
+}
+
+/// `vals` as the engine's values.
+inline fn rawValues(vals: Values) []const IValue {
+    return @as([*]const IValue, @ptrCast(vals.ptr))[0..vals.len];
+}
+
+/// Writes `args`, a tuple or `Values`, to `dst.stack[at..]`, which has
+/// room. `from` is `stackIndex(dst, args)` from before the stack last
+/// moved. Borrowed values may overlap the destination, so they move.
+inline fn placeArgs(dst: *Thread, at: u32, args: anytype, from: ?u32) error{OutOfMemory}!void {
+    if (@TypeOf(args) == Values) {
+        const src = if (from) |i| dst.stack[i..][0..args.len] else rawValues(args);
+        @memmove(dst.stack[at..][0..args.len], src);
+        return;
+    }
+    inline for (@typeInfo(@TypeOf(args)).@"struct".fields, 0..) |field, i| {
+        dst.stack[at + i] = try toLua(dst, @field(args, field.name));
+    }
+}
+
+/// Puts `f` and `args` at `stack[func..]` for a call, with `top` after
+/// them; the stack has room.
+inline fn placeCall(th: *Thread, func: u32, f: anytype, args: anytype, from: ?u32) error{OutOfMemory}!void {
+    if (@TypeOf(args) == Values) {
+        // Borrowed values may sit where `f` goes, so `f` lands after them.
+        const fv = try toLua(th, f);
+        try placeArgs(th, func + 1, args, from);
+        th.stack[func] = fv;
+    } else {
+        // Storing `f` first keeps its 16 bytes out of a spill slot.
+        th.stack[func] = try toLua(th, f);
+        try placeArgs(th, func + 1, args, from);
+    }
+    th.top = func + 1 + @as(u32, @intCast(argCount(args)));
+}
+
+/// Pushes `vals`, which may be borrowed from above `top`.
+inline fn pushValues(th: *Thread, vals: Values) IError!void {
+    const from = stackIndex(th, vals);
+    try th.ensureStack(@intCast(vals.len));
+    try placeArgs(th, th.top, vals, from);
+    th.top += @intCast(vals.len);
 }
 
 fn globalSlow(comptime T: type, th: *Thread, name: []const u8, v: IValue) Error!T {
@@ -641,9 +902,52 @@ fn fieldSlow(comptime T: type, th: *Thread, k: IValue, v: IValue) Error!T {
     return decodeAny(T, false, &d, v);
 }
 
-/// Calls `func` from the top level in protected mode, `msgh` the message
-/// handler's slot or 0. A failure leaves the error object in `th.err`.
-fn protectedCall(th: *Thread, func: u32, nres: i16, msgh: u32) Error!void {
+/// `call` and `pcall` in protected mode, with room on the stack: `f`
+/// and `args` go above `bottom`, the top.
+inline fn protectedCall(comptime R: type, th: *Thread, f: anytype, args: anytype, from: ?u32, bottom: u32) Error!R {
+    const extra = extraOf(th.state);
+    const func = bottom + @intFromBool(extra.traceback);
+    try placeCall(th, func, f, args, from);
+    if (extra.traceback) th.stack[bottom] = .native(&messageHandler);
+    extra.trace.clearRetainingCapacity();
+    const status = vm.pcallMsgh(th, func, comptime resultCount(R), if (extra.traceback) bottom else 0);
+    if (status != .ok) {
+        th.top = bottom;
+        return protectedError(th, func, status);
+    }
+    return finishCall(R, th, func, bottom);
+}
+
+/// The results of a call at `func` as `R`, with the stack back at
+/// `bottom`. `Values` stay on the stack, as the running frame's kept
+/// results, until the next call drops them (`dropKept`).
+inline fn finishCall(comptime R: type, th: *Thread, func: u32, bottom: u32) Error!R {
+    if (R == Values) {
+        const f = th.frame();
+        f.extra_args = bottom;
+        f.old_errfunc = th.top;
+        return @as([*]const Value, @ptrCast(th.stack[func..].ptr))[0 .. th.top - func];
+    }
+    defer th.top = bottom;
+    return results(R, th, th.stack[func..].ptr, comptime @intCast(resultCount(R)));
+}
+
+/// Drops the `Values` a call from the running frame kept on the stack,
+/// unless something was pushed above them. The frame records them in
+/// `extra_args` (where they start; 0 for none) and `old_errfunc` (where
+/// they end), which a frame without a continuation, as every Zig
+/// function's and the base frame are, does not use; they go with the
+/// frame.
+inline fn dropKept(th: *Thread) void {
+    const f = th.frame();
+    if (f.extra_args == 0) return;
+    if (th.top == f.old_errfunc) th.top = f.extra_args;
+    f.extra_args = 0;
+}
+
+/// Runs `func` in protected mode, `msgh` the message handler's slot or
+/// 0. A failure leaves the error object in `th.err`.
+fn protectedRun(th: *Thread, func: u32, nres: i16, msgh: u32) Error!void {
     extraOf(th.state).trace.clearRetainingCapacity();
     const status = vm.pcallMsgh(th, func, nres, msgh);
     if (status != .ok) return protectedError(th, func, status);
@@ -655,23 +959,64 @@ fn protectedError(th: *Thread, func: u32, status: vm.Status) Error {
     return if (status == .memory) error.OutOfMemory else error.Runtime;
 }
 
-/// The top level's message handler: records the message and a traceback
-/// and leaves the error object as it is.
+/// A failed resume of `c` from `th`: its error object moves to `th`, and
+/// the coroutine's traceback, when it died running, to the trace.
+fn resumeError(th: *Thread, c: *Thread, status: vm.Status) Error {
+    @branchHint(.cold);
+    const err = c.stack[c.top - 1];
+    c.top -= 1;
+    th.err = err;
+    if (status == .memory) return error.OutOfMemory;
+    const extra = extraOf(th.state);
+    if (extra.traceback and c.status == .dead) {
+        var buf: [number.max_len]u8 = undefined;
+        var aw: std.Io.Writer.Allocating = .fromArrayList(extra.gpa, &extra.trace);
+        defer extra.trace = aw.toArrayList();
+        debuginfo.traceback(&aw.writer, c, errorText(err, &buf), 0) catch extra.trace.clearRetainingCapacity();
+    }
+    return error.Runtime;
+}
+
+/// The message of error object `v` for a traceback: a string or number
+/// as is, or a description of its type.
+fn errorText(v: IValue, buf: *[number.max_len]u8) []const u8 {
+    if (v.isString()) return v.asString().bytes();
+    if (v.isNumber()) return vm.formatNumber(v, buf);
+    return objectDescription(v);
+}
+
+/// The message handler of calls in protected mode, lua.c's `msghandler`:
+/// records the message and a traceback, or, for an error object that is
+/// not a string or number, its `__tostring` alone, and leaves the error
+/// object as it is.
 fn messageHandler(th: *Thread, b: u32) IError!u32 {
     const extra = extraOf(th.state);
     const v = th.stack[b];
-    var buf: [128]u8 = undefined;
-    const msg: []const u8 = if (v.isString())
-        v.asString().bytes()
-    else if (v.isNumber())
-        vm.formatNumber(v, buf[0..number.max_len])
-    else
-        objectDescription(v);
+    var buf: [number.max_len]u8 = undefined;
+    if (!v.isString() and !v.isNumber()) tostring: {
+        // `luaL_callmeta`: the metamethod's own result, which must be a
+        // string, not `tostring`'s conversion of it.
+        const mm = base.getMetafield(th, v, "__tostring") orelse break :tostring;
+        try th.ensureStack(2);
+        const func = th.top;
+        th.push(mm);
+        th.push(v);
+        try vm.call(th, func, 1);
+        const s = th.stack[func];
+        th.top = func;
+        if (s.isString()) {
+            extra.trace.clearRetainingCapacity();
+            extra.trace.appendSlice(extra.gpa, s.asString().bytes()) catch return 1;
+            th.stack[b] = v;
+            th.top = b + 1;
+            return 1;
+        }
+    }
     extra.trace.clearRetainingCapacity();
     var aw: std.Io.Writer.Allocating = .fromArrayList(extra.gpa, &extra.trace);
     defer extra.trace = aw.toArrayList();
     // Without memory for it the error goes on without a traceback.
-    debuginfo.traceback(&aw.writer, th, msg, 1) catch return 1;
+    debuginfo.traceback(&aw.writer, th, errorText(v, &buf), 1) catch return 1;
     return 1;
 }
 
@@ -693,7 +1038,7 @@ fn protect(th: *Thread, op: IValue.NativeFn, in: []const IValue) Error!IValue {
     const func = th.top;
     th.push(.native(op));
     for (in) |v| th.push(v);
-    try protectedCall(th, func, 1, if (msgh) bottom else 0);
+    try protectedRun(th, func, 1, if (msgh) bottom else 0);
     return th.stack[func];
 }
 
@@ -732,15 +1077,17 @@ fn indexSlow(th: *Thread, o: IValue, k: IValue) Error!IValue {
 inline fn setIndex(th: *Thread, o: IValue, k: IValue, v: IValue) Error!void {
     if (o.isTable()) {
         const t = o.asTable();
-        if (th.state.fastTm(t.metatable, .newindex) == null or !t.get(k).isNil()) {
-            return t.set(th.heap(), k, v) catch |e| switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.IndexIsNil => mapError(th.runError("table index is nil", .{})),
-                error.IndexIsNaN => mapError(th.runError("table index is NaN", .{})),
-            };
-        }
+        if (th.state.fastTm(t.metatable, .newindex) == null or !t.get(k).isNil()) return rawSetValue(th, t, k, v);
     }
     return setIndexSlow(th, o, k, v);
+}
+
+inline fn rawSetValue(th: *Thread, t: *ITable, k: IValue, v: IValue) Error!void {
+    return t.set(th.heap(), k, v) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.IndexIsNil => mapError(th.runError("table index is nil", .{})),
+        error.IndexIsNaN => mapError(th.runError("table index is NaN", .{})),
+    };
 }
 
 fn setIndexSlow(th: *Thread, o: IValue, k: IValue, v: IValue) Error!void {
@@ -801,6 +1148,7 @@ fn toLua(th: *Thread, x: anytype) error{OutOfMemory}!IValue {
     switch (T) {
         Value, Function => return x.raw,
         Table => return .table(x.raw),
+        Coroutine => return .thread(x.raw),
         Ref => return refValue(th, x),
         @TypeOf(null) => return .nil,
         else => {},
@@ -816,7 +1164,7 @@ fn toLua(th: *Thread, x: anytype) error{OutOfMemory}!IValue {
         .enum_literal => return .string(try s.newString(@tagName(x))),
         .@"enum" => return .string(try s.newString(@tagName(x))),
         .optional => return if (x) |p| toLua(th, p) else .nil,
-        .@"fn" => return .native(&Native(x).call),
+        .@"fn" => return .native(&Native(x, void).call),
         .array => |a| {
             if (a.child == u8) return .string(try s.newString(&x));
             return sequence(th, &x);
@@ -883,6 +1231,7 @@ inline fn decodeFast(comptime T: type, v: IValue) ?T {
         Value => return .{ .raw = v },
         Table => if (v.isTable()) return .{ .raw = v.asTable() },
         Function => if (v.isFunction()) return .{ .raw = v },
+        Coroutine => if (v.typeOf() == .thread) return .{ .raw = v.asThread() },
         bool => return !v.isFalsy(),
         []const u8 => if (v.isString()) return v.asString().bytes(),
         [:0]const u8 => if (v.isString()) return v.asString().bytesZ(),
@@ -961,6 +1310,19 @@ const Decoder = struct {
     path: ?*const Crumb = null,
     /// Where `decodeAlloc` copies strings and allocates slices.
     gpa: ?std.mem.Allocator = null,
+    /// `DecodeOptions.unknown_keys` is `.reject`.
+    reject: bool = false,
+
+    /// Key `k` of the table being read as a struct names no field.
+    fn unknownKey(d: *Decoder, k: IValue) Error {
+        @branchHint(.cold);
+        var c: Crumb = .ofKey(k);
+        c.parent = d.path;
+        var pbuf: [96]u8 = undefined;
+        const path = c.write(&pbuf);
+        d.path = null;
+        return d.fail("unknown key '{s}'", .{path});
+    }
 
     fn fail(d: *Decoder, comptime fmt: []const u8, args: anytype) Error {
         @branchHint(.cold);
@@ -1030,31 +1392,35 @@ fn checkArgSlow(comptime T: type, th: *Thread, top: u32, n: u32, slot: u32) Erro
     return decodeAny(T, false, &d, if (slot < top) th.stack[slot] else null);
 }
 
-/// The results of a call at `func` as `R`.
-inline fn results(comptime R: type, th: *Thread, func: u32) Error!R {
+/// The `n` values at `vals` as `R`, missing ones nil; decoding errors are
+/// raised on `th`.
+inline fn results(comptime R: type, th: *Thread, vals: [*]const IValue, n: u32) Error!R {
     if (R == void) return;
+    if (R == Values) return @as([*]const Value, @ptrCast(vals))[0..n];
     if (@typeInfo(R) == .@"struct" and @typeInfo(R).@"struct".is_tuple) {
         var r: R = undefined;
         inline for (@typeInfo(R).@"struct".fields, 0..) |f, i| {
-            @field(r, f.name) = try result(f.type, th, func + @as(u32, i), i + 1);
+            @field(r, f.name) = try result(f.type, th, if (i < n) vals[i] else .nil, i + 1);
         }
         return r;
     }
-    return result(R, th, func, 1);
+    return result(R, th, if (n > 0) vals[0] else .nil, 1);
 }
 
-inline fn result(comptime T: type, th: *Thread, slot: u32, n: u32) Error!T {
-    if (decodeFast(T, th.stack[slot])) |x| return x;
-    return resultSlow(T, th, slot, n);
+inline fn result(comptime T: type, th: *Thread, v: IValue, n: u32) Error!T {
+    if (decodeFast(T, v)) |x| return x;
+    return resultSlow(T, th, v, n);
 }
 
-fn resultSlow(comptime T: type, th: *Thread, slot: u32, n: u32) Error!T {
+fn resultSlow(comptime T: type, th: *Thread, v: IValue, n: u32) Error!T {
     var d: Decoder = .{ .th = th, .ctx = .{ .result = n } };
-    return decodeAny(T, false, &d, th.stack[slot]);
+    return decodeAny(T, false, &d, v);
 }
 
+/// How many results a call returning `R` asks for; -1 for all.
 fn resultCount(comptime R: type) i16 {
     if (R == void) return 0;
+    if (R == Values) return -1;
     if (@typeInfo(R) == .@"struct" and @typeInfo(R).@"struct".is_tuple) return @typeInfo(R).@"struct".fields.len;
     return 1;
 }
@@ -1151,6 +1517,11 @@ fn decodeAny(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue) Er
             if (!x.isFunction()) return d.typeError("function", v);
             return .{ .raw = x };
         },
+        Coroutine => {
+            const x = v orelse return d.typeError("thread", v);
+            if (x.typeOf() != .thread) return d.typeError("thread", v);
+            return .{ .raw = x.asThread() };
+        },
         Ref => {
             const x = v orelse return .nil;
             if (x.isNil()) return .nil;
@@ -1228,6 +1599,14 @@ fn decodeAny(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue) Er
                 }
                 return r;
             }
+            // Unknown keys first, so a misspelled field is reported as
+            // that rather than as the field it was meant to be missing.
+            if (d.reject) {
+                var it = t.iterator();
+                while (it.next()) |e| {
+                    if (!isFieldName(T, e.key.raw)) return d.unknownKey(e.key.raw);
+                }
+            }
             inline for (st.fields) |f| {
                 const fv = t.raw.getStr(try th.state.newString(f.name));
                 if (fv.isNil() and f.defaultValue() != null) {
@@ -1240,6 +1619,16 @@ fn decodeAny(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue) Er
         },
         else => @compileError("cannot convert a Lua value to " ++ @typeName(T)),
     }
+}
+
+/// Whether `k` is the name of a field of struct `T`.
+fn isFieldName(comptime T: type, k: IValue) bool {
+    if (!k.isString()) return false;
+    const name = k.asString().bytes();
+    inline for (comptime std.meta.fieldNames(T)) |f| {
+        if (std.mem.eql(u8, f, name)) return true;
+    }
+    return false;
 }
 
 fn decodeString(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue, comptime z: bool) Error!T {
@@ -1267,12 +1656,16 @@ fn decodeString(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue,
 // Zig functions as Lua functions
 // ---------------------------------------------------------------------------
 
-fn Native(comptime f: anytype) type {
+/// The native function for Zig function `f`. With a context type `C`
+/// (not `void`), the native is a closure whose upvalue holds the context
+/// (`State.function`), and `f` takes it first.
+fn Native(comptime f: anytype, comptime C: type) type {
     const F = @TypeOf(f);
     const info = switch (@typeInfo(F)) {
         .@"fn" => |i| i,
         else => @compileError("expected a function, got " ++ @typeName(F)),
     };
+    if (C != void and info.params.len == 0) @compileError("a function bound to a context takes it first");
     return struct {
         fn call(th: *Thread, b: u32) IError!u32 {
             const top = th.top;
@@ -1280,7 +1673,9 @@ fn Native(comptime f: anytype) type {
             comptime var n: u32 = 1;
             inline for (info.params, 0..) |p, i| {
                 const P = p.type orelse @compileError("generic parameters are not supported");
-                if (P == *State) {
+                if (C != void and i == 0) {
+                    args[0] = boundContext(P, C, th.stack[b - 1].asNativeClosure().upvalues()[0]);
+                } else if (P == *State) {
                     args[i] = .of(th);
                 } else if (P == Args) {
                     args[i] = .{ .th = th, .base = b, .top = top };
@@ -1304,6 +1699,10 @@ fn Native(comptime f: anytype) type {
 inline fn pushResults(th: *Thread, r: anytype) IError!u32 {
     const R = @TypeOf(r);
     if (R == void) return 0;
+    if (R == Values) {
+        try pushValues(th, r);
+        return @intCast(r.len);
+    }
     if (@typeInfo(R) == .@"struct" and @typeInfo(R).@"struct".is_tuple) {
         const n = @typeInfo(R).@"struct".fields.len;
         try th.ensureStack(n);

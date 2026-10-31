@@ -124,14 +124,16 @@ pub const Frame = struct {
     nresults: i16,
     flags: Flags,
     /// Lua vararg frames: how many extra arguments sit below `func`.
-    /// Native frames: the continuation's context.
+    /// Native frames: the continuation's context. Frames without one
+    /// (the base frame, Zig functions): where the results the embedding
+    /// API keeps for its caller start, or 0.
     extra_args: u32 = 0,
     /// Lua frames: the result count a `RETURN` saved while closing
     /// variables (PUC-Rio's `nres`). Native frames: the values a yield
     /// passes (`nyield`), or the protected call's function slot.
     aux: u32 = 0,
     /// Native frames in a yieldable protected call: the message handler to
-    /// restore.
+    /// restore. With `extra_args` as the API's kept results: where they end.
     old_errfunc: u32 = 0,
 
     pub const Flags = packed struct(u16) {
