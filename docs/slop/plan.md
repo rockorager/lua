@@ -183,10 +183,18 @@ reference.
     registry as a light userdata under `_LUA_HOST`. A field on `State` would
     save the lookup; ask the core's owner when a library needs it on a hot
     path.
-16. **Embedding API.** A Zig API, not the C API. Settled: no C API and no
-    loading of C modules (`.so`). Hosts extend Lua with Zig functions, so
-    `package.loadlib` and the C searchers keep the reference's "dynamic
-    libraries not enabled" answer. Landed: `src/api.zig`, exported at the
+16. **Embedding API.** A Zig API first. Reopened in wave 8: whether to
+    add Lua 5.5.1's C API and `.so` loading as an opt-in build
+    (`-Dc-api=true`), so compiled C modules load unmodified. A prototype
+    landed (`c-api.md`, `src/capi/`, `results/c-api-20261031.md`): 128
+    of 156 functions, the suite's `libs/`, lpeg, lua-cjson, and
+    luafilesystem passing their own tests, errors unwound by a protected
+    call per C function. The default build is unchanged; without the
+    option `package.loadlib` and the C searchers keep the reference's
+    "dynamic libraries not enabled" answer. Still to decide: full
+    coverage (hooks, `luaL_Stream`, `lua_newstate` for a `liblua.so`),
+    aarch64, and whether the C-API build becomes a release artifact.
+    Landed: `src/api.zig`, exported at the
     module's root (`lua.State`, `lua.Value`, `lua.Ref`, ...), with the engine
     under `lua.internal` for the tools. `State` is an opaque
     handle to a `Thread`; values cross as Zig types; calls from the top level
@@ -363,3 +371,10 @@ info luac's in every case (decision 14), and ReleaseSafe without the
 allocator's fill (the hot-path rules, `results/safe-poison-20261031.md`).
 The comparison with the reference at the end of wave 7 is
 `results/bench-compare-wave7-20261031.md`.
+
+Wave 8: the C API prototype (decision 16 reopened, `c-api.md`), opt-in
+with `-Dc-api=true`. Owner of `src/capi/`, `include/`, `test/capi/`,
+`bench/capi/`; small edits to `Thread.zig` (the prefix in front of each
+thread), `Proto.zig` (`NativeClosure.cfn`), `State.zig` (5.5.1's
+registry layout), and `lib/package.zig` (`loadlib` and the C searchers
+call `capi/loadlib.zig`). Measurements in `results/c-api-20261031.md`.
