@@ -156,12 +156,17 @@ reference.
     registry as a light userdata under `_LUA_HOST`. A field on `State` would
     save the lookup; ask the core's owner when a library needs it on a hot
     path.
-16. **Embedding API.** A Zig API, not the C API, designed once the standard
-    library has exercised the internal one. Nothing outside `src/` depends on
-    internals until then. Settled: no C API and no loading of C modules
-    (`.so`). Hosts extend Lua with Zig functions, so `package.loadlib` and
-    the C searchers keep the reference's "dynamic libraries not enabled"
-    answer.
+16. **Embedding API.** A Zig API, not the C API. Settled: no C API and no
+    loading of C modules (`.so`). Hosts extend Lua with Zig functions, so
+    `package.loadlib` and the C searchers keep the reference's "dynamic
+    libraries not enabled" answer. Landed: `src/api.zig`, exported at the
+    module's root (`lua.State`, `lua.Value`, `lua.Ref`, ...), with the engine
+    under `lua.internal` for `main.zig` and the tools. `State` is an opaque
+    handle to a `Thread`; values cross as Zig types; calls from the top level
+    are protected and calls inside Zig functions propagate; userdata
+    metatables are found by a per-type number in an array, not a registry
+    hash. Against the internal path the API is 7.7% faster on geomean, with
+    equal peak memory (`api.md`, `results/api-20261031.md`).
 
 ## Hot-path rules
 
@@ -190,6 +195,9 @@ reference.
   `docs/slop/suite-status.md` tracks which files pass.
 
 ## Benchmarks
+
+`just bench-api` times the embedding API against the same work on the
+engine (`bench/api/main.zig`), interleaved and pinned like `bench-compare`.
 
 `bench/` holds Lua programs that stress one thing each: calls (fib), tables
 (binary trees, hash insert and lookup), floats (n-body, spectral norm,

@@ -240,6 +240,41 @@ bench-compare ROUNDS="10" *PROGRAMS:
         exit 1
     fi
 
+[doc("The embedding API against the engine's own path (bench/api): each scenario, or only SCENARIOS, on both arms in interleaved rounds on one core, with time per operation and peak RSS, the work checked equal, then benchstat")]
+[group("bench")]
+bench-api ROUNDS="10" *SCENARIOS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=zig-out/bench-api
+    rm -rf "$out" && mkdir -p "$out"
+    zig build bench-api -Doptimize=ReleaseFast
+    bin=zig-out/bin/bench-api
+    scenarios=({{ SCENARIOS }})
+    if [ ${#scenarios[@]} -eq 0 ]; then
+        scenarios=(lua_calls_zig zig_calls_lua zig_calls_lua_notb callback globals userdata_method decode_struct)
+    fi
+    arms=(internal api)
+    for arm in "${arms[@]}"; do
+        grep -m1 '^model name' /proc/cpuinfo | sed 's/^model name[[:space:]]*:[[:space:]]*/cpu: /' > "$out/$arm.txt"
+    done
+    gnutime=$(type -P time)
+    core=$(( $(nproc) - 1 ))
+    for round in $(seq 0 $(( {{ ROUNDS }} - 1 ))); do
+        echo "round $(( round + 1 ))/{{ ROUNDS }}" >&2
+        for s in "${scenarios[@]}"; do
+            for i in 0 1; do
+                arm=${arms[$(( (round + i) % 2 ))]}
+                line=$("$gnutime" -f %M -o "$out/rss" taskset -c "$core" "$bin" "$arm" "$s" 2> "$out/check.$arm.$s")
+                printf '%s\t%d peak-RSS-KiB\n' "$line" "$(tail -n 1 "$out/rss")" >> "$out/$arm.txt"
+            done
+            if ! cmp -s "$out/check.internal.$s" "$out/check.api.$s"; then
+                echo "the arms did different work on $s" >&2
+                exit 1
+            fi
+        done
+    done
+    benchstat internal="$out/internal.txt" api="$out/api.txt" | tee "$out/benchstat.txt"
+
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:

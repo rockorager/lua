@@ -70,6 +70,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_example.addArgs(args);
     b.step("example", "Run the example host").dependOn(&run_example.step);
 
+    // The embedding API's cost against the engine's own path, for `just
+    // bench-api`.
+    const bench_api = b.addExecutable(.{
+        .name = "bench-api",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/api/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "lua", .module = mod }},
+        }),
+    });
+    b.step("bench-api", "Build the embedding API benchmark").dependOn(&b.addInstallArtifact(bench_api, .{}).step);
+
     // Every step below needs testingx, which is lazy so a consumer never
     // fetches it. On the first configure pass it is not fetched yet, and the
     // build runner fetches it and reruns this script.

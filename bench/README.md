@@ -42,3 +42,7 @@ Until `build.zig` installs `zig-out/bin/lua`, `just bench-compare` says so and t
 Every run's output must match the reference's first run. A program whose output differs on an arm, or that exits with an error, loses that arm's rows, the differences are printed, and the recipe fails after the table. `benchstat` then compares the arms with the reference as the base. Everything lands in `zig-out/bench-compare/`: each run's output in `stdout/`, the raw rows, the per-arm benchstat input, and `benchstat.txt`.
 
 `just bench-compare 20 fib nbody` runs only those programs, for a tighter A/B on one change.
+
+## The embedding API
+
+`bench/api/main.zig` is a Zig program, not a Lua one: it times calls through the embedding API (`lua.State`) against the same work written directly on the engine, as the standard library writes it. `just bench-api [ROUNDS] [SCENARIOS...]` runs both arms in interleaved rounds pinned to the last core, checks that they did the same work, and compares time per operation and peak RSS with benchstat.
