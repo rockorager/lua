@@ -1,0 +1,9 @@
+/* liblua.so exports lua.h's, lauxlib.h's, and lualib.h's functions only. */
+{
+  global:
+    lua_*;
+    luaL_*;
+    luaopen_*;
+  local:
+    *;
+};

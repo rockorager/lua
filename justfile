@@ -163,7 +163,7 @@ diff *FILES:
     done
     [ ${#failed[@]} -eq 0 ]
 
-[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, io handles shared with C (stream.c, luaposix's posix.stdio), libraries closed with the state (unload.c), the own tests of lpeg, lua-cjson, and luafilesystem, and the C-API build's io and os on files.lua and test/diff. With TARGET (aarch64-linux-gnu), the same cross-built and run under qemu-user against the reference built for TARGET")]
+[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, io handles shared with C (stream.c, luaposix's posix.stdio), libraries closed with the state (unload.c), the own tests of lpeg, lua-cjson, and luafilesystem, and the C-API build's io and os on files.lua and test/diff; test/capi/host.c, a C host, on our liblua.so and liblua.a against the reference's liblua.so; then capi-coverage. With TARGET (aarch64-linux-gnu), the same cross-built and run under qemu-user against the reference built for TARGET")]
 [group("test")]
 capi-test TARGET="":
     #!/usr/bin/env bash
@@ -269,7 +269,47 @@ capi-test TARGET="":
         run "diff-$(basename "$f" .lua)" test/diff cat sh -c '"$LUA" '"$(basename "$f")"
         ref=$saved
     done
+    # A C host embedding liblua (test/capi/host.c): built against the
+    # reference's liblua.so, ours, and our liblua.a, and run alone.
+    if [ -z "$target" ]; then
+        refdir=$(dirname "$(dirname "$(readlink -f "$ref")")")
+        runner=()
+    else
+        refdir=$(dirname "$(dirname "$reflua")")
+        runner=("$qemu" -L "$out/root")
+    fi
+    lib=$(dirname "$inc")/lib
+    "${cc[@]}" -Wall -O2 "-I$refdir/include" -o "$out/host-ref" test/capi/host.c "$refdir/lib/liblua.so" "-Wl,-rpath,$refdir/lib"
+    "${cc[@]}" -Wall -O2 "-I$inc" -o "$out/host-so" test/capi/host.c "$lib/liblua.so" "-Wl,-rpath,$lib"
+    "${cc[@]}" -Wall -O2 "-I$inc" -Wl,-z,noexecstack -o "$out/host-a" test/capi/host.c "$lib/liblua.a"
+    for kind in so a; do
+        hostrun() { if [ "$LUA" = "$ref" ]; then "${runner[@]}" "$out/host-ref"; else "${runner[@]}" "$out/host-$kind"; fi; }
+        run "host-$kind" "$out" cat hostrun
+    done
+    just capi-coverage "$lib/liblua.so" "$(dirname "$inc")/bin/lua"
     [ ${#failed[@]} -eq 0 ] || { printf 'differs: %s\n' "${failed[@]}"; exit 1; }
+
+[doc("Coverage of the C API: every function lua.h, lauxlib.h, and lualib.h declare must be a defined dynamic symbol of each BINARY (built with -Dc-api=true), and nothing else named lua_*, luaL_*, or luaopen_* may be")]
+[group("test")]
+capi-coverage +BINARIES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=zig-out/capi-coverage
+    mkdir -p "$out"
+    # Every declaration names its function in parentheses, as in
+    # `LUA_API int (lua_gettop) (lua_State *L);`.
+    grep -hoE '^(LUA_API|LUALIB_API|LUAMOD_API)\b[^;]*' include/lua.h include/lauxlib.h include/lualib.h |
+        grep -oE '\((lua[L]?_[a-z_]+|luaopen_[a-z0-9]+)\)' | tr -d '()' | sort -u > "$out/declared"
+    status=0
+    for bin in {{ BINARIES }}; do
+        nm -D --defined-only "$bin" | awk '$2 == "T" { print $3 }' | grep -E '^(lua[L]?_|luaopen_)' | sort -u > "$out/exported"
+        missing=$(comm -23 "$out/declared" "$out/exported")
+        extra=$(comm -13 "$out/declared" "$out/exported")
+        echo "$bin: $(comm -12 "$out/declared" "$out/exported" | wc -l) of $(wc -l < "$out/declared") declared functions exported"
+        if [ -n "$missing" ]; then echo "missing:" $missing; status=1; fi
+        if [ -n "$extra" ]; then echo "not in the headers:" $extra; status=1; fi
+    done
+    exit $status
 
 [doc("The C API's costs (bench/capi): CPU ns per call of a C function in a tight loop (nop, add, callback, and the empty loop), our C-API lua against the reference, and startup (`lua -e ''`) wall time and peak RSS on the reference, our default build, and our C-API build, in interleaved rounds on one core, then benchstat; and the native stack bytes per level of C -> lua_call -> Lua nesting")]
 [group("bench")]

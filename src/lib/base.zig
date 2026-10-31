@@ -504,6 +504,13 @@ fn warn(th: *Thread, base: u32) Error!u32 {
     const n = th.top - base;
     _ = try checkString(th, base, 1, "warn");
     for (2..n + 1) |i| _ = try checkString(th, base, @intCast(i), "warn");
+    if (Thread.prefix_len != 0) {
+        // C-API builds: through the state's warning function, which
+        // `lua_setwarnf` can replace (`lua_warning`).
+        const wf = th.state.warnf orelse return 0;
+        for (0..n) |i| wf(th.state, th.stack[base + i].asString().bytes(), i + 1 < n);
+        return 0;
+    }
     const host = getHost(th);
     for (0..n) |i| warnf(host, th.stack[base + i].asString().bytes(), i + 1 < n);
     return 0;

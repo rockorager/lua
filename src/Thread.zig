@@ -20,10 +20,11 @@ const capi = @import("capi/capi.zig");
 
 const Error = Value.Error;
 
-/// C-API builds keep 16 bytes in front of every thread: the C API's data
-/// for it, then `lua_getextraspace`'s `LUA_EXTRASPACE`
-/// (docs/slop/c-api.md). Other builds keep none.
-pub const prefix_len: usize = if (lua_options.c_api) 16 else 0;
+/// C-API builds keep 24 bytes in front of every thread: its C hook
+/// (`lua_sethook`'s function), the C API's data for it, then
+/// `lua_getextraspace`'s `LUA_EXTRASPACE` (docs/slop/c-api.md). Other
+/// builds keep none.
+pub const prefix_len: usize = if (lua_options.c_api) 24 else 0;
 const Upval = Proto.Upval;
 
 header: gc.Header,
@@ -241,6 +242,7 @@ fn baseFrame() Frame {
 /// `lua_newthread` does.
 pub fn inheritHook(th: *Thread, from: *const Thread) void {
     th.hook = from.hook;
+    if (prefix_len != 0) capi.inheritHook(th, from);
     th.hookmask = from.hookmask;
     th.basehookcount = from.basehookcount;
     th.hookcount = from.basehookcount;

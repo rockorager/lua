@@ -232,7 +232,7 @@ fn currentLine(t: *Thread, i: usize) i64 {
 /// The name and stack slot of local `n` of the frame at `i`, as
 /// `luaG_findlocal` finds them: a named local, a vararg (negative `n`),
 /// or a temporary.
-fn findLocal(t: *Thread, i: usize, n: i64) ?struct { []const u8, u32 } {
+pub fn findLocal(t: *Thread, i: usize, n: i64) ?struct { []const u8, u32 } {
     const f = &t.frames.items[i];
     const base = f.func + 1;
     var name: ?[]const u8 = null;
@@ -347,7 +347,7 @@ fn setupvalue(th: *Thread, base: u32) Error!u32 {
 }
 
 /// The identity of upvalue `n` of closure `f`, or null (`lua_upvalueid`).
-fn upvalueId(f: Value, n: i64) ?*anyopaque {
+pub fn upvalueId(f: Value, n: i64) ?*anyopaque {
     switch (f.tag) {
         .lua_closure => {
             const c = f.asLuaClosure();
@@ -471,7 +471,7 @@ fn hookTable(state: *State) Error!?*Table {
 
 /// The hook `sethook` installs: calls the thread's function in the hook
 /// table with the event's name and, for a line event, the line (`hookf`).
-fn hookf(th: *Thread, event: Thread.HookEvent, line: i32, frame: usize) Error!void {
+pub fn hookf(th: *Thread, event: Thread.HookEvent, line: i32, frame: usize) Error!void {
     _ = frame;
     const hooks = try hookTable(th.state) orelse return;
     const f = hooks.get(.thread(th));
@@ -523,12 +523,17 @@ fn sethook(th: *Thread, base: u32) Error!u32 {
 fn gethook(th: *Thread, base: u32) Error!u32 {
     const t1, _ = getThread(th, base);
     try th.ensureStack(3);
-    if (t1.hook == null) {
+    const h = t1.hook orelse {
         th.push(.nil);
         return 1;
+    };
+    if (Thread.prefix_len != 0 and h != &hookf) {
+        // Set by the C API's `lua_sethook`.
+        try pushString(th, "external hook");
+    } else {
+        const hooks = try hookTable(th.state);
+        th.push(if (hooks) |t| t.get(.thread(t1)) else .nil);
     }
-    const hooks = try hookTable(th.state);
-    th.push(if (hooks) |t| t.get(.thread(t1)) else .nil);
     var buf: [3]u8 = undefined;
     var n: usize = 0;
     if (t1.hookmask & Thread.HookMask.call != 0) {

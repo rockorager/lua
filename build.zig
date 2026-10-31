@@ -68,6 +68,44 @@ pub fn build(b: *std.Build) void {
         // (docs/slop/results/c-api-20261031.md).
         exe.rdynamic = true;
         b.installDirectory(.{ .source_dir = b.path("include"), .install_dir = .header, .install_subdir = "" });
+        // liblua for C hosts, as the reference's: `liblua.a`, `liblua.so`,
+        // and a pkg-config file, exporting lua.h's, lauxlib.h's, and
+        // lualib.h's functions (docs/slop/c-api.md).
+        for ([_]std.builtin.LinkMode{ .static, .dynamic }) |linkage| {
+            const lib_mod = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .omit_frame_pointer = omit_fp,
+                .link_libc = true,
+                .pic = true,
+            });
+            lib_mod.addOptions("lua_options", lua_options);
+            const liblua = b.addLibrary(.{
+                .name = "lua",
+                .linkage = linkage,
+                .root_module = lib_mod,
+                .version = if (linkage == .dynamic) .{ .major = 5, .minor = 5, .patch = 1 } else null,
+            });
+            // A C host's linker has no Zig runtime to resolve against.
+            liblua.bundle_compiler_rt = true;
+            liblua.bundle_ubsan_rt = false;
+            if (linkage == .dynamic) liblua.setVersionScript(b.path("src/capi/liblua.map"));
+            b.installArtifact(liblua);
+        }
+        const pc = b.addWriteFiles().add("lua5.5.pc", b.fmt(
+            \\prefix={s}
+            \\libdir=${{prefix}}/lib
+            \\includedir=${{prefix}}/include
+            \\
+            \\Name: Lua
+            \\Description: Lua 5.5.1 in Zig, with the C API
+            \\Version: 5.5.1
+            \\Libs: -L${{libdir}} -llua
+            \\Cflags: -I${{includedir}}
+            \\
+        , .{b.install_prefix}));
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(pc, .lib, "pkgconfig/lua5.5.pc").step);
     }
     // Optimized builds put the functions a short run calls first ahead of
     // the rest (src/order.ld, from `just order`): the kernel maps code

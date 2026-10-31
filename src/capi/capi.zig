@@ -28,13 +28,17 @@ const number = @import("../number.zig");
 const debuginfo = @import("../debuginfo.zig");
 const aux = @import("../lib/auxlib.zig");
 const base = @import("../lib/base.zig");
+const debug = @import("../lib/debug.zig");
+const dump = @import("../dump.zig");
 const jmp = @import("jmp.zig");
 const va = @import("va.zig");
 
 const lauxlib = @import("lauxlib.zig");
+const state_mod = @import("state.zig");
 
 comptime {
     _ = lauxlib;
+    _ = state_mod;
 }
 
 const Error = Value.Error;
@@ -46,6 +50,9 @@ pub const lua_KFunction = *const fn (*lua_State, c_int, lua_KContext) callconv(.
 pub const lua_KContext = isize;
 pub const lua_Reader = *const fn (*lua_State, ?*anyopaque, *usize) callconv(.c) ?[*]const u8;
 pub const lua_Alloc = *const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque;
+pub const lua_Writer = *const fn (*lua_State, ?*const anyopaque, usize, ?*anyopaque) callconv(.c) c_int;
+pub const lua_WarnFunction = *const fn (?*anyopaque, [*:0]const u8, c_int) callconv(.c) void;
+pub const lua_Hook = *const fn (*lua_State, *lua_Debug) callconv(.c) void;
 pub const lua_Number = f64;
 pub const lua_Integer = i64;
 pub const lua_Unsigned = u64;
@@ -75,20 +82,39 @@ comptime {
 /// index in `Thread.frames`.
 const KRec = struct { k: lua_KFunction, ctx: lua_KContext };
 
-const ThreadData = struct {
+pub const ThreadData = struct {
     /// C continuations by frame index; `cK` reads them.
     ks: std.ArrayList(KRec) = .empty,
-    /// Main thread only: light C functions by address, so pushing one
-    /// twice gives the same function, as in the reference. The registry
-    /// holds the table.
+    /// The rest is the main thread's, for the whole state. Light C
+    /// functions by address, so pushing one twice gives the same
+    /// function, as in the reference. The registry holds the table.
     cfuncs: ?*Table = null,
+    /// `lua_setwarnf`'s function and its data.
+    warnf: ?lua_WarnFunction = null,
+    warn_ud: ?*anyopaque = null,
+    /// `lua_atpanic`'s function.
+    panicf: ?lua_CFunction = null,
+    /// What `lua_setallocf` gave a state the Zig API made, which keeps
+    /// its own allocator (docs/slop/c-api.md).
+    allocf: ?lua_Alloc = null,
+    alloc_ud: ?*anyopaque = null,
 };
 
-inline fn dataSlot(th: *Thread) *?*ThreadData {
+/// The thread's C hook, `lua_sethook`'s function, first in its prefix.
+inline fn hookSlot(th: *const Thread) *?lua_Hook {
     return @ptrFromInt(@intFromPtr(th) - Thread.prefix_len);
 }
 
-fn threadData(th: *Thread) error{OutOfMemory}!*ThreadData {
+inline fn dataSlot(th: *const Thread) *?*ThreadData {
+    return @ptrFromInt(@intFromPtr(th) - Thread.prefix_len + @sizeOf(usize));
+}
+
+/// A new coroutine's C hook, its creator's (`Thread.inheritHook`).
+pub fn inheritHook(th: *Thread, from: *const Thread) void {
+    hookSlot(th).* = hookSlot(from).*;
+}
+
+pub fn threadData(th: *Thread) error{OutOfMemory}!*ThreadData {
     if (dataSlot(th).*) |d| return d;
     const d = try th.heap().allocator().create(ThreadData);
     d.* = .{};
@@ -120,8 +146,6 @@ const Catch = struct {
 /// raises.
 threadlocal var current: ?*Catch = null;
 
-var panic_fn: ?lua_CFunction = null;
-
 /// The native body of every C function.
 fn trampoline(th: *Thread, b: u32) Error!u32 {
     const cl = th.stack[b - 1].asNativeClosure();
@@ -131,7 +155,18 @@ fn trampoline(th: *Thread, b: u32) Error!u32 {
         failure.r = r;
         return failed(th, b);
     }
+    if (th.tbc.items.len != 0) return closeReturn(th, b, @intCast(r));
     return @intCast(r);
+}
+
+/// A C function returned `n` results: closes the to-be-closed slots it
+/// marked with `lua_toclose`, its `__close` calls above the results, as
+/// `luaD_poscall` does for `CIST_TBC`. Yields in those calls are not
+/// supported.
+noinline fn closeReturn(th: *Thread, b: u32, n: u32) Error!u32 {
+    @branchHint(.cold);
+    if (th.tbc.items[th.tbc.items.len - 1] >= b) try vm.closeLevel(th, b, .ktop, false);
+    return n;
 }
 
 /// Calls `f(th, a1, a2)` protected: its `int` result, or `jmp.aborted`
@@ -170,6 +205,7 @@ fn cK(th: *Thread, b: u32, status: Value.KStatus, ctx: u32) Error!u32 {
         failure.r = r;
         return failed(th, b);
     }
+    if (th.tbc.items.len != 0) return closeReturn(th, b, @intCast(r));
     return @intCast(r);
 }
 
@@ -190,6 +226,8 @@ fn setK(th: *Thread, k: lua_KFunction, ctx: lua_KContext) error{OutOfMemory}!u32
 pub fn throw(th: *Thread, e: Error) noreturn {
     @branchHint(.cold);
     const c = current orelse unprotected(th, e);
+    // A protected call into another state's C function cannot catch it.
+    if (c.th.state != th.state) unprotected(th, e);
     if (c.th != th and e == error.LuaError and th.status != .yield) {
         c.th.err = th.err;
         th.err = .nil;
@@ -199,12 +237,17 @@ pub fn throw(th: *Thread, e: Error) noreturn {
 }
 
 /// An error with no protected call to catch it: the panic function, then
-/// abort, as `luaD_throw` does.
+/// abort, as `luaD_throw` does. A state from `lua_newstate` without a
+/// panic function aborts silently, as the reference's does; the others
+/// say why.
 fn unprotected(th: *Thread, e: Error) noreturn {
-    if (panic_fn) |f| {
+    const d = dataSlot(th.state.main).*;
+    if (d) |data| if (data.panicf) |f| {
         if (e == error.LuaError) th.push(th.err) else th.push(.string(th.state.memerr));
         _ = f(th);
-    }
+        std.process.abort();
+    };
+    if (state_mod.of(th.state) != null) std.process.abort();
     const msg = if (e == error.OutOfMemory)
         "not enough memory"
     else if (th.err.isString())
@@ -321,9 +364,9 @@ pub fn luaClosethread(L: *lua_State, from: ?*lua_State) callconv(.c) c_int {
 }
 
 pub fn luaAtpanic(L: *lua_State, f: ?lua_CFunction) callconv(.c) ?lua_CFunction {
-    _ = L;
-    const old = panic_fn;
-    panic_fn = f;
+    const d = check(L, threadData(L.state.main));
+    const old = d.panicf;
+    d.panicf = f;
     return old;
 }
 
@@ -346,13 +389,30 @@ pub fn luaGettop(L: *lua_State) callconv(.c) c_int {
 }
 
 pub fn luaSettop(L: *lua_State, idx: c_int) callconv(.c) void {
-    if (idx >= 0) {
-        const new = funcSlot(L) + 1 + @as(u32, @intCast(idx));
-        while (L.top < new) push(L, .nil);
-        L.top = new;
-    } else {
-        L.top -= @intCast(-idx - 1);
+    const new = if (idx >= 0) funcSlot(L) + 1 + @as(u32, @intCast(idx)) else L.top - @as(u32, @intCast(-idx - 1));
+    while (L.top < new) push(L, .nil);
+    // Popping a slot `lua_toclose` marked closes it first.
+    if (L.tbc.items.len != 0 and L.tbc.items[L.tbc.items.len - 1] >= new) check(L, vm.closeLevel(L, new, .ktop, false));
+    L.top = new;
+}
+
+pub fn luaToclose(L: *lua_State, idx: c_int) callconv(.c) void {
+    const level = slotOf(L, idx);
+    const v = L.stack[level];
+    // False and nil need no closing (`luaF_newtbcupval`).
+    if (v.isFalsy()) return;
+    if (L.state.tmOf(v, .close) == null) {
+        const i = L.frames.items.len - 1;
+        const name = if (debug.findLocal(L, i, level - funcSlot(L))) |loc| loc[0] else "?";
+        throw(L, L.runError("variable '{s}' got a non-closable value", .{name}));
     }
+    check(L, L.tbc.append(L.heap().allocator(), level));
+}
+
+pub fn luaCloseslot(L: *lua_State, idx: c_int) callconv(.c) void {
+    const level = slotOf(L, idx);
+    check(L, vm.closeLevel(L, level, .ktop, false));
+    L.stack[level] = .nil;
 }
 
 pub fn luaPushvalue(L: *lua_State, idx: c_int) callconv(.c) void {
@@ -905,6 +965,35 @@ pub const Box = struct {
     }
 };
 
+/// What `readShim` passes to and from a `lua_Reader`.
+const ReadCall = struct { reader: lua_Reader, data: ?*anyopaque, size: usize = 0, p: ?[*]const u8 = null };
+
+/// A reader's three arguments, and its pointer result, through a
+/// protected call, which returns an `int`.
+fn readShim(L: *lua_State, rc: *ReadCall) callconv(.c) c_int {
+    rc.p = rc.reader(L, rc.data, &rc.size);
+    return 0;
+}
+
+/// The status of a load that failed with `e`, with its error object
+/// pushed at `slot`.
+fn loadFailure(L: *lua_State, slot: u32, e: Error, syntax: bool) c_int {
+    L.top = slot;
+    switch (e) {
+        error.OutOfMemory => {
+            push(L, .string(L.state.memerr));
+            return lua_errmem;
+        },
+        error.LuaError => {
+            push(L, L.err);
+            L.err = .nil;
+            return if (syntax) lua_errsyntax else if (L.errerr) lua_errerr else lua_errrun;
+        },
+    }
+}
+
+/// Never raises: like `luaD_protectedparser`, a failure, the reader's
+/// own errors included, is the result.
 pub fn luaLoad(
     L: *lua_State,
     reader: lua_Reader,
@@ -912,40 +1001,106 @@ pub fn luaLoad(
     chunkname: ?[*:0]const u8,
     mode: ?[*:0]const u8,
 ) callconv(.c) c_int {
-    // The chunk accumulates in a box on the stack: the reader is C code
-    // and may raise, which must leak nothing.
-    check(L, L.ensureStack(1));
+    // The chunk accumulates in a box on the stack, which the collector
+    // frees whatever happens.
     const slot = L.top;
+    L.ensureStack(1) catch |e| return loadFailure(L, slot, e, false);
     push(L, .nil);
-    var buf: []u8 = check(L, Box.grow(L, slot, "", 256));
+    var buf: []u8 = Box.grow(L, slot, "", 256) catch |e| return loadFailure(L, slot, e, false);
     var n: usize = 0;
+    var rc: ReadCall = .{ .reader = reader, .data = data };
     while (true) {
-        var size: usize = 0;
-        const p = reader(L, data, &size) orelse break;
-        if (size == 0) break;
-        if (n + size + 1 > buf.len) buf = check(L, Box.grow(L, slot, buf[0..n], @max(buf.len * 2, n + size + 1)));
-        @memcpy(buf[n..][0..size], p[0..size]);
-        n += size;
+        if (protect(L, &readShim, @intFromPtr(&rc), 0) == jmp.aborted) return loadFailure(L, slot, failure.err, false);
+        const p = rc.p orelse break;
+        if (rc.size == 0) break;
+        if (n + rc.size + 1 > buf.len)
+            buf = Box.grow(L, slot, buf[0..n], @max(buf.len * 2, n + rc.size + 1)) catch |e|
+                return loadFailure(L, slot, e, false);
+        @memcpy(buf[n..][0..rc.size], p[0..rc.size]);
+        n += rc.size;
     }
     buf[n] = 0;
     const name = if (chunkname) |c| span(c) else "?";
-    const f = base.loadChunk(L, buf[0..n :0], name, if (mode) |m| span(m) else "bt") catch |e| {
-        L.top = slot;
-        return switch (e) {
-            error.OutOfMemory => {
-                push(L, .string(L.state.memerr));
-                return lua_errmem;
-            },
-            error.LuaError => {
-                push(L, L.err);
-                L.err = .nil;
-                return lua_errsyntax;
-            },
-        };
-    };
+    const f = base.loadChunk(L, buf[0..n :0], name, if (mode) |m| span(m) else "bt") catch |e|
+        return loadFailure(L, slot, e, true);
     L.top = slot;
     push(L, f);
     return lua_ok;
+}
+
+/// `lua_dump`'s output: a writer whose drain hands what it has to the
+/// `lua_Writer`, protected, so a writer that raises abandons only this
+/// function's frame and `dump.zig`'s, which hold nothing then.
+const DumpSink = struct {
+    w: std.Io.Writer,
+    th: *Thread,
+    f: lua_Writer,
+    ud: ?*anyopaque,
+    /// The writer's last result; writing stops at the first nonzero one.
+    status: c_int = 0,
+    aborted: bool = false,
+    /// What `writeShim` passes on.
+    p: ?[*]const u8 = null,
+    n: usize = 0,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const d: *DumpSink = @fieldParentPtr("w", w);
+        try d.send(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |s| {
+            try d.send(s);
+            n += s.len;
+        }
+        for (0..splat) |_| {
+            try d.send(data[data.len - 1]);
+            n += data[data.len - 1].len;
+        }
+        return n;
+    }
+
+    /// Calls the writer with `bytes`, or with NULL and 0 for null, the
+    /// end of the dump.
+    fn send(d: *DumpSink, bytes: ?[]const u8) std.Io.Writer.Error!void {
+        if (bytes) |b| if (b.len == 0) return;
+        d.p = if (bytes) |b| b.ptr else null;
+        d.n = if (bytes) |b| b.len else 0;
+        const r = protect(d.th, &writeShim, @intFromPtr(d), 0);
+        if (r == jmp.aborted) {
+            d.aborted = true;
+            return error.WriteFailed;
+        }
+        d.status = @bitCast(@as(u32, @truncate(r)));
+        if (d.status != 0) return error.WriteFailed;
+    }
+
+    /// The writer's four arguments, from the three a protected call
+    /// passes.
+    fn writeShim(L: *lua_State, ctx: *DumpSink) callconv(.c) c_int {
+        return ctx.f(L, ctx.p, ctx.n, ctx.ud);
+    }
+};
+
+pub fn luaDump(L: *lua_State, writer: lua_Writer, data: ?*anyopaque, strip: c_int) callconv(.c) c_int {
+    const proto = top(L, 1).asLuaClosure().proto;
+    var buf: [512]u8 = undefined;
+    var sink: DumpSink = .{
+        .w = .{ .vtable = &.{ .drain = DumpSink.drain }, .buffer = &buf },
+        .th = L,
+        .f = writer,
+        .ud = data,
+    };
+    const r = dump.dump(L.heap().allocator(), &sink.w, proto, strip != 0);
+    if (sink.aborted) throw(L, failure.err);
+    if (r) |_| {
+        // A writer that fails or raises leaves its status or the error
+        // in `sink`, read below and returned.
+        if (sink.w.flush()) |_| sink.send(null) catch |e| switch (e) {
+            error.WriteFailed => {},
+        } else |_| {}
+        if (sink.aborted) throw(L, failure.err);
+    } else |e| if (e == error.OutOfMemory) throw(L, error.OutOfMemory);
+    return sink.status;
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1108,9 @@ pub fn luaLoad(
 // ---------------------------------------------------------------------------
 
 pub fn luaYieldk(L: *lua_State, nresults: c_int, ctx: lua_KContext, k: ?lua_KFunction) callconv(.c) c_int {
+    // Hooks run inside the frame they report on and cannot yield here
+    // (docs/slop/c-api.md).
+    if (L.frame().flags.hooked) throw(L, L.runError("attempt to yield across a C-call boundary", .{}));
     const n: u32 = @intCast(nresults);
     const e = if (k) |kf| vm.yieldk(L, n, check(L, setK(L, kf, ctx)), &cK) else vm.yieldk(L, n, 0, null);
     throw(L, e);
@@ -988,36 +1146,81 @@ pub fn luaWarning(L: *lua_State, msg: [*:0]const u8, tocont: c_int) callconv(.c)
     if (L.state.warnf) |f| f(L.state, span(msg), tocont != 0);
 }
 
+pub fn luaSetwarnf(L: *lua_State, f: ?lua_WarnFunction, ud: ?*anyopaque) callconv(.c) void {
+    const d = check(L, threadData(L.state.main));
+    d.warnf = f;
+    d.warn_ud = ud;
+    L.state.warnf = if (f != null) &cWarn else null;
+}
+
+/// The state's warning function while `lua_setwarnf` gave it a C one.
+fn cWarn(state: *State, msg: []const u8, tocont: bool) void {
+    const d = dataSlot(state.main).*.?;
+    const f = d.warnf orelse return;
+    // Every message comes from a Lua string or a literal, both of which
+    // end in a zero; copy the short ones anyway, as cheap insurance.
+    var buf: [256]u8 = undefined;
+    const z: [*:0]const u8 = if (msg.len < buf.len) blk: {
+        @memcpy(buf[0..msg.len], msg);
+        buf[msg.len] = 0;
+        break :blk buf[0..msg.len :0].ptr;
+    } else @ptrCast(msg.ptr);
+    f(d.warn_ud, z, @intFromBool(tocont));
+}
+
+/// `lua_gc`'s options, lua.h's `LUA_GC*`.
+const GcOption = enum(c_int) { stop, restart, collect, count, countb, step, isrunning, gen, inc, param, _ };
+
 pub fn luaGc(L: *lua_State, what: c_int, ...) callconv(.c) c_int {
+    var ap = @cVaStart();
+    const r = luaGcv(L, what, &ap);
+    @cVaEnd(&ap);
+    return r;
+}
+
+/// `lua_gc` with its arguments as a list, which aarch64 Linux's entry
+/// builds (`va.zig`).
+fn luaGcv(L: *lua_State, what: c_int, ap: *va.List) callconv(.c) c_int {
     const heap = L.heap();
     if (heap.stopped & (gc.stop.internal | gc.stop.closing) != 0) return -1;
-    return switch (what) {
-        0 => blk: {
-            heap.stopped = gc.stop.user;
-            break :blk 0;
-        },
-        1 => blk: {
+    switch (@as(GcOption, @enumFromInt(what))) {
+        .stop => heap.stopped = gc.stop.user,
+        .restart => {
             heap.setDebt(0);
             heap.stopped = 0;
-            break :blk 0;
         },
-        2 => blk: {
-            gc.fullGc(L, false);
-            break :blk 0;
-        },
-        3 => @intCast(heap.bytes >> 10),
-        4 => @intCast(heap.bytes & 0x3ff),
-        5 => blk: {
+        .collect => gc.fullGc(L, false),
+        .count => return @intCast(heap.bytes >> 10),
+        .countb => return @intCast(heap.bytes & 0x3ff),
+        .step => {
+            // A step of `n` bytes' worth, or one basic step for n <= 0,
+            // as `collectgarbage("step")` takes it.
+            const n: isize = @bitCast(va.arg(ap, usize));
             const old = heap.stopped;
             heap.stopped = 0;
-            heap.setDebt(0);
-            gc.basicStep(L);
+            const max = std.math.maxInt(isize);
+            heap.setDebt(if (n <= 0) 0 else if (heap.debt() >= n - max) heap.debt() - n else -max);
+            const worked = L.state.gcDue();
+            if (worked) gc.basicStep(L);
             heap.stopped = old;
-            break :blk @intFromBool(heap.phase == .pause);
+            return @intFromBool(worked and heap.phase == .pause);
         },
-        6 => @intFromBool(heap.running()),
-        else => -1,
-    };
+        .isrunning => return @intFromBool(heap.running()),
+        .gen, .inc => {
+            const old = @intFromEnum(if (heap.kind == .incremental) GcOption.inc else GcOption.gen);
+            gc.changeMode(L, if (what == @intFromEnum(GcOption.gen)) .gen_minor else .incremental);
+            return old;
+        },
+        .param => {
+            const p: usize = @intCast(va.arg(ap, c_int));
+            const value = va.arg(ap, c_int);
+            const old = gc.applyParam(heap.params[p], 100);
+            if (value >= 0) heap.params[p] = gc.codeParam(@intCast(value));
+            return @intCast(old);
+        },
+        _ => return -1,
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,8 +1291,31 @@ fn cAlloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callcon
 }
 
 pub fn luaGetallocf(L: *lua_State, ud: ?*?*anyopaque) callconv(.c) lua_Alloc {
+    if (state_mod.of(L.state)) |cs| {
+        if (ud) |p| p.* = cs.ud;
+        return cs.f;
+    }
+    if (dataSlot(L.state.main).*) |d| if (d.allocf) |f| {
+        if (ud) |p| p.* = d.alloc_ud;
+        return f;
+    };
     if (ud) |p| p.* = L.state;
     return &cAlloc;
+}
+
+/// A state from `lua_newstate` allocates through the new function from
+/// now on. One the Zig API made keeps its allocator: blocks it allocated
+/// carry alignments a `lua_Alloc` cannot be told, so only `lua_getallocf`
+/// sees the change (docs/slop/c-api.md).
+pub fn luaSetallocf(L: *lua_State, f: lua_Alloc, ud: ?*anyopaque) callconv(.c) void {
+    if (state_mod.of(L.state)) |cs| {
+        cs.f = f;
+        cs.ud = ud;
+        return;
+    }
+    const d = check(L, threadData(L.state.main));
+    d.allocf = f;
+    d.alloc_ud = ud;
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,13 +1414,40 @@ pub fn luaGetinfo(L: *lua_State, what_in: [*:0]const u8, ar: *lua_Debug) callcon
             ar.extraargs = if (f) |x| x.flags.ncallmt else 0;
         },
         'r' => {
-            ar.ftransfer = 0;
-            ar.ntransfer = 0;
+            // Only a frame running a hook has transfer information.
+            const hooked = if (frame) |i| L.frames.items[i].flags.hooked else false;
+            ar.ftransfer = if (hooked) L.ftransfer else 0;
+            ar.ntransfer = if (hooked) L.ntransfer else 0;
         },
-        'f' => push(L, func),
+        'f', 'L' => {},
         else => ok = 0,
     };
+    // 'f' then 'L', wherever they are in `what`, as `lua_getinfo` pushes.
+    if (std.mem.findScalar(u8, what, 'f') != null) push(L, func);
+    if (std.mem.findScalar(u8, what, 'L') != null) push(L, if (lua) |p| .table(check(L, activeLines(L, p))) else .nil);
     return ok;
+}
+
+/// The lines of `p` that have code, as a table of `true`s
+/// (`collectvalidlines`). A vararg function's first instruction,
+/// `VARARGPREP`, has no line of its own.
+fn activeLines(th: *Thread, p: *Proto) Error!*Table {
+    const t = try th.state.newTable(0, 0);
+    // Rooted on the stack while it fills.
+    push(th, .table(t));
+    defer th.top -= 1;
+    if (p.lineinfo.len == 0) return t;
+    var line: i32 = @bitCast(p.linedefined);
+    var first: usize = 0;
+    if (p.flags.vararg or p.flags.vararg_table) {
+        line = p.nextLine(line, 0);
+        first = 1;
+    }
+    for (first..p.lineinfo.len) |pc| {
+        line = p.nextLine(line, pc);
+        try t.setInt(th.heap(), line, .true);
+    }
+    return t;
 }
 
 pub fn luaGetupvalue(L: *lua_State, funcindex: c_int, n: c_int) callconv(.c) ?[*:0]const u8 {
@@ -1242,6 +1495,82 @@ pub fn luaSetupvalue(L: *lua_State, funcindex: c_int, n: c_int) callconv(.c) ?[*
         },
         else => return null,
     }
+}
+
+pub fn luaUpvalueid(L: *lua_State, fidx: c_int, n: c_int) callconv(.c) ?*anyopaque {
+    return debug.upvalueId(get(L, fidx), n);
+}
+
+pub fn luaUpvaluejoin(L: *lua_State, f1: c_int, n1: c_int, f2: c_int, n2: c_int) callconv(.c) void {
+    const c1 = get(L, f1).asLuaClosure();
+    const c2 = get(L, f2).asLuaClosure();
+    c1.setUpval(L.heap(), @intCast(n1 - 1), c2.upvals()[@intCast(n2 - 1)]);
+}
+
+pub fn luaGetlocal(L: *lua_State, ar: ?*const lua_Debug, n: c_int) callconv(.c) ?[*:0]const u8 {
+    const a = ar orelse {
+        // Parameters of the Lua function on top, which stays.
+        const f = top(L, 1);
+        if (f.tag != .lua_closure or n <= 0) return null;
+        const name = debuginfo.localName(f.asLuaClosure().proto, @intCast(n), 0) orelse return null;
+        return @ptrCast(name.ptr);
+    };
+    const loc = debug.findLocal(L, a.i_ci - 1, n) orelse return null;
+    push(L, L.stack[loc[1]]);
+    return @ptrCast(loc[0].ptr);
+}
+
+pub fn luaSetlocal(L: *lua_State, ar: *const lua_Debug, n: c_int) callconv(.c) ?[*:0]const u8 {
+    const loc = debug.findLocal(L, ar.i_ci - 1, n) orelse return null;
+    L.top -= 1;
+    L.stack[loc[1]] = L.stack[L.top];
+    return @ptrCast(loc[0].ptr);
+}
+
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+/// The hook the interpreter calls while a thread has a C hook: calls it
+/// protected, with `event`, `currentline`, and the frame filled in, as
+/// `luaD_hook` does. An error it raises unwinds from here.
+fn cHook(th: *Thread, event: Thread.HookEvent, line: i32, frame: usize) Error!void {
+    const h = hookSlot(th).* orelse return;
+    var ar: lua_Debug = undefined;
+    ar.event = @intFromEnum(event);
+    ar.currentline = line;
+    ar.i_ci = frame + 1;
+    if (protect(th, h, @intFromPtr(&ar), 0) == jmp.aborted) return failure.err;
+}
+
+/// What `lua_gethook` returns while the debug library's hook is set: a C
+/// function that runs it, which `lua_sethook` turns back into it.
+fn luaHook(L: *lua_State, ar: *lua_Debug) callconv(.c) void {
+    check(L, debug.hookf(L, @enumFromInt(ar.event), ar.currentline, ar.i_ci - 1));
+}
+
+pub fn luaSethook(L: *lua_State, func: ?lua_Hook, mask: c_int, count: c_int) callconv(.c) void {
+    const m: u8 = @truncate(@as(c_uint, @bitCast(mask)));
+    const f = func orelse return vm.setHook(L, null, 0, count);
+    if (f == &luaHook) return vm.setHook(L, &debug.hookf, m, count);
+    hookSlot(L).* = f;
+    vm.setHook(L, &cHook, m, count);
+}
+
+pub fn luaGethook(L: *lua_State) callconv(.c) ?lua_Hook {
+    const h = L.hook orelse return null;
+    if (h == &cHook) return hookSlot(L).*;
+    return &luaHook;
+}
+
+pub fn luaGethookmask(L: *lua_State) callconv(.c) c_int {
+    const th: *Thread = L;
+    return th.hookmask;
+}
+
+pub fn luaGethookcount(L: *lua_State) callconv(.c) c_int {
+    const th: *Thread = L;
+    return th.basehookcount;
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,7 +1725,7 @@ comptime {
     @export(&luaStatus, .{ .name = "lua_status" });
     @export(&luaIsyieldable, .{ .name = "lua_isyieldable" });
     @export(&luaWarning, .{ .name = "lua_warning" });
-    @export(&luaGc, .{ .name = "lua_gc" });
+    @export(if (va.native) &luaGc else &va.Entry(&luaGcv).entry, .{ .name = "lua_gc" });
     @export(&luaError, .{ .name = "lua_error" });
     @export(&luaNext, .{ .name = "lua_next" });
     @export(&luaConcat, .{ .name = "lua_concat" });
@@ -1408,4 +1737,17 @@ comptime {
     @export(&luaGetinfo, .{ .name = "lua_getinfo" });
     @export(&luaGetupvalue, .{ .name = "lua_getupvalue" });
     @export(&luaSetupvalue, .{ .name = "lua_setupvalue" });
+    @export(&luaUpvalueid, .{ .name = "lua_upvalueid" });
+    @export(&luaUpvaluejoin, .{ .name = "lua_upvaluejoin" });
+    @export(&luaGetlocal, .{ .name = "lua_getlocal" });
+    @export(&luaSetlocal, .{ .name = "lua_setlocal" });
+    @export(&luaSethook, .{ .name = "lua_sethook" });
+    @export(&luaGethook, .{ .name = "lua_gethook" });
+    @export(&luaGethookmask, .{ .name = "lua_gethookmask" });
+    @export(&luaGethookcount, .{ .name = "lua_gethookcount" });
+    @export(&luaToclose, .{ .name = "lua_toclose" });
+    @export(&luaCloseslot, .{ .name = "lua_closeslot" });
+    @export(&luaDump, .{ .name = "lua_dump" });
+    @export(&luaSetwarnf, .{ .name = "lua_setwarnf" });
+    @export(&luaSetallocf, .{ .name = "lua_setallocf" });
 }

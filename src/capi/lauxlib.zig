@@ -244,7 +244,7 @@ fn lauxFileresult(L: *lua_State, stat: c_int, fname: ?[*:0]const u8) callconv(.c
         return 1;
     }
     capi.luaPushnil(L);
-    const msg = span(strerror(en));
+    const msg = if (en != 0) span(strerror(en)) else "(no extra info)";
     if (fname) |f| {
         var buf: [512]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{s}: {s}", .{ span(f), msg }) catch buf[0..];
@@ -253,6 +253,27 @@ fn lauxFileresult(L: *lua_State, stat: c_int, fname: ?[*:0]const u8) callconv(.c
         _ = capi.luaPushlstring(L, msg.ptr, msg.len);
     }
     capi.luaPushinteger(L, en);
+    return 3;
+}
+
+/// `luaL_execresult` for the status of `system` or `pclose`: true or
+/// fail, "exit" or "signal", and the code, as `l_inspectstat` reads it
+/// on POSIX.
+fn lauxExecresult(L: *lua_State, stat_in: c_int) callconv(.c) c_int {
+    if (stat_in != 0 and std.c._errno().* != 0) return lauxFileresult(L, 0, null);
+    var stat = stat_in;
+    var what: [*:0]const u8 = "exit";
+    // glibc's WIFEXITED, WEXITSTATUS, WIFSIGNALED, and WTERMSIG.
+    const sig = stat & 0x7f;
+    if (sig == 0) {
+        stat = (stat >> 8) & 0xff;
+    } else if (sig != 0x7f) {
+        stat = sig;
+        what = "signal";
+    }
+    if (what[0] == 'e' and stat == 0) capi.luaPushboolean(L, 1) else capi.luaPushnil(L);
+    _ = capi.luaPushstring(L, what);
+    capi.luaPushinteger(L, stat);
     return 3;
 }
 
@@ -315,7 +336,7 @@ fn lauxLoadfilex(L: *lua_State, filename: ?[*:0]const u8, mode: ?[*:0]const u8) 
             return capi.lua_errerr + 1;
         return st;
     };
-    capi.check(L, L.ensureStack(1));
+    L.ensureStack(1) catch |e| return loadFailed(L, e);
     L.stack[L.top] = f;
     L.top += 1;
     return capi.lua_ok;
@@ -330,11 +351,15 @@ fn lauxLoadbufferx(
 ) callconv(.c) c_int {
     // The loader wants a terminating zero; the copy lives in a box on the
     // stack, which the collector frees.
-    capi.check(L, L.ensureStack(2));
+    // Never raises, as `lua_load`.
+    L.ensureStack(2) catch |e| return loadFailed(L, e);
     const slot = L.top;
     L.stack[slot] = .nil;
     L.top += 1;
-    const b = capi.check(L, capi.Box.grow(L, slot, buff[0..sz], sz + 1));
+    const b = capi.Box.grow(L, slot, buff[0..sz], sz + 1) catch |e| {
+        L.top = slot;
+        return loadFailed(L, e);
+    };
     b[sz] = 0;
     const f = base.loadChunk(L, b[0..sz :0], span(name), if (mode) |m| span(m) else "bt") catch |e| {
         L.top = slot;
@@ -394,7 +419,7 @@ fn lauxSetfuncs(L: *lua_State, l: [*]const Reg, nup: c_int) callconv(.c) void {
     capi.luaSettop(L, -nup - 1);
 }
 
-fn lauxGetsubtable(L: *lua_State, idx_in: c_int, fname: [*:0]const u8) callconv(.c) c_int {
+pub fn lauxGetsubtable(L: *lua_State, idx_in: c_int, fname: [*:0]const u8) callconv(.c) c_int {
     if (capi.luaGetfield(L, idx_in, fname) == lua_ttable) return 1;
     L.top -= 1;
     const idx = capi.luaAbsindex(L, idx_in);
@@ -418,7 +443,7 @@ fn traceback(L: *lua_State, L1: *lua_State, aw: *std.Io.Writer.Allocating, msg: 
     L.top += 1;
 }
 
-fn lauxRequiref(L: *lua_State, modname: [*:0]const u8, openf: lua_CFunction, glb: c_int) callconv(.c) void {
+pub fn lauxRequiref(L: *lua_State, modname: [*:0]const u8, openf: lua_CFunction, glb: c_int) callconv(.c) void {
     _ = lauxGetsubtable(L, registry_index, "_LOADED");
     _ = capi.luaGetfield(L, -1, modname);
     if (capi.luaToboolean(L, -1) == 0) {
@@ -437,14 +462,14 @@ fn lauxRequiref(L: *lua_State, modname: [*:0]const u8, openf: lua_CFunction, glb
     }
 }
 
-fn lauxMakeseed(L: ?*lua_State) callconv(.c) c_uint {
+pub fn lauxMakeseed(L: ?*lua_State) callconv(.c) c_uint {
     _ = L;
     var local: u8 = 0;
     const bits = [_]usize{ @intFromPtr(&local), @intFromPtr(&lauxMakeseed) };
     return @truncate(std.hash.Wyhash.hash(0, std.mem.asBytes(&bits)));
 }
 
-fn lauxAlloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv(.c) ?*anyopaque {
+pub fn lauxAlloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv(.c) ?*anyopaque {
     _ = ud;
     _ = osize;
     if (nsize == 0) {
@@ -570,6 +595,7 @@ comptime {
     @export(if (va.native) &lauxError else &va.Entry(&lauxErrorv).entry, .{ .name = "luaL_error" });
     @export(&lauxCheckoption, .{ .name = "luaL_checkoption" });
     @export(&lauxFileresult, .{ .name = "luaL_fileresult" });
+    @export(&lauxExecresult, .{ .name = "luaL_execresult" });
     @export(&lauxRef, .{ .name = "luaL_ref" });
     @export(&lauxUnref, .{ .name = "luaL_unref" });
     @export(&lauxLoadfilex, .{ .name = "luaL_loadfilex" });

@@ -723,7 +723,7 @@ noinline fn newTbc(th: *Thread, level: u32) Error!void {
     try th.tbc.append(th.heap().allocator(), level);
 }
 
-const CloseMode = union(enum) {
+pub const CloseMode = union(enum) {
     /// `CLOSE`: each `__close` call goes right above its variable.
     normal,
     /// `RETURN`: the calls go on top, above the results.
@@ -735,7 +735,7 @@ const CloseMode = union(enum) {
 /// Closes the upvalues and to-be-closed variables at stack slot `level`
 /// and above, innermost first (`luaF_close`). Each `__close` handler gets
 /// the variable's value and, with `.err`, the error object.
-noinline fn closeLevel(th: *Thread, level: u32, mode: CloseMode, comptime yieldable: bool) Error!void {
+pub noinline fn closeLevel(th: *Thread, level: u32, mode: CloseMode, comptime yieldable: bool) Error!void {
     @branchHint(.cold);
     th.closeUpvals(level);
     while (th.tbc.items.len > 0) {
