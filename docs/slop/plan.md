@@ -158,7 +158,10 @@ reference.
     path.
 16. **Embedding API.** A Zig API, not the C API, designed once the standard
     library has exercised the internal one. Nothing outside `src/` depends on
-    internals until then.
+    internals until then. Settled: no C API and no loading of C modules
+    (`.so`). Hosts extend Lua with Zig functions, so `package.loadlib` and
+    the C searchers keep the reference's "dynamic libraries not enabled"
+    answer.
 
 ## Hot-path rules
 
