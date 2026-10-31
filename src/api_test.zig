@@ -160,6 +160,21 @@ test "globals and fields, with metamethods" {
     try testing.expect(std.mem.find(u8, state.errorTraceback().?, "m:2: in function <m:2>") != null);
     try expectRuntime(state, "table index is nil", state.setField(try state.newTable(), null, 1));
     try testing.expectEqual(42, try state.getField(i64, proxy, "y"));
+
+    // The length runs __len, and must be an integer; Table.len is raw.
+    const sized = try state.doString(lua.Table,
+        \\local n = 7
+        \\return setmetatable({1, 2}, {__len = function()
+        \\  n = n + 0.5 if n > 8 then error("too long", 0) end return n
+        \\end})
+    , .{});
+    try testing.expectEqual(2, sized.len());
+    try testing.expectEqual(3, try state.len(try state.getGlobal(lua.Value, "list")));
+    try testing.expectEqual(3, try state.len("abc"));
+    try expectRuntime(state, "object length is not an integer", state.len(sized));
+    try testing.expectEqual(8, try state.len(sized));
+    try expectRuntime(state, "too long", state.len(sized));
+    try expectRuntime(state, "attempt to get length of a number value", state.len(1));
 }
 
 test "Zig functions check arguments with the reference's messages" {

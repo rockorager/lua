@@ -15,6 +15,10 @@ const build_options = @import("build_options");
 
 const copyright = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio";
 
+/// The most slots a Lua stack holds, the engine's `LUAI_MAXSTACK`: past
+/// it, lua.c's `luaL_checkstack` refuses the script's arguments.
+const max_stack = 1_000_000;
+
 const Interp = struct {
     io: std.Io,
     environ: *const std.process.Environ.Map,
@@ -112,8 +116,12 @@ const Interp = struct {
         const argv = try state.getGlobal(lua.Value, "arg");
         if (argv.typeOf() != .table) return state.raise("'arg' is not a table", .{});
         const t = try state.decode(lua.Table, argv, .{});
+        // `#arg` with `__len`, truncated to a C int as lua.c's is; a
+        // negative count passes nothing.
+        const n: i32 = @truncate(try state.len(t));
+        if (n > max_stack - 3) return state.raise("stack overflow (too many arguments to script)", .{});
         const gpa = std.heap.smp_allocator;
-        const vals = gpa.alloc(lua.Value, @intCast(t.len())) catch return error.OutOfMemory;
+        const vals = gpa.alloc(lua.Value, @intCast(@max(n, 0))) catch return error.OutOfMemory;
         defer gpa.free(vals);
         for (vals, 1..) |*v, i| v.* = try t.rawGet(state, lua.Value, i);
         state.pcall(void, chunk, @as(lua.Values, vals)) catch |e| {

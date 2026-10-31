@@ -31,6 +31,7 @@ All notable changes to lua are recorded here. The format follows
 - `lua.DecodeOptions` with `.unknown_keys = .reject`, which fails a decode on a table key the struct has no field for and names its path ("unknown key 'keybinds[2].acton'").
 - `lua.Options.noenv` (as `lua -E`), `gc_mode`, and `gc_stress`, `state.warn`, and `state.loadFile(null, mode)` for standard input.
 - `co.close(state)` and `co.status(state)` on a `lua.Coroutine`, as `coroutine.close` and `coroutine.status`; `close` returns the error a coroutine died with, or a `__close` handler's, as `error.Runtime` (`error.OutOfMemory` for an allocation failure).
+- `state.len(x)`, `#x` with `__len` as `luaL_len` gives it.
 
 ### Changed
 
@@ -44,6 +45,7 @@ All notable changes to lua are recorded here. The format follows
 - A script that raises "not enough memory" itself now returns `error.Runtime`; `error.OutOfMemory` means an allocation failed.
 - `vm.pcall` and `vm.closeThread` return a `vm.Status` instead of a `bool`; test for `.ok`.
 - A function made by `coroutine.wrap` adds the caller's position to an error raised as `error("not enough memory", 0)` inside it, like any other error; only a failed allocation passes through unpositioned.
+- The standalone `lua` passes a script `#arg` arguments counted with `__len`, as the reference's does, instead of the raw length.
 - `state.errorTraceback()` for an error object whose `__tostring` returns a string is that string, as the standalone `lua` prints it.
 - The standalone `lua` is built on the embedding API. An error in `_PROMPT`'s `__tostring` now ends it, a non-string error from `print` in the interactive loop shows as "(null)", and a `__tostring` that returns a non-string gives "(error object is a table value)" and a traceback, as with the reference.
 

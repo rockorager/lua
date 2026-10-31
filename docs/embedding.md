@@ -137,7 +137,7 @@ try state.setField(t, "count", 3);
 const sum = try state.call(i64, try state.getGlobal(lua.Function, "add"), .{ 1, 2 });
 ```
 
-`getField` and `setField` index any value with `__index` and `__newindex`, as Lua code does; a table's `rawGet` and `rawSet` skip them (`try t.rawGet(state, i64, "count")`). A table's `iterator()` visits its keys and values raw, and `len()` is its raw length. `toString` converts any value as `tostring` does, and `state.warn` emits a warning as `warn` does.
+`getField` and `setField` index any value with `__index` and `__newindex`, as Lua code does; a table's `rawGet` and `rawSet` skip them (`try t.rawGet(state, i64, "count")`). A table's `iterator()` visits its keys and values raw, and `len()` is its raw length; `state.len(x)` is `#x` with `__len`, as `luaL_len` gives it, and fails unless the length is an integer. `toString` converts any value as `tostring` does, and `state.warn` emits a warning as `warn` does.
 
 ## Zig functions
 

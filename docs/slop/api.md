@@ -272,8 +272,11 @@ traceback; "error calling 'print' ((null))" for a non-string error object;
 and `pmain` gets `argc` as lua.c's does, so a stack overflow traceback
 counts the same levels ("skipping 999970 levels"). `-l` uses
 `getGlobal`/`setGlobal`, with metamethods, as lua.c's
-`lua_getglobal`/`lua_setglobal` do. The `#arg` count stays raw where
-lua.c's `luaL_len` would call `__len`.
+`lua_getglobal`/`lua_setglobal` do. The `#arg` count goes through
+`State.len` (`luaL_len`, with `__len`), truncated to a C int and refused
+past the stack's limit with lua.c's "stack overflow (too many arguments
+to script)"; a negative count, undefined behavior in lua.c, passes
+nothing.
 
 ## A compiler crash to avoid
 

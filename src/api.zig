@@ -563,6 +563,16 @@ pub const State = opaque {
         return fieldSlow(T, th, k, v);
     }
 
+    /// `#obj` with `__len`, as `luaL_len`: an error unless the length is
+    /// an integer. `obj` is any value the API converts; `Table.len` is
+    /// the raw length.
+    pub fn len(state: *State, obj: anytype) Error!i64 {
+        const th = state.thread();
+        const o = try toLua(th, obj);
+        if (o.isTable() and th.state.fastTm(o.asTable().metatable, .len) == null) return @bitCast(o.asTable().length());
+        return lenSlow(th, o);
+    }
+
     /// `obj[key] = x`, with `__newindex`, as Lua's assignment does.
     pub fn setField(state: *State, obj: anytype, key: anytype, x: anytype) Error!void {
         const th = state.thread();
@@ -1089,6 +1099,17 @@ fn getOp(th: *Thread, b: u32) IError!u32 {
 fn setOp(th: *Thread, b: u32) IError!u32 {
     try vm.set(th, th.stack[b], th.stack[b + 1], th.stack[b + 2]);
     return 0;
+}
+
+fn lenOp(th: *Thread, b: u32) IError!u32 {
+    th.push(.int(try auxlib.lenInt(th, th.stack[b])));
+    return 1;
+}
+
+fn lenSlow(th: *Thread, o: IValue) Error!i64 {
+    @branchHint(.cold);
+    if (th.frames.items.len > 1) return auxlib.lenInt(th, o) catch |e| mapError(e);
+    return (try protect(th, &lenOp, &.{o})).asInt();
 }
 
 fn tostringOp(th: *Thread, b: u32) IError!u32 {
