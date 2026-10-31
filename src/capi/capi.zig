@@ -41,6 +41,10 @@ comptime {
     _ = state_mod;
 }
 
+test {
+    _ = @import("unwind.zig");
+}
+
 const Error = Value.Error;
 const Frame = Thread.Frame;
 
@@ -1154,18 +1158,28 @@ pub fn luaSetwarnf(L: *lua_State, f: ?lua_WarnFunction, ud: ?*anyopaque) callcon
 }
 
 /// The state's warning function while `lua_setwarnf` gave it a C one.
+/// The collector warns from deep in Zig code, so the C function runs
+/// protected, and an error it raises is dropped.
 fn cWarn(state: *State, msg: []const u8, tocont: bool) void {
     const d = dataSlot(state.main).*.?;
     const f = d.warnf orelse return;
+    var call: WarnCall = .{ .f = f, .ud = d.warn_ud, .msg = undefined, .tocont = @intFromBool(tocont) };
     // Every message comes from a Lua string or a literal, both of which
     // end in a zero; copy the short ones anyway, as cheap insurance.
     var buf: [256]u8 = undefined;
-    const z: [*:0]const u8 = if (msg.len < buf.len) blk: {
+    call.msg = if (msg.len < buf.len) blk: {
         @memcpy(buf[0..msg.len], msg);
         buf[msg.len] = 0;
         break :blk buf[0..msg.len :0].ptr;
     } else @ptrCast(msg.ptr);
-    f(d.warn_ud, z, @intFromBool(tocont));
+    _ = protect(state.main, &warnShim, @intFromPtr(&call), 0);
+}
+
+const WarnCall = struct { f: lua_WarnFunction, ud: ?*anyopaque, msg: [*:0]const u8, tocont: c_int };
+
+fn warnShim(_: *lua_State, call: *const WarnCall) callconv(.c) c_int {
+    call.f(call.ud, call.msg, call.tocont);
+    return 0;
 }
 
 /// `lua_gc`'s options, lua.h's `LUA_GC*`.
