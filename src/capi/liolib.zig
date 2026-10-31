@@ -509,10 +509,6 @@ fn readLine(L: *lua_State, f: *CFile, chop: bool) bool {
 fn readAll(L: *lua_State, f: *CFile) void {
     var b: Buffer = undefined;
     luaL_buffinit(L, &b);
-    // Unlike the reference, size the buffer to what is left of a regular
-    // file: our box grows by copying into a new userdata, where the
-    // reference's reallocates in place.
-    if (remaining(f)) |n| _ = luaL_prepbuffsize(&b, n +| buffer_size);
     while (true) {
         const p = luaL_prepbuffsize(&b, buffer_size);
         const nr = std.c.fread(p, 1, buffer_size, f);
@@ -520,26 +516,6 @@ fn readAll(L: *lua_State, f: *CFile) void {
         if (nr != buffer_size) break;
     }
     luaL_pushresult(&b);
-}
-
-/// The bytes between `f`'s position and the end, when it is a regular file.
-fn remaining(f: *CFile) ?usize {
-    const pos = ftello(f);
-    if (pos < 0) return null;
-    const fd = fileno(f);
-    var size: u64 = undefined;
-    if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        var sx: linux.Statx = undefined;
-        const rc = linux.statx(fd, "", 0x1000, .{ .TYPE = true, .SIZE = true }, &sx); // AT_EMPTY_PATH
-        if (linux.errno(rc) != .SUCCESS or !linux.S.ISREG(sx.mode)) return null;
-        size = sx.size;
-    } else {
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0 or !std.c.S.ISREG(st.mode)) return null;
-        size = @intCast(st.size);
-    }
-    return if (size > pos) @intCast(size - @as(u64, @intCast(pos))) else null;
 }
 
 fn readChars(L: *lua_State, f: *CFile, n: usize) bool {

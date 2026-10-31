@@ -344,9 +344,11 @@ fn lauxLoadbufferx(
     };
     b[sz] = 0;
     const f = base.loadChunk(L, b[0..sz :0], span(name), if (mode) |m| span(m) else "bt") catch |e| {
+        capi.Box.release(L, slot);
         L.top = slot;
         return loadFailed(L, e);
     };
+    capi.Box.release(L, slot);
     L.stack[slot] = f;
     return capi.lua_ok;
 }
@@ -538,6 +540,7 @@ fn lauxAddvalue(B: *Buffer) callconv(.c) void {
 fn lauxPushresult(B: *Buffer) callconv(.c) void {
     const L = B.L;
     _ = capi.luaPushlstring(L, B.b, B.n);
+    if (B.b != &B.init.b) capi.Box.release(L, L.top - 2);
     capi.luaRotate(L, -2, -1);
     L.top -= 1;
 }

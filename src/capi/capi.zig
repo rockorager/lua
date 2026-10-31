@@ -102,6 +102,8 @@ pub const ThreadData = struct {
     /// its own allocator (docs/slop/c-api.md).
     allocf: ?lua_Alloc = null,
     alloc_ud: ?*anyopaque = null,
+    /// The metatable of `Box`es. The registry holds it.
+    box_mt: ?*Table = null,
 };
 
 /// The thread's C hook, `lua_sethook`'s function, first in its prefix.
@@ -958,16 +960,84 @@ pub fn luaPcallk(
 /// collector frees if an error abandons it: `lua_load` and lauxlib's
 /// buffers keep no memory a jump could leak.
 pub const Box = struct {
-    /// Replaces the value at stack slot `slot` with a new userdata of
-    /// `size` bytes holding a copy of `keep`; returns its bytes.
+    /// The box's bytes: memory from the state's heap, outside the
+    /// userdata, so it can grow in place.
+    const Data = extern struct { ptr: ?[*]u8, len: usize };
+
+    /// Makes the value at stack slot `slot` a box of `size` bytes that
+    /// starts with `keep`, and returns its bytes. A box there already
+    /// grows, in place where the allocator can (`mremap` for large
+    /// blocks), as lauxlib.c's `realloc`s; then `keep` must be the start
+    /// of its bytes. Otherwise a new box holds a copy of `keep`.
     pub fn grow(th: *Thread, slot: u32, keep: []const u8, size: usize) error{OutOfMemory}![]u8 {
-        const u = try Userdata.create(th.heap(), size, 0);
-        const b = u.bytes();
-        @memcpy(b[0..keep.len], keep);
+        const heap = th.heap();
+        if (data(th, th.stack[slot])) |d| {
+            const b = try heap.raw().realloc(d.ptr.?[0..d.len], size);
+            d.* = .{ .ptr = b.ptr, .len = b.len };
+            return b;
+        }
+        if (heap.stopped & gc.stop.closing != 0) {
+            // Finalizers no longer register while the state closes: the
+            // bytes in a plain userdata, a new one each time.
+            const u = try Userdata.create(heap, size, 0);
+            const b = u.bytes();
+            @memcpy(b[0..keep.len], keep);
+            th.stack[slot] = .userdata(u);
+            return b;
+        }
+        const mt = try metatable(th);
+        const u = try Userdata.create(heap, @sizeOf(Data), 0);
+        const d: *Data = @ptrCast(u.bytes().ptr);
+        d.* = .{ .ptr = null, .len = 0 };
         th.stack[slot] = .userdata(u);
+        th.state.setMetatable(.userdata(u), mt);
+        const b = try heap.raw().alloc(u8, size);
+        @memcpy(b[0..keep.len], keep);
+        d.* = .{ .ptr = b.ptr, .len = size };
         return b;
     }
+
+    /// Frees the bytes of the box at `slot` now, if it is one, instead of
+    /// at its collection (lauxlib.c's `lua_closeslot` of the box).
+    pub fn release(th: *Thread, slot: u32) void {
+        const d = data(th, th.stack[slot]) orelse return;
+        if (d.ptr) |p| th.heap().raw().free(p[0..d.len]);
+        d.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn data(th: *Thread, v: Value) ?*Data {
+        if (v.tag != .userdata) return null;
+        const u = v.asUserdata();
+        const mt = u.metatable orelse return null;
+        const td = dataSlot(th.state.main).* orelse return null;
+        if (mt != td.box_mt) return null;
+        return @ptrCast(@alignCast(u.bytes().ptr));
+    }
+
+    /// `{__gc = gcf}`, made once per state.
+    fn metatable(th: *Thread) error{OutOfMemory}!*Table {
+        const state = th.state;
+        const d = try threadData(state.main);
+        if (d.box_mt) |t| return t;
+        const t = try state.newTable(0, 1);
+        state.registry.set(&state.heap, .lightUserdata(&box_key), .table(t)) catch return error.OutOfMemory;
+        const name = try state.newString("__gc");
+        t.set(&state.heap, .string(name), try lightCFunction(th, &gcf)) catch return error.OutOfMemory;
+        d.box_mt = t;
+        return t;
+    }
+
+    /// Frees what an error left in a box.
+    fn gcf(L: *lua_State) callconv(.c) c_int {
+        const v = get(L, 1);
+        const d: *Data = @ptrCast(@alignCast(v.asUserdata().bytes().ptr));
+        if (d.ptr) |p| L.heap().raw().free(p[0..d.len]);
+        d.* = .{ .ptr = null, .len = 0 };
+        return 0;
+    }
 };
+
+var box_key: u8 = 0;
 
 /// What `readShim` passes to and from a `lua_Reader`.
 const ReadCall = struct { reader: lua_Reader, data: ?*anyopaque, size: usize = 0, p: ?[*]const u8 = null };
@@ -1014,19 +1084,27 @@ pub fn luaLoad(
     var n: usize = 0;
     var rc: ReadCall = .{ .reader = reader, .data = data };
     while (true) {
-        if (protect(L, &readShim, @intFromPtr(&rc), 0) == jmp.aborted) return loadFailure(L, slot, failure.err, false);
+        if (protect(L, &readShim, @intFromPtr(&rc), 0) == jmp.aborted) {
+            Box.release(L, slot);
+            return loadFailure(L, slot, failure.err, false);
+        }
         const p = rc.p orelse break;
         if (rc.size == 0) break;
         if (n + rc.size + 1 > buf.len)
-            buf = Box.grow(L, slot, buf[0..n], @max(buf.len * 2, n + rc.size + 1)) catch |e|
+            buf = Box.grow(L, slot, buf[0..n], @max(buf.len * 2, n + rc.size + 1)) catch |e| {
+                Box.release(L, slot);
                 return loadFailure(L, slot, e, false);
+            };
         @memcpy(buf[n..][0..rc.size], p[0..rc.size]);
         n += rc.size;
     }
     buf[n] = 0;
     const name = if (chunkname) |c| span(c) else "?";
-    const f = base.loadChunk(L, buf[0..n :0], name, if (mode) |m| span(m) else "bt") catch |e|
+    const f = base.loadChunk(L, buf[0..n :0], name, if (mode) |m| span(m) else "bt") catch |e| {
+        Box.release(L, slot);
         return loadFailure(L, slot, e, true);
+    };
+    Box.release(L, slot);
     L.top = slot;
     push(L, f);
     return lua_ok;
