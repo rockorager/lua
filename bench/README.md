@@ -1,6 +1,6 @@
 # lua bench
 
-Lua programs that each stress one part of an implementation, timed on this package's `lua` and on reference C Lua 5.5.1.
+Lua programs timed on this package's `lua` and on reference C Lua 5.5.1. Most stress one part of an implementation; `json`, `template`, `oop`, and `config` are shaped like real programs and stress several at once.
 
 These are local numbers, for iterating. They are not claims: a number that gets quoted in the README needs a run on dedicated hardware.
 
@@ -8,24 +8,28 @@ These are local numbers, for iterating. They are not claims: a number that gets 
 
 Each program is plain Lua 5.5 with no modules. It takes one size argument, `lua bench/fib.lua 30`, and its default size runs for about 0.5 to 2 seconds on the reference. It prints a checksum: the same output from two implementations means they did the same work, so their times can be compared.
 
-| Program         | Stresses                                                                                                     |
-| --------------- | ------------------------------------------------------------------------------------------------------------ |
-| `fib`           | Lua-to-Lua calls and returns: naive recursive Fibonacci                                                      |
-| `binary_trees`  | table allocation and the collector: the benchmarks game's binary-trees                                       |
-| `hash_string`   | the hash part with string keys: insert, hit, miss, delete                                                    |
-| `hash_int`      | the hash part with sparse integer keys: insert, hit, miss, delete, `pairs`                                   |
-| `array`         | the array part: fill by index and by `t[#t + 1]`, read with `ipairs` and a numeric `for`                     |
-| `nbody`         | float arithmetic and field access: the benchmarks game's n-body                                              |
-| `spectral_norm` | float arithmetic, calls, and array access: the benchmarks game's spectral-norm                               |
-| `mandelbrot`    | float arithmetic and comparisons in locals                                                                   |
-| `concat`        | the `..` operator on strings and numbers, in a loop                                                          |
-| `table_concat`  | `table.concat` with and without a separator                                                                  |
-| `format`        | `string.format`'s common conversions                                                                         |
-| `patterns`      | `string.find`, `match`, `gsub`, and `gmatch` with patterns, captures, and replacements                       |
-| `closures`      | closure creation, shared upvalues, per-iteration loop upvalues, nested upvalues                              |
-| `methods`       | `obj:method()` through `__index` tables, a two-level `__index` chain, an `__index` function, `__add`, `__eq` |
-| `coroutines`    | `coroutine.resume` and `yield` ping-pong, a `coroutine.wrap` generator, short-lived coroutines               |
-| `globals`       | global variables and functions: every name a field of `_ENV`, as in code written without locals              |
+| Program         | Stresses                                                                                                       |
+| --------------- | -------------------------------------------------------------------------------------------------------------- |
+| `fib`           | Lua-to-Lua calls and returns: naive recursive Fibonacci                                                        |
+| `binary_trees`  | table allocation and the collector: the benchmarks game's binary-trees                                         |
+| `hash_string`   | the hash part with string keys: insert, hit, miss, delete                                                      |
+| `hash_int`      | the hash part with sparse integer keys: insert, hit, miss, delete, `pairs`                                     |
+| `array`         | the array part: fill by index and by `t[#t + 1]`, read with `ipairs` and a numeric `for`                       |
+| `nbody`         | float arithmetic and field access: the benchmarks game's n-body                                                |
+| `spectral_norm` | float arithmetic, calls, and array access: the benchmarks game's spectral-norm                                 |
+| `mandelbrot`    | float arithmetic and comparisons in locals                                                                     |
+| `concat`        | the `..` operator on strings and numbers, in a loop                                                            |
+| `table_concat`  | `table.concat` with and without a separator                                                                    |
+| `format`        | `string.format`'s common conversions                                                                           |
+| `patterns`      | `string.find`, `match`, `gsub`, and `gmatch` with patterns, captures, and replacements                         |
+| `closures`      | closure creation, shared upvalues, per-iteration loop upvalues, nested upvalues                                |
+| `methods`       | `obj:method()` through `__index` tables, a two-level `__index` chain, an `__index` function, `__add`, `__eq`   |
+| `coroutines`    | `coroutine.resume` and `yield` ping-pong, a `coroutine.wrap` generator, short-lived coroutines                 |
+| `globals`       | global variables and functions: every name a field of `_ENV`, as in code written without locals                |
+| `json`          | a pure-Lua JSON encoder and decoder round-tripping a generated document: `byte`, `find`, `sub`, `gsub`, `sort` |
+| `template`      | HTML pages and text reports from templates: `gsub` with functions and tables, `format`, `table.concat`         |
+| `oop`           | a predator and prey simulation with classes over metatables, inheritance, and calls to base-class methods      |
+| `config`        | a large table constructor compiled with `load`, run, and queried: the compiler and table constructors          |
 
 ## Arms
 
