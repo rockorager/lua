@@ -270,7 +270,8 @@ capi-test TARGET="":
         ref=$saved
     done
     # A C host embedding liblua (test/capi/host.c): built against the
-    # reference's liblua.so, ours, and our liblua.a, and run alone.
+    # reference's liblua.so, ours, and our liblua.a (exporting its lua_*
+    # for the unload modules, as lua.c's -Wl,-E), and run alone.
     if [ -z "$target" ]; then
         refdir=$(dirname "$(dirname "$(readlink -f "$ref")")")
         runner=()
@@ -281,7 +282,7 @@ capi-test TARGET="":
     lib=$(dirname "$inc")/lib
     "${cc[@]}" -Wall -O2 "-I$refdir/include" -o "$out/host-ref" test/capi/host.c "$refdir/lib/liblua.so" "-Wl,-rpath,$refdir/lib"
     "${cc[@]}" -Wall -O2 "-I$inc" -o "$out/host-so" test/capi/host.c "$lib/liblua.so" "-Wl,-rpath,$lib"
-    "${cc[@]}" -Wall -O2 "-I$inc" -Wl,-z,noexecstack -o "$out/host-a" test/capi/host.c "$lib/liblua.a"
+    "${cc[@]}" -Wall -O2 "-I$inc" -Wl,-z,noexecstack -Wl,-E -o "$out/host-a" test/capi/host.c "$lib/liblua.a"
     for kind in so a; do
         hostrun() { if [ "$LUA" = "$ref" ]; then "${runner[@]}" "$out/host-ref"; else "${runner[@]}" "$out/host-$kind"; fi; }
         run "host-$kind" "$out" cat hostrun

@@ -668,6 +668,21 @@ static void t_threads (void) {
   lua_close(L);
 }
 
+/* ---------------------------------------------------------------------
+** C libraries close with the state: unload1.so and unload2.so (built by
+** `just capi-test` beside this program) report their finalizers and
+** destructors on stderr, the last loaded first, during lua_close.
+** ------------------------------------------------------------------- */
+
+static void t_unload (void) {
+  lua_State *L = luaL_newstate();
+  section("lua_close closes C libraries");
+  luaL_openselectedlibs(L, ~0, 0);
+  run(L, "package.cpath = './?.so' Keep = {require 'unload1', require 'unload2'} print('  loaded')");
+  lua_close(L);
+  printf("  closed\n");
+}
+
 int main (void) {
   /* Lua's output and ours in order, whichever writes it. */
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -681,6 +696,7 @@ int main (void) {
   t_results();
   t_gc();
   t_threads();
+  t_unload();
   printf("OK\n");
   return 0;
 }
