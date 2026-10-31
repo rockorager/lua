@@ -25,6 +25,7 @@ Each program is plain Lua 5.5 with no modules. It takes one size argument, `lua 
 | `closures`      | closure creation, shared upvalues, per-iteration loop upvalues, nested upvalues                              |
 | `methods`       | `obj:method()` through `__index` tables, a two-level `__index` chain, an `__index` function, `__add`, `__eq` |
 | `coroutines`    | `coroutine.resume` and `yield` ping-pong, a `coroutine.wrap` generator, short-lived coroutines               |
+| `globals`       | global variables and functions: every name a field of `_ENV`, as in code written without locals              |
 
 ## Arms
 
