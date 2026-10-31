@@ -164,7 +164,7 @@ pub fn typeName(state: *State, v: Value) []const u8 {
 }
 
 /// Field `name` of `v`'s metatable, raw, or null (`luaL_getmetafield`).
-pub fn metafield(state: *State, v: Value, comptime name: []const u8) ?Value {
+pub fn metafield(state: *State, v: Value, name: []const u8) ?Value {
     const mt = state.metatableOf(v) orelse return null;
     // Looking the name up interns it; that allocation failing means no
     // table can hold the key either.
@@ -434,8 +434,22 @@ pub const Sized = struct {
 
 /// A library table with these natives, by name.
 pub fn newLib(state: *State, comptime funcs: anytype) error{OutOfMemory}!*Table {
-    const t = try state.newTable(0, funcs.len);
-    inline for (funcs) |f| try setField(state, t, f[0], .native(f[1]));
+    const list = comptime blk: {
+        var l: [funcs.len]Reg = undefined;
+        for (funcs, &l) |f, *r| r.* = .{ .name = f[0], .f = f[1] };
+        break :blk l;
+    };
+    return newLibFrom(state, &list);
+}
+
+/// A library function's name and code, as `luaL_Reg`. A list of them in
+/// read-only data is smaller than a call per function unrolled into each
+/// library's `open` (`results/lean-20261031.md`).
+const Reg = struct { name: []const u8, f: Value.NativeFn };
+
+fn newLibFrom(state: *State, list: []const Reg) error{OutOfMemory}!*Table {
+    const t = try state.newTable(0, @intCast(list.len));
+    for (list) |r| try setField(state, t, r.name, .native(r.f));
     return t;
 }
 

@@ -566,8 +566,11 @@ fn arithFn(comptime op: ArithOp) Value.NativeFn {
 
 /// Both operands as numbers, then the operation; otherwise the second
 /// operand's metamethod, or the reference's error (`arith`, `trymt`).
-fn arith(th: *Thread, base: u32, comptime op: ArithOp) Error!u32 {
-    const a: Args = .init(th, base, "__" ++ @tagName(op));
+/// One copy for the eight operators, which are not hot: inlined in each
+/// metamethod it was 1.8 KB a copy (`results/lean-20261031.md`).
+noinline fn arith(th: *Thread, base: u32, op: ArithOp) Error!u32 {
+    const event = mm_names[@intFromEnum(op)];
+    const a: Args = .init(th, base, event);
     const x = a.get(1);
     const y = a.get(2);
     if (auxlib.toNumberValue(x)) |nx| {
@@ -580,18 +583,24 @@ fn arith(th: *Thread, base: u32, comptime op: ArithOp) Error!u32 {
             return 1;
         }
     }
-    const mm = (if (y.isString()) null else auxlib.metafield(th.state, y, "__" ++ @tagName(op))) orelse
+    const mm = (if (y.isString()) null else auxlib.metafield(th.state, y, event)) orelse
         return raise(
             th,
             "attempt to {s} a '{s}' with a '{s}'",
-            .{ @tagName(op), x.typeOf().name(), y.typeOf().name() },
+            .{ event[2..], x.typeOf().name(), y.typeOf().name() },
         );
     th.push(try auxlib.call1(th, mm, &.{ x, y }));
     return 1;
 }
 
+const mm_names = blk: {
+    var names: [@typeInfo(ArithOp).@"enum".fields.len][]const u8 = undefined;
+    for (&names, @typeInfo(ArithOp).@"enum".fields) |*n, f| n.* = "__" ++ f.name;
+    break :blk names;
+};
+
 /// `lua_arith` on two numbers.
-fn arithOp(th: *Thread, comptime op: ArithOp, x: Value, y: Value) Error!Value {
+fn arithOp(th: *Thread, op: ArithOp, x: Value, y: Value) Error!Value {
     if (x.tag == .int and y.tag == .int) {
         const i = x.payload.int;
         const j = y.payload.int;

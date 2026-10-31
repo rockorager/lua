@@ -162,12 +162,18 @@ fn newString(ls: *Parser, b: []const u8) Error!*String {
 /// Sets the error message, "chunk:line: msg near 'tok'", and fails.
 noinline fn fail(ls: *Parser, line: u32, near: ?Token, comptime fmt: []const u8, args: anytype) Error {
     @branchHint(.cold);
+    return ls.failArgs(line, near, fmt, &Thread.FormatArg.list(fmt, args));
+}
+
+noinline fn failArgs(ls: *Parser, line: u32, near: ?Token, fmt: []const u8, args: []const Thread.FormatArg) Error {
+    @branchHint(.cold);
     var aw: std.Io.Writer.Allocating = .fromArrayList(ls.gpa, &ls.msg);
     defer ls.msg = aw.toArrayList();
     aw.clearRetainingCapacity();
     const w = &aw.writer;
     Thread.writeChunkId(w, ls.chunkname) catch return error.OutOfMemory;
-    w.print(":{d}: " ++ fmt, .{line} ++ args) catch return error.OutOfMemory;
+    w.print(":{d}: ", .{line}) catch return error.OutOfMemory;
+    Thread.FormatArg.write(w, fmt, args) catch return error.OutOfMemory;
     if (near) |tok| {
         if (@intFromEnum(tok.kind) != 0) {
             w.writeAll(" near ") catch return error.OutOfMemory;

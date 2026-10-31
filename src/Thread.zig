@@ -391,14 +391,136 @@ pub noinline fn errorInErrorHandling(th: *Thread) Error {
 /// the running Lua function as `error` with level 1 does.
 pub noinline fn runError(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
     @branchHint(.cold);
+    return runErrorArgs(th, fmt, &FormatArg.list(fmt, args));
+}
+
+noinline fn runErrorArgs(th: *Thread, fmt: []const u8, args: []const FormatArg) Error {
+    @branchHint(.cold);
     var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
     defer aw.deinit();
     const w = &aw.writer;
     const f = th.frame();
     if (f.flags.lua) writePosition(w, th, f) catch return error.OutOfMemory;
-    w.print(fmt, args) catch return error.OutOfMemory;
+    FormatArg.write(w, fmt, args) catch return error.OutOfMemory;
     const s = try th.state.newString(aw.written());
     return th.throw(.string(s));
+}
+
+/// An argument of an error message's format. The functions that raise
+/// formatted errors are generic in their format and arguments, and with
+/// `std.fmt` each instance carried its own copy of the formatting, about
+/// a kilobyte each over a hundred instances; they convert their arguments
+/// to a list of these and share one formatter that reads the format at
+/// run time (`docs/slop/results/lean-20261031.md`). It takes `{s}`, `{d}`,
+/// `{c}`, and `{}` for a string or an integer, and `{d}` for a float as
+/// `std.fmt` writes it.
+pub const FormatArg = union(enum) {
+    s: []const u8,
+    d: i64,
+    u: u64,
+    c: u8,
+    f: f64,
+
+    /// The arguments of `fmt` in the tuple `args`.
+    pub inline fn list(comptime fmt: []const u8, args: anytype) [fieldsOf(@TypeOf(args)).len]FormatArg {
+        const specs = comptime parse(fmt);
+        const fields = comptime fieldsOf(@TypeOf(args));
+        if (specs.len != fields.len) @compileError("format \"" ++ fmt ++ "\" does not match its arguments");
+        var out: [fields.len]FormatArg = undefined;
+        inline for (fields, 0..) |field, i| out[i] = from(specs[i], @field(args, field.name));
+        return out;
+    }
+
+    fn fieldsOf(T: type) []const std.builtin.Type.StructField {
+        return @typeInfo(T).@"struct".fields;
+    }
+
+    fn from(comptime spec: u8, x: anytype) FormatArg {
+        const T = @TypeOf(x);
+        switch (@typeInfo(T)) {
+            .int, .comptime_int => {
+                if (spec == 'c') return .{ .c = x };
+                if (spec == 's') @compileError("{s} for an integer");
+                if (T != comptime_int and @typeInfo(T).int.bits >= 64 and
+                    @typeInfo(T).int.signedness == .unsigned) return .{ .u = x };
+                return .{ .d = x };
+            },
+            .float => {
+                if (spec != 'd') @compileError("{d} for a float");
+                return .{ .f = x };
+            },
+            else => {
+                if (spec != 's' and spec != 0) @compileError("{" ++ &[_]u8{spec} ++ "} for a " ++ @typeName(T));
+                const s: []const u8 = x;
+                return .{ .s = s };
+            },
+        }
+    }
+
+    /// The specifier of each placeholder in `fmt`: 's', 'd', 'c', or 0 for
+    /// `{}`.
+    fn parse(comptime fmt: []const u8) []const u8 {
+        comptime {
+            var specs: []const u8 = "";
+            var i: usize = 0;
+            while (i < fmt.len) : (i += 1) {
+                if (fmt[i] == '{' and i + 1 < fmt.len and fmt[i + 1] == '{') {
+                    i += 1;
+                } else if (fmt[i] == '{') {
+                    if (fmt[i + 1] == '}') {
+                        specs = specs ++ &[_]u8{0};
+                        i += 1;
+                    } else if (i + 2 < fmt.len and fmt[i + 2] == '}' and isSpec(fmt[i + 1])) {
+                        specs = specs ++ &[_]u8{fmt[i + 1]};
+                        i += 2;
+                    } else @compileError("unsupported placeholder in \"" ++ fmt ++ "\"");
+                }
+            }
+            return specs;
+        }
+    }
+
+    fn isSpec(c: u8) bool {
+        return c == 's' or c == 'd' or c == 'c';
+    }
+
+    /// Writes `fmt` with its placeholders replaced by `args` in order.
+    pub fn write(w: *std.Io.Writer, fmt: []const u8, args: []const FormatArg) std.Io.Writer.Error!void {
+        var start: usize = 0;
+        var i: usize = 0;
+        var n: usize = 0;
+        while (i < fmt.len) : (i += 1) {
+            const c = fmt[i];
+            if (c != '{' and c != '}') continue;
+            try w.writeAll(fmt[start..i]);
+            if (i + 1 < fmt.len and fmt[i + 1] == c) {
+                try w.writeByte(c);
+                i += 1;
+            } else {
+                while (fmt[i] != '}') i += 1;
+                switch (args[n]) {
+                    .s => |s| try w.writeAll(s),
+                    .d => |d| try w.printInt(d, 10, .lower, .{}),
+                    .u => |u| try w.printInt(u, 10, .lower, .{}),
+                    .c => |b| try w.writeByte(b),
+                    .f => |f| try w.print("{d}", .{f}),
+                }
+                n += 1;
+            }
+            start = i + 1;
+        }
+        try w.writeAll(fmt[start..]);
+    }
+};
+
+test "FormatArg formats as std.fmt does" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const fmt = "{{a}} {s}:{d} {} {c}{} {d}}}";
+    const u: u64 = std.math.maxInt(u64);
+    const args = .{ "x", @as(i32, -7), "y", @as(u8, 'z'), @as(usize, 3), u };
+    try FormatArg.write(&w, fmt, &FormatArg.list(fmt, args));
+    try std.testing.expectEqualStrings("{a} x:-7 y z3 18446744073709551615}", w.buffered());
 }
 
 /// "chunk:line: " for the instruction Lua frame `f` is running, as

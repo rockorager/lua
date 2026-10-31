@@ -321,10 +321,15 @@ pub fn traceback(w: *std.Io.Writer, t: *Thread, msg: ?[]const u8, level_in: i64)
 /// called the running native, as `luaL_error` does.
 pub noinline fn raise(th: *Thread, comptime fmt: []const u8, args: anytype) Value.Error {
     @branchHint(.cold);
+    return raiseArgs(th, fmt, &Thread.FormatArg.list(fmt, args));
+}
+
+noinline fn raiseArgs(th: *Thread, fmt: []const u8, args: []const Thread.FormatArg) Value.Error {
+    @branchHint(.cold);
     var aw: std.Io.Writer.Allocating = .init(th.heap().allocator());
     defer aw.deinit();
     where(th, 1, &aw.writer) catch return error.OutOfMemory;
-    aw.writer.print(fmt, args) catch return error.OutOfMemory;
+    Thread.FormatArg.write(&aw.writer, fmt, args) catch return error.OutOfMemory;
     return th.throw(.string(try th.state.newString(aw.written())));
 }
 
