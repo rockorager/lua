@@ -28,29 +28,17 @@ second for a chunk whose first byte is ESC, after the mode check, so `load`,
 
 ## Line information
 
-`Proto.lineinfo` holds one absolute line per instruction; luac's chunk holds
-a signed byte per instruction (the change from the previous line) and an
-absolute entry where the change does not fit in a byte or after 128 relative
-entries in a row. `dump.zig` replays lcode.c's `savelineinfo` over the final
-lines. `luaK_fixline` makes that replay lossy: it moves an instruction's
-line after saving it, and if the first save was absolute the moved one is
-forced absolute. Every generic `for` spanning 128 lines or more does this to
-its `TFORLOOP`. Since an instruction is first saved at the last token's
-line, which never decreases, an instruction whose final line is below an
-earlier one was moved, and its first save was at least at the highest line
-so far; replaying that save matches luac on every suite and bench file and
-on generated sources with long loops, gaps, and calls.
-
-What still differs: a moved instruction whose true first line was 128 or
-more beyond every earlier instruction while the move lands within 128 of
-the previous one, which takes 128 instruction-free lines inside one
-expression or call (`f(` and `)` 200 blank lines apart). The lines decode
-to the same numbers; only the bytes differ. Closing it needs the compiler
-to record those forced entries: `Code.zig` could run `savelineinfo`
-alongside its absolute lines and keep the forced pcs in a `Proto` field.
-
-Loading expands the encoding back to absolute lines as `luaG_getfuncline`
-reads it, so `debug` and error messages need nothing new.
+`Proto.lineinfo` and `Proto.abslineinfo` hold lcode.c's encoding, built by
+`Code.zig` as `savelineinfo`, `removelastlineinfo`, and `luaK_fixline`
+build it: a signed byte per instruction (the change from the previous
+line) and an absolute entry where the change does not fit in a byte,
+after 128 relative entries in a row, or where `luaK_fixline` moved an
+instruction whose first save was absolute. The dump writes both as they
+are and the loader reads them back as they are, so every line-info byte
+is luac's, including the case the earlier re-encoding of absolute lines
+could not reproduce (a call whose parentheses enclose 128 lines or more,
+in `test/diff/dump.lua`). `Proto.lineAt` decodes a line as
+`luaG_getfuncline` does (`results/lineinfo-20261031.md`).
 
 ## Loading
 
@@ -70,15 +58,18 @@ constant`. Bytes after the main function are ignored, as the reference
   whatever its name.
 - Like the reference, the loader does not verify bytecode: a hand-made
   chunk can hold out-of-range registers or constant indices, which the VM
-  trusts.
+  trusts. Nor does it check line information; `Proto.lineAt` and
+  `changedLine` stay in bounds on any entries, giving some line for
+  out-of-order ones.
 
 ## Verification
 
 - `just dump`: for every suite and bench file, our `string.dump` of our
   compile equals `luac -o` and `luac -s -o` byte for byte, and luac's
-  chunks load on ours and dump back unchanged: 98 of 98.
+  chunks load on ours and dump back unchanged: 108 of 108.
 - Every one of our dumps loads on the reference, which lists it with
-  `luac -l -l` exactly as it lists its own (98 of 98).
+  `luac -l -l` exactly as it lists its own (98 of 98 in wave 3; since
+  the dumps are now luac's bytes, this follows from `just dump`).
 - `lua x.out` on ours for luac's output of each bench program prints what
   the reference prints for the source (plain and stripped), except
   `coroutines`, which needs the coroutine library either way.
@@ -96,7 +87,8 @@ constant`. Bytes after the main function are ignored, as the reference
   stripped, including a forced absolute line); luac's chunk loads with the
   right lines and dumps back unchanged; every truncation and each header
   corruption gives the reference's message; every byte of the chunk flipped
-  four ways loads or fails cleanly, and what loads dumps again.
+  four ways loads or fails cleanly, and what loads dumps again and decodes
+  every instruction's line.
 
 ## Requests for the core
 

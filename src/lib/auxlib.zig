@@ -481,7 +481,7 @@ pub const testing = struct {
             opcodes.abc(.call, 1, 0, 0, false),
             opcodes.abc(.@"return", 1, 0, 2, false),
         });
-        p.lineinfo = try gpa.dupe(u32, &.{ 7, 7, 7, 7, 7 });
+        p.lineinfo = try gpa.dupe(i8, &.{ 7, 0, 0, 0, 0 });
         p.numparams = 1;
         p.flags.vararg = true;
         p.maxstacksize = 4;

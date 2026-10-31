@@ -154,11 +154,14 @@ reference.
     `PrintFunction` format) with `luac -l -l -p` for every suite and bench
     file, addresses masked: 54 of 54 identical. Keep it that way; a
     deliberate divergence goes in the recipe with the reason. Line info is
-    one absolute line per instruction (`Proto.lineinfo`), not luac's
-    delta encoding; `dump.zig` re-encodes it for `string.dump`. That
-    costs about 3 bytes per instruction against luac's encoding (185 KiB
-    of bench/config.lua's chunk); measure luac's encoding when the memory
-    of loaded code matters. Wave 6 took two store forwarding stalls out
+    luac's encoding (`Proto.lineinfo`, a byte per instruction, and
+    `Proto.abslineinfo`), built as lcode.c builds it and decoded by
+    `Proto.lineAt` as `luaG_getfuncline` does. Landed in wave 7: against
+    one absolute `u32` per instruction, bench/config.lua's compiled chunk
+    holds 184 KiB less (850 to 666 KiB; the reference's 630), every suite
+    and bench file loaded together 15% less, and compile time, line
+    hooks, and error positions are unchanged
+    (`results/lineinfo-20261031.md`). Wave 6 took two store forwarding stalls out
     of the compiler, the token returned by value and the constant
     cache's generic hash: building and loading a large table constructor
     64 times runs 24% faster than on the reference
@@ -168,8 +171,9 @@ reference.
     5.5.1's format exactly, so `luac -o` output runs here and our dumps
     load on the reference. `just dump` checks that our dump of every suite
     and bench file is `luac -o`'s byte for byte, plain and stripped, and
-    that luac's chunks load and dump back unchanged: 98 of 98. Details and
-    the one line-info case that can differ are in `dump.md`. Unlike
+    that luac's chunks load and dump back unchanged: 108 of 108. Line
+    info is written and read as the prototype holds it, so no case
+    differs any more; details are in `dump.md`. Unlike
     lundump.c, the loader rejects an opcode outside the set ("bad binary
     format (invalid opcode)"), which is what lets the loop's dispatch go
     unchecked in safe builds (`results/opcode-check-20261031.md`).

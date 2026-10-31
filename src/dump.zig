@@ -1,13 +1,8 @@
 //! `string.dump`: a prototype as a precompiled chunk in reference Lua
 //! 5.5.1's binary format (ldump.c), so the reference loads it and, for a
 //! function our compiler built, the bytes are what `luac -o` writes for the
-//! same source. `undump.zig` reads the format back.
-//!
-//! The one part the prototype does not hold as luac does is line
-//! information: `Proto.lineinfo` is one absolute line per instruction, and
-//! the dump re-encodes it as lcode.c's `savelineinfo` does, a signed byte
-//! per instruction relative to the previous line plus an absolute entry
-//! when the difference does not fit or after `max_iwthabs` relative ones.
+//! same source. `undump.zig` reads the format back. The prototype holds
+//! line information in the format's encoding, so it is written as is.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -27,14 +22,6 @@ pub const data = "\x19\x93\r\n\x1a\n";
 pub const check_int: i32 = -0x5678;
 pub const check_inst: u32 = 0x12345678;
 pub const check_num: f64 = -370.5;
-
-/// ldebug.h's `ABSLINEINFO`: a line-info byte that defers to an absolute
-/// entry.
-pub const abs_line_info: i8 = -0x80;
-/// ldebug.h's `MAXIWTHABS`: the most relative entries in a row.
-pub const max_iwthabs = 128;
-/// lcode.c's `LIMLINEDIFF`.
-const lim_line_diff = 0x80;
 
 /// The constant tags of the format, lobject.h's variant tags.
 pub const Tag = struct {
@@ -57,8 +44,6 @@ pub const Error = Writer.Error || error{OutOfMemory};
 pub fn dump(gpa: std.mem.Allocator, w: *Writer, f: *const Proto, strip: bool) Error!void {
     var d: Dumper = .{ .gpa = gpa, .w = w, .strip = strip };
     defer d.saved.deinit(gpa);
-    defer d.lines.deinit(gpa);
-    defer d.abs.deinit(gpa);
     try d.block(signature);
     try d.byte(version);
     try d.byte(format);
@@ -80,9 +65,6 @@ const Dumper = struct {
     /// Strings already written, by contents, with their 1-based index: a
     /// later occurrence is written as a reference.
     saved: std.StringHashMapUnmanaged(u64) = .empty,
-    /// Scratch for one function's encoded line information.
-    lines: std.ArrayList(i8) = .empty,
-    abs: std.ArrayList(AbsLineInfo) = .empty,
 
     fn block(d: *Dumper, b: []const u8) Writer.Error!void {
         try d.w.writeAll(b);
@@ -198,13 +180,12 @@ const Dumper = struct {
             for (0..4) |_| try d.int(0);
             return;
         }
-        try encodeLines(d, f);
-        try d.int(@intCast(d.lines.items.len));
-        try d.block(@ptrCast(d.lines.items));
-        try d.int(@intCast(d.abs.items.len));
-        if (d.abs.items.len > 0) {
+        try d.int(@intCast(f.lineinfo.len));
+        try d.block(@ptrCast(f.lineinfo));
+        try d.int(@intCast(f.abslineinfo.len));
+        if (f.abslineinfo.len > 0) {
             try d.alignTo(@sizeOf(i32));
-            try d.block(@ptrCast(d.abs.items));
+            try d.block(@ptrCast(f.abslineinfo));
         }
         try d.int(@intCast(f.locvars.len));
         for (f.locvars) |lv| {
@@ -214,80 +195,6 @@ const Dumper = struct {
         }
         try d.int(@intCast(f.upvalues.len));
         for (f.upvalues) |u| try d.string(u.name);
-    }
-};
-
-/// lobject.h's `AbsLineInfo`.
-pub const AbsLineInfo = extern struct {
-    pc: i32,
-    line: i32,
-};
-
-/// Encodes `f.lineinfo` as lcode.c's `savelineinfo` builds it while
-/// compiling, into `lines` and `abs`.
-///
-/// One step of that history is not in the final lines: `luaK_fixline`
-/// moves an instruction already saved at the line of the last token read
-/// back to an earlier line (a call to its function's line, a generic
-/// `for`'s `TFORCALL` and `TFORLOOP` to the `for`), and when that first
-/// save was absolute, the replacement is forced absolute too. An
-/// instruction is saved at the last token's line, which never decreases, so
-/// one whose final line is below an earlier instruction's was moved, and
-/// its first save was at least at the highest line so far. Replaying that
-/// save gives luac's bytes unless the true line was 128 or more past every
-/// instruction before it with the move landing within 128 of the previous
-/// one (a call whose parentheses enclose that many blank lines).
-fn encodeLines(d: *Dumper, f: *const Proto) error{OutOfMemory}!void {
-    d.lines.clearRetainingCapacity();
-    d.abs.clearRetainingCapacity();
-    var e: LineEncoder = .{ .lines = &d.lines, .abs = &d.abs, .gpa = d.gpa, .previous = @bitCast(f.linedefined) };
-    var highest = e.previous;
-    for (f.lineinfo, 0..) |line_u, pc| {
-        const line: i32 = @bitCast(line_u);
-        if (line < highest) {
-            try e.save(pc, highest);
-            e.removeLast();
-        } else {
-            highest = line;
-        }
-        try e.save(pc, line);
-    }
-}
-
-/// lcode.c's line bookkeeping: `savelineinfo` and `removelastlineinfo`.
-const LineEncoder = struct {
-    lines: *std.ArrayList(i8),
-    abs: *std.ArrayList(AbsLineInfo),
-    gpa: std.mem.Allocator,
-    /// The last line saved, `previousline`.
-    previous: i32,
-    /// Instructions since the last absolute entry, `iwthabs`.
-    iwthabs: u32 = 0,
-
-    fn save(e: *LineEncoder, pc: usize, line: i32) error{OutOfMemory}!void {
-        var diff: i32 = line -% e.previous;
-        const far = diff >= lim_line_diff or diff <= -lim_line_diff;
-        // `iwthabs` counts this instruction only when the line is near.
-        if (far or e.iwthabs >= max_iwthabs) {
-            try e.abs.append(e.gpa, .{ .pc = @intCast(pc), .line = line });
-            diff = abs_line_info;
-            e.iwthabs = 1;
-        } else {
-            e.iwthabs += 1;
-        }
-        try e.lines.append(e.gpa, @intCast(diff));
-        e.previous = line;
-    }
-
-    fn removeLast(e: *LineEncoder) void {
-        const last = e.lines.pop().?;
-        if (last != abs_line_info) {
-            e.previous -%= last;
-            e.iwthabs -= 1;
-        } else {
-            _ = e.abs.pop();
-            e.iwthabs = max_iwthabs + 1;
-        }
     }
 };
 

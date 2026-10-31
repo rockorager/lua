@@ -198,11 +198,19 @@ fn getinfo(th: *Thread, base: u32) Error!u32 {
         if (lua) |p| {
             const lines = try th.state.newTable(0, 0);
             try setField(th, r, "activelines", .table(lines));
-            // A vararg function's first instruction, `VARARGPREP`, has no
-            // line of its own.
-            const first: usize = if (p.flags.vararg or p.flags.vararg_table) 1 else 0;
-            if (p.lineinfo.len > first) {
-                for (p.lineinfo[first..]) |line| try lines.setInt(th.heap(), line, .true);
+            if (p.lineinfo.len > 0) {
+                var line: i32 = @bitCast(p.linedefined);
+                // A vararg function's first instruction, `VARARGPREP`, has
+                // no line of its own.
+                var first: usize = 0;
+                if (p.flags.vararg or p.flags.vararg_table) {
+                    line = p.nextLine(line, 0);
+                    first = 1;
+                }
+                for (first..p.lineinfo.len) |pc| {
+                    line = p.nextLine(line, pc);
+                    try lines.setInt(th.heap(), line, .true);
+                }
             }
         }
     }

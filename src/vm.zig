@@ -852,9 +852,8 @@ noinline fn traceExec(th: *Thread, pc: [*]const u32) Error!void {
         // `oldpc` may be stale; any valid value costs at most one extra
         // event.
         const oldpc = if (th.oldpc < p.code.len) th.oldpc else 0;
-        if (npci <= oldpc or p.lineAt(oldpc) != p.lineAt(npci)) {
-            const line: i32 = if (p.lineAt(npci)) |l| @intCast(l) else -1;
-            try callHook(th, .line, line, 0, 0);
+        if (npci <= oldpc or p.changedLine(oldpc, npci)) {
+            try callHook(th, .line, p.lineAt(npci) orelse -1, 0, 0);
         }
         th.oldpc = npci;
     }
@@ -2765,7 +2764,8 @@ const ProtoSpec = struct {
     k: []const Value = &.{},
     p: []const *Proto = &.{},
     upvalues: []const Proto.UpvalDesc = &.{},
-    lineinfo: []const u32 = &.{},
+    /// Line changes, `Proto.lineinfo`.
+    lineinfo: []const i8 = &.{},
     numparams: u8 = 0,
     vararg: bool = false,
     maxstack: u8,
@@ -2780,7 +2780,7 @@ fn makeProto(state: *State, s: ProtoSpec) !*Proto {
     p.k = try a.dupe(Value, s.k);
     p.p = try a.dupe(*Proto, s.p);
     p.upvalues = try a.dupe(Proto.UpvalDesc, s.upvalues);
-    p.lineinfo = try a.dupe(u32, s.lineinfo);
+    p.lineinfo = try a.dupe(i8, s.lineinfo);
     p.numparams = s.numparams;
     p.flags.vararg = s.vararg;
     p.maxstacksize = s.maxstack;
@@ -3212,7 +3212,7 @@ test "runtime errors carry position and unwind to pcall" {
     const p = try makeProto(state, .{
         .maxstack = 2,
         .k = &.{try str(state, "x")},
-        .lineinfo = &.{ 1, 2, 2 },
+        .lineinfo = &.{ 1, 1, 0 },
         .code = &.{
             abc(.loadnil, 0, 0, 0),
             abc(.getfield, 1, 0, 0),

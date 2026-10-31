@@ -41,6 +41,7 @@ All notable changes to lua are recorded here. The format follows
 - Reading and writing a global variable (a field of `_ENV` with a constant name) goes through a per-function cache of where the name sits in the table, so code written with globals runs faster (bench/globals.lua 9% faster).
 - `auxlib.Buffer` is declared `var b: auxlib.Buffer = .init(state)` instead of `undefined` followed by `b.init(state)`, so ReleaseSafe builds no longer clear 1 KiB on every `string.format`, `table.concat`, `gsub`, `string.pack`, or `string.dump` call (format 21–28% faster in ReleaseSafe).
 - ReleaseSafe builds no longer check each instruction's opcode before dispatching it, since the compiler and the binary loader only produce valid ones: dispatch-heavy programs run 5–12% faster in ReleaseSafe.
+- Compiled functions keep line information in `luac`'s encoding, a byte per instruction plus absolute entries (`Proto.lineinfo` is `[]i8`, with `Proto.abslineinfo`; `Proto.lineAt` gives an instruction's line), so loaded code takes about 3 bytes less per instruction: a 521 KB chunk holds 184 KiB less.
 - `load` compiles faster: the compiler no longer stalls on its constant cache and on every token it reads, so a 521 KB table constructor compiles 24% faster (bench/config.lua 17% faster).
 - `state.decode` and `state.decodeAlloc` take a `lua.DecodeOptions` last; pass `.{}` for the old behavior.
 - A script that raises "not enough memory" itself now returns `error.Runtime`; `error.OutOfMemory` means an allocation failed.
@@ -52,5 +53,6 @@ All notable changes to lua are recorded here. The format follows
 
 ### Fixed
 
+- `string.dump` writes the same bytes as `luac` for a function with a call whose parentheses enclose 128 or more lines; before, its line information differed (the lines it decoded to did not).
 - `load` of a binary chunk with an instruction whose opcode is not one of Lua 5.5.1's fails with "bad binary format (invalid opcode)" instead of loading a function that crashes when called.
 - A Zig function that calls Lua with `state.call` no longer leaves a coroutine that fails inside that call with a corrupt stack for `debug.traceback`.

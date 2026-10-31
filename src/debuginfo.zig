@@ -278,7 +278,7 @@ pub fn traceback(w: *std.Io.Writer, t: *Thread, msg: ?[]const u8, level_in: i64)
         const src = if (p) |q| (if (q.source) |s| s.bytes() else "=?") else "=[C]";
         try w.writeAll("\n\t");
         try Thread.writeChunkId(w, src);
-        const line: ?u32 = if (p != null and f.flags.lua) p.?.lineAt(Thread.currentPc(p.?, f)) else null;
+        const line: ?i32 = if (p != null and f.flags.lua) p.?.lineAt(Thread.currentPc(p.?, f)) else null;
         if (line) |l| try w.print(":{d}: in ", .{l}) else try w.writeAll(": in ");
         if (funcName(t, i)) |n| {
             try w.print("{s} '{s}'", .{ n.kind, n.name });

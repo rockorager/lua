@@ -33,13 +33,16 @@ print(hex(string.dump(inner)))
 print(hex(string.dump(inner(1))))
 
 -- Line information: gaps past what a byte holds, more than 128 relative
--- entries in a row, and loops whose instructions move back to the 'for'.
+-- entries in a row, loops whose instructions move back to the 'for', and a
+-- call whose parentheses are 200 lines apart, which moves its CALL back
+-- from an absolute entry to a line a byte reaches.
 local gaps = "local x = 0\n" .. string.rep("x = x + 1 ", 300) .. "\n"
   .. string.rep("\n", 200) .. "for k, v in pairs({}) do\n"
   .. string.rep("x = x + k\n", 140) .. "end\n"
   .. "for i = 1, 2 do\n" .. string.rep("\n", 300) .. "x = x + i end\n"
   .. "local function g()\n" .. string.rep("\n", 150) .. "end\n"
   .. "print(\n" .. string.rep("x,\n", 135) .. "x)\n"
+  .. "x = g(" .. string.rep("\n", 200) .. ")\n"
   .. "return x"
 local lines = assert(load(gaps, "@gaps.lua"))
 print(digest(string.dump(lines)), digest(string.dump(lines, true)))

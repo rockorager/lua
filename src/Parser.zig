@@ -688,6 +688,7 @@ fn openFunc(ls: *Parser, fs: *FuncState, bl: *BlockCnt) void {
     fs.firstlabel = @intCast(ls.label.items.len);
     fs.f.source = ls.source;
     fs.f.maxstacksize = 2;
+    fs.previousline = @intCast(fs.f.linedefined);
     ls.enterBlock(fs, bl, 0);
 }
 
@@ -701,7 +702,8 @@ fn closeFunc(ls: *Parser) Error!void {
     std.debug.assert(fs.bl == null);
     try fs.finish();
     f.code = try fs.insts.toOwnedSlice(gpa);
-    f.lineinfo = try fs.lines.toOwnedSlice(gpa);
+    f.lineinfo = try fs.lineinfo.toOwnedSlice(gpa);
+    f.abslineinfo = try fs.abslineinfo.toOwnedSlice(gpa);
     f.k = try fs.ks.toOwnedSlice(gpa);
     try f.initSlots(gpa);
     f.p = try fs.protos.toOwnedSlice(gpa);
@@ -952,7 +954,7 @@ fn funcArgs(ls: *Parser, f: *ExpDesc) Error!void {
         nparams = fs.freereg - (base + 1);
     }
     f.* = .init(.call, try fs.codeAbc(.call, base, nparams + 1, 2));
-    fs.fixLine(line);
+    try fs.fixLine(line);
     fs.freereg = base + 1;
 }
 
@@ -1296,11 +1298,11 @@ fn forBody(ls: *Parser, base: i32, line: u32, nvars: i32, isgen: bool) Error!voi
     try ls.fixForJump(fs, prep, fs.getLabel(), false);
     if (isgen) {
         _ = try fs.codeAbc(.tforcall, base, 0, nvars);
-        fs.fixLine(line);
+        try fs.fixLine(line);
     }
     const endfor = try fs.codeABx(if (isgen) .tforloop else .forloop, base, 0);
     try ls.fixForJump(fs, endfor, prep + 1, true);
-    fs.fixLine(line);
+    try fs.fixLine(line);
 }
 
 fn forNum(ls: *Parser, varname: *String, line: u32) Error!void {
@@ -1517,7 +1519,7 @@ fn globalFunc(ls: *Parser, line: u32) Error!void {
     try ls.body(&b, false, ls.lx.line);
     try ls.checkGlobal(fname, line);
     try fs.storeVar(&v, &b);
-    fs.fixLine(line);
+    try fs.fixLine(line);
 }
 
 fn globalStatFunc(ls: *Parser, line: u32) Error!void {
@@ -1547,7 +1549,7 @@ fn funcStat(ls: *Parser, line: u32) Error!void {
     try ls.checkReadonly(&v);
     try ls.body(&b, ismethod, line);
     try ls.fs.?.storeVar(&v, &b);
-    ls.fs.?.fixLine(line);
+    try ls.fs.?.fixLine(line);
 }
 
 fn exprStat(ls: *Parser) Error!void {

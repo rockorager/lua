@@ -5,9 +5,10 @@
 //! the same source: the same constant folding, specialized opcodes
 //! (`ADDI`, `ADDK`, `EQK`, `GETFIELD`, ...), and jump threading.
 //!
-//! Line information is one absolute line per instruction (`Proto.lineinfo`),
-//! so PUC-Rio's relative and absolute line bookkeeping reduces to setting
-//! the last instruction's line.
+//! Line information is lcode.c's: a signed byte per instruction, the
+//! change from the previous instruction's line, and an absolute entry where
+//! the change does not fit or after `Proto.max_iwthabs` bytes in a row
+//! (`Proto.lineinfo`, `Proto.abslineinfo`).
 
 const std = @import("std");
 const Value = @import("Value.zig");
@@ -27,6 +28,9 @@ pub const Error = Parser.Error;
 
 /// The end of a jump list: an invalid address and an invalid link.
 pub const no_jump: i32 = -1;
+/// lcode.c's `LIMLINEDIFF`: the smallest line change saved as an absolute
+/// entry.
+const lim_line_diff = 0x80;
 /// A `TESTSET` with this destination produces no value.
 const no_reg: i32 = opcodes.max_a;
 /// The largest constant index an RK operand can hold.
@@ -231,7 +235,8 @@ pub const FuncState = struct {
     /// The innermost block.
     bl: ?*BlockCnt = null,
     insts: std.ArrayList(Instruction) = .empty,
-    lines: std.ArrayList(u32) = .empty,
+    lineinfo: std.ArrayList(i8) = .empty,
+    abslineinfo: std.ArrayList(Proto.AbsLineInfo) = .empty,
     ks: std.ArrayList(Value) = .empty,
     protos: std.ArrayList(*Proto) = .empty,
     locvars: std.ArrayList(Proto.LocVar) = .empty,
@@ -249,11 +254,16 @@ pub const FuncState = struct {
     freereg: i32 = 0,
     /// The function must close upvalues when returning.
     needclose: bool = false,
+    /// The last line saved in `lineinfo`.
+    previousline: i32 = 0,
+    /// Instructions since the last absolute line entry.
+    iwthabs: u8 = 0,
 
     pub fn deinit(fs: *FuncState) void {
         const gpa = fs.ls.gpa;
         fs.insts.deinit(gpa);
-        fs.lines.deinit(gpa);
+        fs.lineinfo.deinit(gpa);
+        fs.abslineinfo.deinit(gpa);
         fs.ks.deinit(gpa);
         fs.protos.deinit(gpa);
         fs.locvars.deinit(gpa);
@@ -436,18 +446,45 @@ pub const FuncState = struct {
         try fs.patchList(try fs.jump(), target);
     }
 
+    /// Saves the last instruction's line, `savelineinfo`: the change from
+    /// the line saved before, or an absolute entry when the change does
+    /// not fit in a byte or `max_iwthabs` changes came since the last one.
+    fn saveLineInfo(fs: *FuncState, line: u32) Error!void {
+        const l: i32 = @intCast(line);
+        var diff = l - fs.previousline;
+        if (@abs(diff) >= lim_line_diff or fs.iwthabs >= Proto.max_iwthabs) {
+            try fs.abslineinfo.append(fs.ls.gpa, .{ .pc = fs.pc() - 1, .line = l });
+            diff = Proto.abs_line_info;
+            fs.iwthabs = 1;
+        } else {
+            fs.iwthabs += 1;
+        }
+        try fs.lineinfo.append(fs.ls.gpa, @intCast(diff));
+        fs.previousline = l;
+    }
+
+    /// Takes back the last instruction's line, `removelastlineinfo`. An
+    /// absolute entry forces the next line saved to be absolute too.
+    fn removeLastLineInfo(fs: *FuncState) void {
+        const last = fs.lineinfo.pop().?;
+        if (last != Proto.abs_line_info) {
+            fs.previousline -= last;
+            fs.iwthabs -= 1;
+        } else {
+            fs.abslineinfo.items.len -= 1;
+            fs.iwthabs = Proto.max_iwthabs + 1;
+        }
+    }
+
     fn removeLastInstruction(fs: *FuncState) void {
+        fs.removeLastLineInfo();
         fs.insts.items.len -= 1;
-        fs.lines.items.len -= 1;
     }
 
     /// Emits `i` with the line of the last token read.
     pub fn code(fs: *FuncState, i: Instruction) Error!i32 {
-        const gpa = fs.ls.gpa;
-        try fs.insts.ensureUnusedCapacity(gpa, 1);
-        try fs.lines.ensureUnusedCapacity(gpa, 1);
-        fs.insts.appendAssumeCapacity(i);
-        fs.lines.appendAssumeCapacity(fs.ls.lastline);
+        try fs.insts.append(fs.ls.gpa, i);
+        try fs.saveLineInfo(fs.ls.lastline);
         return fs.pc() - 1;
     }
 
@@ -603,10 +640,10 @@ pub const FuncState = struct {
     /// the constant index of the name.
     pub fn codeCheckGlobal(fs: *FuncState, v: *ExpDesc, kidx: i32, line: u32) Error!void {
         _ = try fs.exp2anyreg(v);
-        fs.fixLine(line);
+        try fs.fixLine(line);
         const kk = if (kidx >= opcodes.max_bx) 0 else kidx + 1;
         _ = try fs.codeABx(.errnnil, v.info, kk);
-        fs.fixLine(line);
+        try fs.fixLine(line);
         fs.freeExp(v);
     }
 
@@ -990,7 +1027,7 @@ pub const FuncState = struct {
         fs.freeExp(e);
         e.info = try fs.codeAbc(o, 0, r, 0);
         e.k = .reloc;
-        fs.fixLine(line);
+        try fs.fixLine(line);
     }
 
     fn finishBinExpVal(
@@ -1009,9 +1046,9 @@ pub const FuncState = struct {
         fs.freeExps(e1, e2);
         e1.info = at;
         e1.k = .reloc;
-        fs.fixLine(line);
+        try fs.fixLine(line);
         _ = try fs.codeAbck(mmop, v1, v2, @intFromEnum(event), flip);
-        fs.fixLine(line);
+        try fs.fixLine(line);
     }
 
     fn codeBinExpVal(fs: *FuncState, opr: BinOpr, e1: *ExpDesc, e2: *ExpDesc, line: u32) Error!void {
@@ -1192,7 +1229,7 @@ pub const FuncState = struct {
         }
         _ = try fs.codeAbc(.concat, e1.info, 2, 0);
         fs.freeExp(e2);
-        fs.fixLine(line);
+        try fs.fixLine(line);
     }
 
     /// Finishes a binary operation once the second operand is read.
@@ -1251,9 +1288,10 @@ pub const FuncState = struct {
         }
     }
 
-    /// Sets the line of the last instruction.
-    pub fn fixLine(fs: *FuncState, line: u32) void {
-        fs.lines.items[fs.lines.items.len - 1] = line;
+    /// Changes the line of the last instruction, `luaK_fixline`.
+    pub fn fixLine(fs: *FuncState, line: u32) Error!void {
+        fs.removeLastLineInfo();
+        try fs.saveLineInfo(line);
     }
 
     /// Fills in the `NEWTABLE` at `at` and its `EXTRAARG` with the sizes.

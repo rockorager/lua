@@ -27,9 +27,16 @@ kslot: []u32 = &.{},
 /// Prototypes of the functions defined inside this one, for `CLOSURE`.
 p: []*Proto = &.{},
 upvalues: []UpvalDesc = &.{},
-/// The source line of each instruction (`lineinfo.len` is 0 or
-/// `code.len`). PUC-Rio's compressed encoding can replace it later.
-lineinfo: []u32 = &.{},
+/// The source lines, in lcode.c's encoding, which `string.dump` writes as
+/// is: for each instruction, its line minus the previous instruction's
+/// (the first's minus `linedefined`), or `abs_line_info` where
+/// `abslineinfo` holds the line. Empty without debug information;
+/// `lineAt` decodes it.
+lineinfo: []i8 = &.{},
+/// The absolute lines: an entry for each instruction whose change does
+/// not fit in a byte, and at least one every `max_iwthabs` instructions,
+/// so `lineAt` adds at most that many bytes.
+abslineinfo: []AbsLineInfo = &.{},
 locvars: []LocVar = &.{},
 /// The chunk name, as `load` received it.
 source: ?*String = null,
@@ -40,6 +47,18 @@ numparams: u8 = 0,
 flags: Flags = .{},
 /// Registers the function needs, parameters included.
 maxstacksize: u8 = 2,
+
+/// lobject.h's `AbsLineInfo`, in the layout binary chunks hold.
+pub const AbsLineInfo = extern struct {
+    pc: i32,
+    line: i32,
+};
+
+/// ldebug.h's `ABSLINEINFO`: a `lineinfo` byte that defers to an
+/// `abslineinfo` entry.
+pub const abs_line_info: i8 = -0x80;
+/// ldebug.h's `MAXIWTHABS`: the most relative entries in a row.
+pub const max_iwthabs = 128;
 
 pub const Flags = packed struct(u8) {
     /// Declared with `...`. Its first instruction is `VARARGPREP`, which
@@ -88,6 +107,7 @@ pub fn destroy(heap: *gc.Heap, p: *Proto) void {
     a.free(p.p);
     a.free(p.upvalues);
     a.free(p.lineinfo);
+    a.free(p.abslineinfo);
     a.free(p.locvars);
     a.destroy(p);
 }
@@ -95,8 +115,8 @@ pub fn destroy(heap: *gc.Heap, p: *Proto) void {
 /// The bytes the prototype holds, for the collector's pacing.
 pub fn byteSize(p: *const Proto) usize {
     return @sizeOf(Proto) + p.code.len * @sizeOf(u32) + p.k.len * @sizeOf(Value) + p.kslot.len * @sizeOf(u32) +
-        p.p.len * @sizeOf(*Proto) + p.upvalues.len * @sizeOf(UpvalDesc) + p.lineinfo.len * @sizeOf(u32) +
-        p.locvars.len * @sizeOf(LocVar);
+        p.p.len * @sizeOf(*Proto) + p.upvalues.len * @sizeOf(UpvalDesc) + p.lineinfo.len +
+        p.abslineinfo.len * @sizeOf(AbsLineInfo) + p.locvars.len * @sizeOf(LocVar);
 }
 
 /// Allocates `kslot` when the code reads or writes a global (`GETTABUP`,
@@ -112,9 +132,50 @@ pub fn initSlots(p: *Proto, gpa: std.mem.Allocator) error{OutOfMemory}!void {
     }
 }
 
-/// The source line of the instruction at `pc`, or null without line info.
-pub fn lineAt(p: *const Proto, pc: usize) ?u32 {
-    return if (pc < p.lineinfo.len) p.lineinfo[pc] else null;
+/// The source line of the instruction at `pc`, or null without line info,
+/// `luaG_getfuncline`: from the last absolute entry at or before `pc` (or
+/// `linedefined`), plus the changes after it. A loaded chunk's entries are
+/// not checked, so out-of-order ones give some line, never a read out of
+/// bounds.
+pub fn lineAt(p: *const Proto, pc: usize) ?i32 {
+    if (pc >= p.lineinfo.len) return null;
+    const abs = p.abslineinfo;
+    var line: i32 = @bitCast(p.linedefined);
+    var from: usize = 0;
+    if (abs.len > 0 and pc >= abs[0].pc) {
+        // An entry comes at least every `max_iwthabs` instructions, so
+        // this estimate is at or below the one wanted.
+        var i = @min(pc / max_iwthabs, abs.len) -| 1;
+        while (i + 1 < abs.len and pc >= abs[i + 1].pc) i += 1;
+        line = abs[i].line;
+        from = @intCast(@as(i64, @max(abs[i].pc, -1)) + 1);
+    }
+    if (from <= pc) {
+        for (p.lineinfo[from .. pc + 1]) |d| line +%= d;
+    }
+    return line;
+}
+
+/// Whether the instruction at `newpc` is on another line than the one at
+/// `oldpc`, which comes before it: ldebug.c's `changedline`, which adds
+/// the changes between them when they are close.
+pub fn changedLine(p: *const Proto, oldpc: usize, newpc: usize) bool {
+    if (p.lineinfo.len == 0) return false;
+    if (newpc < p.lineinfo.len and newpc - oldpc < max_iwthabs / 2) {
+        var delta: i32 = 0;
+        for (p.lineinfo[oldpc + 1 .. newpc + 1]) |d| {
+            if (d == abs_line_info) break;
+            delta += d;
+        } else return delta != 0;
+    }
+    return p.lineAt(oldpc) != p.lineAt(newpc);
+}
+
+/// The line of the instruction at `pc` given `line`, the previous one's:
+/// ldebug.c's `nextline`, for walking every instruction in order.
+pub fn nextLine(p: *const Proto, line: i32, pc: usize) i32 {
+    const d = p.lineinfo[pc];
+    return if (d != abs_line_info) line +% d else p.lineAt(pc).?;
 }
 
 /// A Lua function: a prototype and its upvalues, which trail the struct.

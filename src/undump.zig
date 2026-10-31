@@ -5,9 +5,9 @@
 //! operands; unlike it, it rejects an instruction whose opcode is not one
 //! of the set ("invalid opcode"), so the interpreter never dispatches one.
 //!
-//! Line information comes in as luac's relative bytes and absolute entries
-//! and is expanded to `Proto.lineinfo`'s one absolute line per instruction,
-//! as ldebug.c's `luaG_getfuncline` reads it.
+//! Line information is luac's relative bytes and absolute entries, which
+//! `Proto` holds as they come; like the reference, the loader does not
+//! check them, and `Proto.lineAt` reads any of them safely.
 
 const std = @import("std");
 const Proto = @import("Proto.zig");
@@ -211,15 +211,15 @@ const Loader = struct {
         const gpa = s.th.heap().allocator();
         const nlines = try s.int();
         const rel: []const i8 = @ptrCast(try s.block(nlines));
+        f.lineinfo = try gpa.dupe(i8, rel);
         const nabs = try s.int();
-        var abs: []align(1) const dump.AbsLineInfo = &.{};
         if (nabs > 0) {
             try s.alignTo(@sizeOf(i32));
-            try s.checkCount(nabs, @sizeOf(dump.AbsLineInfo));
-            abs = std.mem.bytesAsSlice(dump.AbsLineInfo, try s.block(nabs * @sizeOf(dump.AbsLineInfo)));
+            try s.checkCount(nabs, @sizeOf(Proto.AbsLineInfo));
+            const abs = try s.block(nabs * @sizeOf(Proto.AbsLineInfo));
+            f.abslineinfo = try gpa.alloc(Proto.AbsLineInfo, nabs);
+            @memcpy(std.mem.sliceAsBytes(f.abslineinfo), abs);
         }
-        f.lineinfo = try gpa.alloc(u32, nlines);
-        expandLines(f, rel, abs);
 
         const nloc = try s.int();
         try s.checkCount(nloc, 3);
@@ -238,25 +238,6 @@ const Loader = struct {
     }
 };
 
-/// `luaG_getfuncline` for every instruction: from the absolute entry at or
-/// before it (or `linedefined`), plus the relative bytes after that entry.
-fn expandLines(f: *Proto, rel: []const i8, abs: []align(1) const dump.AbsLineInfo) void {
-    var line: i32 = @bitCast(f.linedefined);
-    var next_abs: usize = 0;
-    for (f.lineinfo, 0..) |*out, pc| {
-        var base: ?dump.AbsLineInfo = null;
-        while (next_abs < abs.len and abs[next_abs].pc >= 0 and abs[next_abs].pc <= pc) : (next_abs += 1)
-            base = abs[next_abs];
-        if (base) |e| {
-            line = e.line;
-            for (rel[@intCast(e.pc + 1) .. pc + 1]) |d| line +%= d;
-        } else {
-            line +%= rel[pc];
-        }
-        out.* = @bitCast(line);
-    }
-}
-
 const testing = std.testing;
 const State = @import("State.zig");
 
@@ -265,6 +246,14 @@ fn dumpToOwned(f: *const Proto, strip: bool) ![]u8 {
     defer out.deinit();
     try dump.dump(testing.allocator, &out.writer, f, strip);
     return out.toOwnedSlice();
+}
+
+/// Decodes every instruction's line, as the debug library and hooks do.
+fn readLines(p: *const Proto) void {
+    for (0..p.code.len) |pc| {
+        _ = p.lineAt(pc);
+        if (pc > 0) _ = p.changedLine(pc - 1, pc);
+    }
 }
 
 fn expectFailure(th: *Thread, chunk: []const u8, msg: []const u8) !void {
@@ -281,7 +270,9 @@ test "luac's chunk loads and dumps back byte for byte" {
     const p = try undump(state.main, &chunk, "@golden.lua");
     try testing.expectEqualStrings("@golden.lua", p.source.?.bytes());
     // `TFORCALL` and `TFORLOOP` sit on the `for` line, between lines 133.
-    try testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1, 2, 3, 3, 3, 3, 133, 3, 3, 133, 134, 134 }, p.lineinfo);
+    const lines = [_]i32{ 1, 1, 1, 1, 2, 3, 3, 3, 3, 133, 3, 3, 133, 134, 134 };
+    try testing.expectEqual(lines.len, p.lineinfo.len);
+    for (lines, 0..) |line, pc| try testing.expectEqual(line, p.lineAt(pc).?);
     const again = try dumpToOwned(p, false);
     defer testing.allocator.free(again);
     try testing.expectEqualSlices(u8, &chunk, again);
@@ -331,7 +322,7 @@ test "bad chunks raise the reference's messages and never crash" {
         _ = try undump(th, &ok, "=c");
     }
     // Any single corrupted byte loads or fails cleanly, and whatever loads
-    // dumps again.
+    // dumps again and reads its lines.
     for (0..chunk.len) |at| {
         for ([_]u8{ 0x01, 0x40, 0x80, 0xff }) |flip| {
             var bad = chunk;
@@ -342,6 +333,8 @@ test "bad chunks raise the reference's messages and never crash" {
                 continue;
             };
             testing.allocator.free(try dumpToOwned(p, false));
+            readLines(p);
+            for (p.p) |q| readLines(q);
         }
     }
 }
