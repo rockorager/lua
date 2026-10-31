@@ -588,7 +588,9 @@ pub fn resize(t: *Table, heap: *gc.Heap, new_asize: u32, nhash: u32) error{OutOf
             @memcpy((t.array.? + 4)[0..keep], (old.array.? + 4)[0..keep]);
         }
         @memset((t.array.? + 4 + keep)[0 .. new_asize - keep], @intFromEnum(Tag.nil));
-        t.lenHint().* = if (old.asize > 0) @min(old.lenHint().*, new_asize) else 0;
+        // 5.5's initial hint, so `#` finds the reference's border in a
+        // table with holes.
+        t.lenHint().* = new_asize / 2;
     }
     // Array slots past the new size move to the hash part.
     if (new_asize < old.asize) {

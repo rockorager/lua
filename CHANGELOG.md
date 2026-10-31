@@ -59,3 +59,4 @@ All notable changes to lua are recorded here. The format follows
 - A Zig function that calls Lua with `state.call` no longer leaves a coroutine that fails inside that call with a corrupt stack for `debug.traceback`.
 - The result of an arithmetic, `__len`, or `__index` metamethod, and the error a `__close` handler raises inside `pcall`, are no longer lost (or written to freed memory) when the call grows the stack; `'0' + 1` could give `'0'`.
 - `setmetatable(t)` without a second argument raises "bad argument #2 to 'setmetatable' (nil or table expected, got no value)", as in the reference.
+- `#t` on a table with holes in its array part returns the border the reference returns.

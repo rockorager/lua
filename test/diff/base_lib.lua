@@ -42,3 +42,5 @@ print(pcall(setmetatable, 1), pcall(setmetatable, {}, 1))
 print(pcall(error)); print(xpcall(error, function(m) return type(m) end)); print(xpcall(error, function() end))
 -- An absent metatable is "no value", not nil (found by fuzzing).
 print(pcall(setmetatable, {}))
+-- `#` of a table with holes finds the reference's border (found by fuzzing).
+print(#{nil, 2, nil, 4}, #{nil, 2, 3, 4, 5, 6, 7, 8}, #{1, nil, 3, a = 1})
