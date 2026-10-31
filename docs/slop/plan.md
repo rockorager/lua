@@ -236,6 +236,16 @@ reference.
   (`results/vm-operands-20261030.md`, `vm-copies`, `vm-registers`.)
 - The interpreter loop's register allocation shifts other programs by ±5%
   with any edit; judge a change only by a full 10-round A/B.
+- Every stack slot the loop needs is in its frame, which every level of
+  native-to-Lua nesting repeats, and LLVM shares none of them. In the
+  loop and what inlines into it, slow paths return `Error!void` and
+  write results through pointers; no optional or error union with a
+  payload; an inline lookup builds its `Value` from one payload and one
+  tag variable rather than returning one of several values (the frame
+  went from 1504 bytes to 288 in wave 9). Check the frame with `objdump`
+  after a change. A `Value` written field by field and then copied whole
+  stalls store forwarding: return and store values field by field
+  (`results/stack-20261031.md`).
 - `ReleaseFast` builds are the ones measured. `ReleaseSafe` runs the suite too;
   it is 33% slower than ReleaseFast and still faster than the reference.
   Half of that and all of its extra peak memory is the standard allocator
@@ -286,7 +296,9 @@ mandelbrot), strings (concatenation, `string.format`, `gsub`), closures and
 upvalues, method calls through metatables, and coroutines. `just bench-compare`
 runs each on our binary and on reference Lua 5.5.1, interleaved and pinned to
 one core, and prints benchstat input: wall time, and each process's peak RSS
-(GNU time's `%M`) as the `peak-RSS-KiB` unit. Memory is a gate like time.
+(GNU time's `%M`, run under `taskset`: `ru_maxrss` survives exec, so over
+it taskset's 2.3 MiB floored every reading until wave 9) as the
+`peak-RSS-KiB` unit. Memory is a gate like time.
 Four programs are shaped like real workloads rather than one feature: a
 pure-Lua JSON encoder and decoder (`json`), templated HTML and text
 reports (`template`), a class-based simulation (`oop`), and a large
@@ -378,3 +390,25 @@ with `-Dc-api=true`. Owner of `src/capi/`, `include/`, `test/capi/`,
 thread), `Proto.zig` (`NativeClosure.cfn`), `State.zig` (5.5.1's
 registry layout), and `lib/package.zig` (`loadlib` and the C searchers
 call `capi/loadlib.zig`). Measurements in `results/c-api-20261031.md`.
+
+Wave 9: native stack and the loader's messages. The frames on the
+native call paths shrank (`runLoop` 1504 bytes to 288; per C level,
+`pcall` 1883 bytes to 533, the C API's C → Lua 1903 to 656), and "C
+stack overflow" counts native stack bytes as well as levels
+(`Thread.max_native_stack`, 192 KiB), so a 256 KiB host thread gets a
+Lua error on any script; release builds of `lua` drop Zig's segfault
+handler and its 256 KiB signal stack, which lowers the floor from 1480
+KiB to 1216 (`results/stack-20261031.md`). The binary loader checks in
+the reference's order (`dump.md`), and `bench-compare` reads peak RSS
+under `taskset`. The comparison with the reference at the end of wave 9
+is `results/bench-compare-wave9-20261031.md`: ReleaseFast 28.6% faster
+on the geomean with 44.1% lower peak RSS, ReleaseSafe 18.7% faster and
+36.3% lower; wave 7's −22.7% peak RSS was floored by taskset.
+
+Next, in another orb: leanness, that is binary size and resident code
+(our text is 1.3 MB resident against the reference's 300 KB), and the
+native call path (a call of an empty C function 17 ns against the
+reference's 12; `runLoop`'s remaining frame; the embedding API's
+`getGlobal` and `Ref` paths copy a `Value` built from fields whole,
+the store-forwarding stall wave 9 took out of `Table.get`, and half of
+`zig_calls_lua`'s time in the API arm).

@@ -216,8 +216,10 @@ Detail and raw output in `results/c-api-20261031.md`.
   Zig builds glibc-linked code position-independent, which costs the
   interpreter loop one register for its jump table base.
 - Peak RSS on bench/: −4.9% geomean against the reference (default:
-  −37.8%). The floor, `lua -e ''`, is 3.02 MiB against the reference's
-  2.62 and the default's 1.49: dynamic glibc and ld.so map ~1.3 MiB the
+  −37.8%; both read through `taskset`, which floored small programs
+  at 2.3 MiB until wave 9). The floor, `lua -e ''`, is 3.02 MiB against
+  the reference's 2.62 and the default's 1.49 (wave 9, without Zig's
+  256 KiB signal stack: 2.69 and 1.22): dynamic glibc and ld.so map ~1.3 MiB the
   static build does not, and our executable's text (1.3 MB) is resident
   where the reference's is 300 KB. Our allocators stay: glibc malloc
   saves 32 KiB at the floor and costs 10 to 60% peak RSS on the
@@ -226,7 +228,8 @@ Detail and raw output in `results/c-api-20261031.md`.
   5 ns is the trampoline; the rest is our native call path against the
   reference's `precallC`. C → `lua_call` → Lua: 63 ns against 33.
 - Native stack per C → `lua_call` → Lua level: 1903 bytes against 351;
-  `runLoop`'s frame is 1432 of it, the trampoline ~160.
+  `runLoop`'s frame is 1432 of it, the trampoline ~160. Wave 9: 656,
+  with `runLoop`'s frame 272 (`results/stack-20261031.md`).
 - Startup: 1.29 ms against the reference's 1.34 and the default's 0.80.
 - lua-cjson and lpeg workloads run ~9% faster than on the reference,
   with 0.4 to 0.9 MiB more peak memory.

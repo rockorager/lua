@@ -105,17 +105,17 @@ Not fixed, by design or for size:
   loop (decision 4), so `__index`/`__eq`/`__concat` functions recursing
   without end exhaust the Lua stack ("stack overflow") instead of 200 C
   levels ("C stack overflow").
-- **Native stack use.** At the 200-level C limit ours needs 2 to 5 times
-  the reference's native stack: measured with `ulimit -s`, `pcall`
-  recursion 439 KiB against 175, `gsub` callbacks 839 against 431,
-  `table.sort` comparators 703 against 127, nested `__close` 375 against
-  87; the parser at its nesting limit 151 to 167 KiB against 79 to 95.
-  The main thread's 8 MiB and Zig's 16 MiB thread default are far
-  above that, but a host thread with 256 KiB crashes (SIGSEGV) on a
-  hostile script instead of raising "C stack overflow" (`fuzz repro
-grammar FILE --stack 256` reproduces). Shrinking the frames on the
-  native call path, or a C-call limit scaled to the stack, would fix it;
-  until then hosts should give a state 1 MiB of stack.
+- **Native stack use.** Wave 9 cut the frames on the native call paths
+  and added a byte limit to the 200-level one (`results/stack-20261031.md`):
+  "C stack overflow" fires when nested native-to-Lua calls or the
+  parser's nesting use 192 KiB below the host's call into Lua, so every
+  hostile script raises a Lua error on a 256 KiB host thread (`fuzz repro
+grammar FILE --stack 256`), down to 208 KiB. At the level limit
+  `pcall` needs 136 KiB against the reference's 182, `table.sort` 180
+  against 128, nested `__close` 116 against 84, the parser 57 to 165
+  against 49 to 124. The divergence left: `gsub` callbacks cost about
+  2.6 KB a level, so the byte limit stops them at 74 levels where the
+  reference reaches 197 with 431 KiB of stack.
 
 The known limit, recorded apart (`binary` writes them to `known/`):
 corrupted chunks that load and then crash or hang when run. See
