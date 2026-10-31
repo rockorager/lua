@@ -77,7 +77,7 @@ const Interp = struct {
         @memmove(th.stack[func + 1 .. th.top + 1], th.stack[func..th.top]);
         th.stack[func] = .native(&msghandler);
         th.top += 1;
-        const ok = vm.pcallMsgh(th, func + 1, nres, func);
+        const ok = vm.pcallMsgh(th, func + 1, nres, func) == .ok;
         @memmove(th.stack[func .. th.top - 1], th.stack[func + 1 .. th.top]);
         th.top -= 1;
         return ok;

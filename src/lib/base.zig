@@ -788,8 +788,8 @@ fn pcall(th: *Thread, base: u32) Error!u32 {
     @memmove(th.stack[base + 1 .. th.top + 1], th.stack[base..th.top]);
     th.stack[base] = .true;
     th.top += 1;
-    const ok = try vm.pcallk(th, base + 1, -1, 0, 0, &finishPcall);
-    return finishPcall(th, base, if (ok) .ok else .err, 0);
+    const status = try vm.pcallk(th, base + 1, -1, 0, 0, &finishPcall);
+    return finishPcall(th, base, if (status == .ok) .ok else .err, 0);
 }
 
 fn xpcall(th: *Thread, base: u32) Error!u32 {
@@ -804,8 +804,8 @@ fn xpcall(th: *Thread, base: u32) Error!u32 {
     th.stack[base] = handler;
     th.stack[base + 1] = .true;
     th.top = base + n + 1;
-    const ok = try vm.pcallk(th, base + 2, -1, base, 1, &finishPcall);
-    return finishPcall(th, base, if (ok) .ok else .err, 1);
+    const status = try vm.pcallk(th, base + 2, -1, base, 1, &finishPcall);
+    return finishPcall(th, base, if (status == .ok) .ok else .err, 1);
 }
 
 fn tostring(th: *Thread, base: u32) Error!u32 {

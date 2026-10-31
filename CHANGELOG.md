@@ -31,6 +31,7 @@ All notable changes to lua are recorded here. The format follows
 - Reading and writing a global variable (a field of `_ENV` with a constant name) goes through a per-function cache of where the name sits in the table, so code written with globals runs faster (bench/globals.lua 9% faster).
 - `auxlib.Buffer` is declared `var b: auxlib.Buffer = .init(state)` instead of `undefined` followed by `b.init(state)`, so ReleaseSafe builds no longer clear 1 KiB on every `string.format`, `table.concat`, `gsub`, `string.pack`, or `string.dump` call (format 21–28% faster in ReleaseSafe).
 - ReleaseSafe builds no longer check each instruction's opcode before dispatching it, since the compiler and the binary loader only produce valid ones: dispatch-heavy programs run 5–12% faster in ReleaseSafe.
+- A script that raises "not enough memory" itself now returns `error.Runtime`; `error.OutOfMemory` means an allocation failed.
 
 ### Fixed
 

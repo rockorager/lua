@@ -110,29 +110,44 @@ pub fn callk(th: *Thread, func: u32, nresults: i16, ctx: u32, k: KFn) Error!void
     return callYieldable(th, func, nresults);
 }
 
+/// How a protected call ended, the reference's `LUA_OK`, `LUA_ERRRUN`,
+/// `LUA_ERRMEM`, and `LUA_ERRERR`: by the kind of failure, not by the
+/// error object, so a Lua `error("not enough memory")` is `.runtime`.
+pub const Status = enum {
+    ok,
+    /// An error raised by code or by the engine.
+    runtime,
+    /// An allocation failed; the error object is the fixed "not enough
+    /// memory" string, and no message handler ran.
+    memory,
+    /// "error in error handling": the message handler failed, or handling
+    /// an error kept nesting.
+    handler,
+};
+
 /// `call` in protected mode. On an error the stack is unwound to `func`,
 /// pending to-be-closed variables are closed, the error object is left at
 /// `func`, `top` is `func + 1`, and the result is false. Allocation failure
-/// leaves the "not enough memory" string.
+/// leaves the "not enough memory" string. `pcallMsgh` says which error.
 pub fn pcall(th: *Thread, func: u32, nresults: i16) bool {
-    return pcallMsgh(th, func, nresults, 0);
+    return pcallMsgh(th, func, nresults, 0) == .ok;
 }
 
-/// `pcall` with a message handler (`lua_pcall`): `msgh` is the stack index
-/// of a function, or 0 for none. An error raised inside the call (but not
-/// a memory error) is passed to the handler before the stack unwinds, and
-/// the handler's result becomes the error object.
-pub fn pcallMsgh(th: *Thread, func: u32, nresults: i16, msgh: u32) bool {
+/// `pcall` with a message handler and its status (`lua_pcall`): `msgh` is
+/// the stack index of a function, or 0 for none. An error raised inside
+/// the call (but not a memory error) is passed to the handler before the
+/// stack unwinds, and the handler's result becomes the error object.
+pub fn pcallMsgh(th: *Thread, func: u32, nresults: i16, msgh: u32) Status {
     // `closeSelf` refuses to unwind past this call, which cannot pass the
     // unwinding on, so nothing else gets through.
     th.npcall += 1;
     defer th.npcall -= 1;
-    return protectedCall(th, func, nresults, msgh) catch false;
+    return protectedCall(th, func, nresults, msgh) catch .runtime;
 }
 
 /// `pcallMsgh`, except that the unwinding `closeSelf` starts passes
 /// through as `error.LuaError`.
-fn protectedCall(th: *Thread, func: u32, nresults: i16, msgh: u32) Error!bool {
+fn protectedCall(th: *Thread, func: u32, nresults: i16, msgh: u32) Error!Status {
     const frames = th.frames.items.len;
     const old_errfunc = th.errfunc;
     const old_allowhook = th.allowhook;
@@ -140,26 +155,27 @@ fn protectedCall(th: *Thread, func: u32, nresults: i16, msgh: u32) Error!bool {
     defer th.errfunc = old_errfunc;
     call(th, func, nresults) catch |e| {
         if (th.closed_self) return e;
+        var status = errorStatus(th, e);
         const err = errorObject(th, e);
         th.frames.items.len = frames;
         th.allowhook = old_allowhook;
-        th.stack[func] = closeProtected(th, func, err) orelse err;
+        th.stack[func] = closeProtected(th, func, err, &status) orelse err;
         if (th.closed_self) return error.LuaError;
         th.top = func + 1;
         th.shrinkStack();
-        return false;
+        return status;
     };
-    return true;
+    return .ok;
 }
 
 /// `pcallMsgh` from a native function that can be suspended inside the
-/// call (`lua_pcallk`). Returns true when the call succeeded and false
-/// after an error, which then sits at `func` as for `pcall`. Inside a
+/// call (`lua_pcallk`). Returns the status; after an error the error
+/// object sits at `func` as for `pcall`. Inside a
 /// coroutine it may instead return `error.LuaError`, for a yield or for an
 /// error; propagate it with `try`. The coroutine then finishes the call
 /// later, and calls `k` with `ctx` and status `.yield` (success) or `.err`
 /// (the error object on top) in place of the rest of the native.
-pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn) Error!bool {
+pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn) Error!Status {
     if (th.nny > 0) return protectedCall(th, func, nresults, msgh);
     const idx = th.frames.items.len - 1;
     {
@@ -177,7 +193,7 @@ pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn
     const f = &th.frames.items[idx];
     f.flags.ypcall = false;
     th.errfunc = f.old_errfunc;
-    return true;
+    return .ok;
 }
 
 /// `luaD_call`: a call from Zig that may yield if the thread can.
@@ -212,14 +228,23 @@ fn nativeOverflow(th: *Thread) Error!void {
 }
 
 /// The error object a failed call left: `Thread.err`, or the memory error
-/// message. Clears `Thread.err`.
+/// message. Clears `Thread.err`; take `errorStatus` first.
 fn errorObject(th: *Thread, e: Error) Value {
     const v: Value = switch (e) {
         error.LuaError => th.err,
         error.OutOfMemory => .string(th.state.memerr),
     };
     th.err = .nil;
+    th.errerr = false;
     return v;
+}
+
+/// Which kind of error a failed call raised.
+fn errorStatus(th: *const Thread, e: Error) Status {
+    return switch (e) {
+        error.LuaError => if (th.errerr) .handler else .runtime,
+        error.OutOfMemory => .memory,
+    };
 }
 
 /// Calls the running protected call's message handler on `Thread.err`
@@ -411,6 +436,8 @@ pub const Resumed = struct {
     /// Values on top of the coroutine's stack: the body's results, the
     /// yielded values, or 1, the error object.
     nres: u32,
+    /// With `.err`, which kind (`lua_resume`'s error statuses).
+    err: Status = .ok,
 };
 
 /// Starts or continues coroutine `co` with the `nargs` values on top of
@@ -440,14 +467,14 @@ pub fn resumeThread(co: *Thread, from: ?*Thread, nargs: u32) Error!Resumed {
     // each such call and go on (`precover`).
     while (outcome == .err and !co.closed_self) {
         const level = findPcall(co) orelse break;
-        recoverAt(co, level, outcome.err);
+        recoverAt(co, level, outcome.err.v);
         co.native_calls = base_calls;
         co.nny = 0;
         outcome = outcomeOf(co, unroll(co));
     }
     if (co.closed_self) {
         co.closed_self = false;
-        outcome = if (co.top == 2) .{ .err = co.stack[1] } else .ok;
+        outcome = if (co.top == 2) .{ .err = .{ .v = co.stack[1], .status = .runtime } } else .ok;
     }
     switch (outcome) {
         .ok => return .{ .status = .ok, .nres = co.top - 1 },
@@ -457,20 +484,21 @@ pub fn resumeThread(co: *Thread, from: ?*Thread, nargs: u32) Error!Resumed {
             const f = co.frame();
             if (f.flags.lua and co.top < f.top) co.top = f.top;
             try co.ensureStack(2);
-            co.push(e);
-            co.push(e);
+            co.push(e.v);
+            co.push(e.v);
             f.top = co.top;
-            return .{ .status = .err, .nres = 1 };
+            return .{ .status = .err, .nres = 1, .err = e.status };
         },
     }
 }
 
-const Outcome = union(enum) { ok, yield, err: Value };
+const Outcome = union(enum) { ok, yield, err: struct { v: Value, status: Status } };
 
 fn outcomeOf(co: *Thread, r: Error!void) Outcome {
     r catch |e| {
         if (e == error.LuaError and co.status == .yield) return .yield;
-        return .{ .err = errorObject(co, e) };
+        const status = errorStatus(co, e);
+        return .{ .err = .{ .v = errorObject(co, e), .status = status } };
     };
     return .ok;
 }
@@ -478,7 +506,7 @@ fn outcomeOf(co: *Thread, r: Error!void) Outcome {
 fn resumeError(co: *Thread, msg: []const u8, nargs: u32) Error!Resumed {
     co.top -= nargs;
     co.push(.string(try co.state.newString(msg)));
-    return .{ .status = .err, .nres = 1 };
+    return .{ .status = .err, .nres = 1, .err = .runtime };
 }
 
 fn resumeBody(co: *Thread, nargs: u32) Error!void {
@@ -581,7 +609,7 @@ pub fn closeThread(co: *Thread, from: ?*Thread) bool {
     co.native_calls = if (from) |f| f.native_calls else 0;
     const err: ?Value = if (co.status == .dead) co.stack[co.top - 1] else null;
     co.resetFrames();
-    const result = closeProtected(co, 1, err);
+    const result = closeProtected(co, 1, err, null);
     // Closing from inside a handler ended this close too, unless this is
     // that inner close itself.
     if (from != co) co.closed_self = false;
@@ -606,7 +634,7 @@ pub fn closeState(state: *State) void {
     const th = state.main;
     th.resetFrames();
     th.native_calls = 0;
-    _ = closeProtected(th, 1, null);
+    _ = closeProtected(th, 1, null, null);
     gc.callAllFinalizers(state);
 }
 
@@ -679,9 +707,10 @@ noinline fn closeLevel(th: *Thread, level: u32, mode: CloseMode, comptime yielda
 }
 
 /// Closes from `level` in protected mode after an error, `luaD_closeprotected`:
-/// an error in a `__close` handler replaces the error object and closing
-/// goes on. Returns the final error object, or null when there was none.
-fn closeProtected(th: *Thread, level: u32, err_in: ?Value) ?Value {
+/// an error in a `__close` handler replaces the error object, and its kind
+/// `status` when given, and closing goes on. Returns the final error
+/// object, or null when there was none.
+fn closeProtected(th: *Thread, level: u32, err_in: ?Value, status: ?*Status) ?Value {
     var err = err_in;
     const frames = th.frames.items.len;
     const old_allowhook = th.allowhook;
@@ -690,6 +719,7 @@ fn closeProtected(th: *Thread, level: u32, err_in: ?Value) ?Value {
         closeLevel(th, level, mode, false) catch |e| {
             // `closeSelf` from a handler closed the rest and left its result.
             if (th.closed_self) return if (th.top == 2) th.stack[1] else null;
+            if (status) |p| p.* = errorStatus(th, e);
             err = errorObject(th, e);
             th.frames.items.len = frames;
             th.allowhook = old_allowhook;
@@ -3218,6 +3248,43 @@ test "runtime errors carry position and unwind to pcall" {
     th.push(.luaClosure(try mainClosure(state, r)));
     try testing.expect(!pcall(th, func, -1));
     try testing.expectEqualStrings("?:?: attempt to call a nil value", th.stack[func].asString().bytes());
+}
+
+fn raiseMemoryMessage(th: *Thread, _: u32) Error!u32 {
+    return th.throw(.string(th.state.memerr));
+}
+
+fn failAllocation(_: *Thread, _: u32) Error!u32 {
+    return error.OutOfMemory;
+}
+
+fn raiseAgain(th: *Thread, b: u32) Error!u32 {
+    return th.throw(th.stack[b]);
+}
+
+test "a protected call's status says which kind of error ended it" {
+    const state = try newState(false);
+    defer state.destroy();
+    const th = state.main;
+    const func = th.top;
+    try th.ensureStack(3);
+    // A raised "not enough memory" is an ordinary error; an allocation
+    // failure is a memory error, with the same object.
+    th.push(.native(&raiseMemoryMessage));
+    try testing.expectEqual(Status.runtime, pcallMsgh(th, func, 0, 0));
+    th.top = func;
+    th.push(.native(&failAllocation));
+    try testing.expectEqual(Status.memory, pcallMsgh(th, func, 0, 0));
+    try testing.expectEqual(state.memerr, th.stack[func].asString());
+    // A message handler that raises again nests until the engine gives up.
+    th.top = func;
+    th.push(.native(&raiseAgain));
+    th.push(.native(&raiseMemoryMessage));
+    try testing.expectEqual(Status.handler, pcallMsgh(th, func + 1, 0, func));
+    try testing.expectEqualStrings("error in error handling", th.stack[func + 1].asString().bytes());
+    th.top = func;
+    th.push(.native(&raiseMemoryMessage));
+    try testing.expectEqual(Status.runtime, pcallMsgh(th, func, 0, 0));
 }
 
 test "Lua metamethods finish their instructions: __index, __add, __lt" {

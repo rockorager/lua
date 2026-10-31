@@ -340,7 +340,8 @@ pub const State = opaque {
             const func = th.top;
             try pushCall(th, f, args);
             extra.trace.clearRetainingCapacity();
-            if (!vm.pcallMsgh(th, func, nres, if (extra.traceback) bottom else 0)) return protectedError(th, func);
+            const status = vm.pcallMsgh(th, func, nres, if (extra.traceback) bottom else 0);
+            if (status != .ok) return protectedError(th, func, status);
             return results(R, th, func);
         }
         const func = th.top;
@@ -631,17 +632,14 @@ fn fieldSlow(comptime T: type, th: *Thread, k: IValue, v: IValue) Error!T {
 /// handler's slot or 0. A failure leaves the error object in `th.err`.
 fn protectedCall(th: *Thread, func: u32, nres: i16, msgh: u32) Error!void {
     extraOf(th.state).trace.clearRetainingCapacity();
-    if (vm.pcallMsgh(th, func, nres, msgh)) return;
-    return protectedError(th, func);
+    const status = vm.pcallMsgh(th, func, nres, msgh);
+    if (status != .ok) return protectedError(th, func, status);
 }
 
-fn protectedError(th: *Thread, func: u32) Error {
+fn protectedError(th: *Thread, func: u32, status: vm.Status) Error {
     @branchHint(.cold);
-    const err = th.stack[func];
-    th.err = err;
-    // `pcall` leaves the fixed memory-error string for allocation failure.
-    if (err.isString() and err.asString() == th.state.memerr) return error.OutOfMemory;
-    return error.Runtime;
+    th.err = th.stack[func];
+    return if (status == .memory) error.OutOfMemory else error.Runtime;
 }
 
 /// The top level's message handler: records the message and a traceback

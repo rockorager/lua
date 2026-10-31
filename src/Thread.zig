@@ -54,6 +54,10 @@ errfunc: u32 = 0,
 closed_self: bool = false,
 /// `vm.pcallMsgh` calls in progress, which catch every error.
 npcall: u16 = 0,
+/// Set while the error unwinding is "error in error handling", so the
+/// protected call that catches it reports `vm.Status.handler`
+/// (`LUA_ERRERR`); every other raise clears it.
+errerr: bool = false,
 /// The debug hook (`lua_Hook`), called for the events in `hookmask`.
 hook: ?Hook = null,
 /// The events the hook gets, `HookMask` bits; 0 when there is no hook.
@@ -330,6 +334,7 @@ pub fn resetFrames(th: *Thread) void {
 /// object becomes "<no error object>", as `luaG_errormsg` does.
 pub fn throw(th: *Thread, v: Value) Error {
     th.err = v;
+    th.errerr = false;
     if (th.errfunc != 0) try vm.callMessageHandler(th);
     if (th.err.isNil()) th.err = .string(try th.state.newString("<no error object>"));
     return error.LuaError;
@@ -340,6 +345,7 @@ pub fn throw(th: *Thread, v: Value) Error {
 /// binary chunks, unreadable files), which no handler sees.
 pub fn throwRaw(th: *Thread, v: Value) Error {
     th.err = v;
+    th.errerr = false;
     return error.LuaError;
 }
 
@@ -347,6 +353,7 @@ pub fn throwRaw(th: *Thread, v: Value) Error {
 /// stack overflow while handling one, or runaway nesting of handlers.
 pub fn errorInErrorHandling(th: *Thread) Error {
     th.err = .string(try th.state.newString("error in error handling"));
+    th.errerr = true;
     return error.LuaError;
 }
 

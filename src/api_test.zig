@@ -92,6 +92,9 @@ test "errors come back as Zig errors with the message and a traceback" {
     try testing.expectEqualStrings("(error object is a table value)", state.errorMessage());
     try testing.expectEqual(42, try state.getField(i64, state.errorValue(), "code"));
 
+    // The kind of error comes from the engine, not from the message.
+    try expectRuntime(state, "not enough memory", state.doString(void, "error('not enough memory', 0)", .{}));
+
     // The state is usable after every error, and its stack is where it was.
     const th: *lua.internal.Thread = @ptrCast(@alignCast(state));
     try testing.expectEqual(1, th.top);
