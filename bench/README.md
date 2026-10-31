@@ -33,6 +33,8 @@ Each program is plain Lua 5.5 with no modules. It takes one size argument, `lua 
 | `ref`  | the dev shell's `lua`: reference C Lua 5.5.1 from nixpkgs |
 | `ours` | `zig-out/bin/lua` from `zig build -Doptimize=ReleaseFast` |
 
+`just optimize=ReleaseSafe bench-compare` builds our arm in another mode. Several modes, as in `just optimize="ReleaseFast ReleaseSafe" bench-compare`, give one arm each, named `ours-ReleaseFast` and `ours-ReleaseSafe`.
+
 Until `build.zig` installs `zig-out/bin/lua`, `just bench-compare` says so and times the reference alone.
 
 ## Method

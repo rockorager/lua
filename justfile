@@ -163,7 +163,11 @@ diff *FILES:
     done
     [ ${#failed[@]} -eq 0 ]
 
-[doc("Time every bench/ program, or only PROGRAMS, on our zig-out/bin/lua (ReleaseFast) and the reference lua: interleaved rounds on one core, wall time and peak RSS per run, checksums checked, then benchstat. The numbers are not claims")]
+# The build modes `just bench-compare` times our lua in, one arm each:
+# `just optimize=ReleaseSafe bench-compare`, or "ReleaseFast ReleaseSafe".
+optimize := "ReleaseFast"
+
+[doc("Time every bench/ program, or only PROGRAMS, on our lua (built in each of `optimize`'s modes, ReleaseFast by default) and the reference lua: interleaved rounds on one core, wall time and peak RSS per run, checksums checked, then benchstat. The numbers are not claims")]
 [group("bench")]
 bench-compare ROUNDS="10" *PROGRAMS:
     #!/usr/bin/env bash
@@ -172,14 +176,22 @@ bench-compare ROUNDS="10" *PROGRAMS:
     rm -rf "$out" && mkdir -p "$out/stdout"
     arms=(ref)
     declare -A bin=([ref]="$(command -v lua)")
-    rm -f zig-out/bin/lua
-    zig build -Doptimize=ReleaseFast
-    if [ -x zig-out/bin/lua ]; then
-        arms+=(ours)
-        bin[ours]=$PWD/zig-out/bin/lua
-    else
-        echo "skipping our arm: build.zig does not install zig-out/bin/lua yet, so this times the reference alone"
-    fi
+    # One mode is the arm `ours`; several are `ours-<mode>` each, built
+    # into a copy so every arm keeps its binary.
+    modes=({{ optimize }})
+    for mode in "${modes[@]}"; do
+        rm -f zig-out/bin/lua
+        zig build -Doptimize="$mode"
+        if [ ! -x zig-out/bin/lua ]; then
+            echo "skipping our arm: build.zig does not install zig-out/bin/lua yet, so this times the reference alone"
+            break
+        fi
+        arm=ours
+        if [ ${#modes[@]} -gt 1 ]; then arm=ours-$mode; fi
+        cp zig-out/bin/lua "$out/lua-$mode"
+        arms+=("$arm")
+        bin[$arm]=$PWD/$out/lua-$mode
+    done
     programs=({{ PROGRAMS }})
     if [ ${#programs[@]} -eq 0 ]; then
         programs=($(cd bench && ls -- *.lua | sed 's/\.lua$//'))
