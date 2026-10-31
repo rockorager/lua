@@ -99,6 +99,12 @@ static int t_settable (lua_State *L) {
   return 0;
 }
 
+static int t_rawset (lua_State *L) {
+  lua_settop(L, 3);
+  lua_rawset(L, 1);
+  return 0;
+}
+
 static int t_arith (lua_State *L) {
   lua_settop(L, 2);
   lua_arith(L, LUA_OPADD);
@@ -589,6 +595,7 @@ static const luaL_Reg funcs[] = {
   {"checkopt", t_checkopt},
   {"gettable", t_gettable},
   {"settable", t_settable},
+  {"rawset", t_rawset},
   {"arith", t_arith},
   {"unm", t_unm},
   {"compare", t_compare},

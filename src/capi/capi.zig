@@ -878,8 +878,8 @@ pub fn luaSeti(L: *lua_State, idx: c_int, n: lua_Integer) callconv(.c) void {
 fn rawSet(th: *Thread, t: *Table, k: Value, v: Value) void {
     t.set(th.heap(), k, v) catch |e| switch (e) {
         error.OutOfMemory => throw(th, error.OutOfMemory),
-        error.IndexIsNil => throw(th, th.runError("index is nil", .{})),
-        error.IndexIsNaN => throw(th, th.runError("index is NaN", .{})),
+        error.IndexIsNil => throw(th, th.runError("table index is nil", .{})),
+        error.IndexIsNaN => throw(th, th.runError("table index is NaN", .{})),
     };
 }
 
