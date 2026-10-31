@@ -61,6 +61,7 @@ test {
     testing.refAllDecls(@This());
     testing.refAllDecls(internal);
     if (lua_options.c_api) _ = capi;
+    if (lua_options.c_api) _ = @import("capi/jmp.zig");
     _ = @import("api_test.zig");
     _ = @import("Lexer.zig");
     _ = @import("number.zig");

@@ -68,7 +68,7 @@ pub fn lookForFunc(th: *Thread, path_in: []const u8, sym_in: []const u8) Error!L
     const f = @call(.never_tail, std.c.dlsym, .{ handle, buf[0..sym.len :0].ptr }) orelse return .{ .init = dlerror() };
     // Not `lua_pushcclosure`: a C API function raises by jumping to the
     // innermost C function, and this runs inside a Zig one.
-    return .{ .ok = try capi.lightCFunction(th, @ptrCast(f)) };
+    return .{ .ok = try capi.lightCFunction(th, @ptrCast(@alignCast(f))) };
 }
 
 /// `loadfunc`: module `modname`'s open function in library `filename`.

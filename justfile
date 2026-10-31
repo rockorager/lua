@@ -163,17 +163,39 @@ diff *FILES:
     done
     [ ${#failed[@]} -eq 0 ]
 
-[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, io handles shared with C (stream.c, luaposix's posix.stdio), libraries closed with the state (unload.c), the own tests of lpeg, lua-cjson, and luafilesystem, and the C-API build's io and os on files.lua and test/diff")]
+[doc("The C API (built with -Dc-api=true): C modules built against zig-out/include run on our lua and on the reference, and must print the same: the suite's libs/ under attrib.lua with _port off, test/capi/capitest.c's errors and continuations, io handles shared with C (stream.c, luaposix's posix.stdio), libraries closed with the state (unload.c), the own tests of lpeg, lua-cjson, and luafilesystem, and the C-API build's io and os on files.lua and test/diff. With TARGET (aarch64-linux-gnu), the same cross-built and run under qemu-user against the reference built for TARGET")]
 [group("test")]
-capi-test:
+capi-test TARGET="":
     #!/usr/bin/env bash
     set -euo pipefail
-    zig build -Dc-api=true -Doptimize=ReleaseSafe
-    ours=$PWD/zig-out/bin/lua
-    ref=$(command -v lua)
-    inc=$PWD/zig-out/include
-    out=$PWD/zig-out/capi
+    target="{{ TARGET }}"
+    out=$PWD/zig-out/capi${target:+-$target}
     rm -rf "$out" && mkdir -p "$out"
+    if [ -z "$target" ]; then
+        zig build -Dc-api=true -Doptimize=ReleaseSafe
+        ours=$PWD/zig-out/bin/lua
+        ref=$(command -v lua)
+        inc=$PWD/zig-out/include
+        cc=(cc)
+    else
+        # Another Linux target: our lua and the modules cross-built, and both
+        # interpreters run under qemu-user, the reference as nixpkgs builds
+        # it for that machine, fetched from the flake's nixpkgs.
+        zig build -Dc-api=true -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$out/zig"
+        arch=${target%%-*}
+        pkg() { nix build --no-link --print-out-paths --inputs-from . "nixpkgs#$1"; }
+        qemu=$(pkg qemu-user)/bin/qemu-$arch
+        mkdir -p "$out/root" && ln -s "$(pkg "legacyPackages.$arch-linux.glibc^out")/lib" "$out/root/lib"
+        reflua=$(pkg "legacyPackages.$arch-linux.lua5_5")/bin/lua
+        # argv[0] is the wrapper's path, which `run` masks.
+        printf '#!/bin/sh\nexec %s -L %s -0 "$0" %s "$@"\n' "$qemu" "$out/root" "$out/zig/bin/lua" > "$out/ours"
+        printf '#!/bin/sh\nexec %s -0 "$0" %s "$@"\n' "$qemu" "$reflua" > "$out/ref"
+        chmod +x "$out/ours" "$out/ref"
+        ours=$out/ours
+        ref=$out/ref
+        inc=$out/zig/include
+        cc=(zig cc -target "$target")
+    fi
     cflags=(-Wall -O2 "-I$inc" -fPIC -shared)
     failed=()
     # run NAME DIR FILTER CMD...: CMD on both interpreters ($LUA in it),
@@ -201,44 +223,51 @@ capi-test:
     s=$out/suite
     mkdir -p "$s/libs/P1"
     cp test/lua-5.5.1-tests/attrib.lua "$s/"
-    for lib in lib1 lib11 lib2 lib21; do cc "${cflags[@]}" -o "$s/libs/$lib.so" "test/lua-5.5.1-tests/libs/$lib.c"; done
-    cc "${cflags[@]}" -o "$s/libs/lib2-v2.so" test/lua-5.5.1-tests/libs/lib22.c
+    for lib in lib1 lib11 lib2 lib21; do "${cc[@]}" "${cflags[@]}" -o "$s/libs/$lib.so" "test/lua-5.5.1-tests/libs/$lib.c"; done
+    "${cc[@]}" "${cflags[@]}" -o "$s/libs/lib2-v2.so" test/lua-5.5.1-tests/libs/lib22.c
     run attrib "$s" cat sh -c '"$LUA" -e"_U=true _soft=true _nomsg=true" attrib.lua'
     # Errors, continuations, and lauxlib.
-    cc "${cflags[@]}" -o "$out/capitest.so" test/capi/capitest.c
+    "${cc[@]}" "${cflags[@]}" -o "$out/capitest.so" test/capi/capitest.c
     run capitest test/capi cat sh -c 'LUA_CPATH="'"$out"'/?.so" "$LUA" -W errors.lua'
     # lpeg.
     mkdir -p "$out/lpeg" && tar xzf "$LPEG_SRC" -C "$out/lpeg" --strip-components=1
-    (cd "$out/lpeg" && cc "${cflags[@]}" -std=c99 -o lpeg.so lpvm.c lpcap.c lptree.c lpcode.c lpprint.c lpcset.c)
+    (cd "$out/lpeg" && "${cc[@]}" "${cflags[@]}" -std=c99 -o lpeg.so lpvm.c lpcap.c lptree.c lpcode.c lpprint.c lpcset.c)
     run lpeg "$out/lpeg" cat sh -c '"$LUA" test.lua'
     # lua-cjson: its table output follows hash order, which differs, so
     # only the verdicts compare.
     cp -r "$LUA_CJSON_SRC" "$out/cjson" && chmod -R u+w "$out/cjson"
-    (cd "$out/cjson" && cc "${cflags[@]}" -o cjson.so lua_cjson.c strbuf.c fpconv.c && cd tests && perl genutf8.pl > utf8.dat 2> /dev/null)
+    (cd "$out/cjson" && "${cc[@]}" "${cflags[@]}" -o cjson.so lua_cjson.c strbuf.c fpconv.c && cd tests && perl genutf8.pl > utf8.dat 2> /dev/null)
     run cjson "$out/cjson/tests" "grep -E ^(==>|exit)" sh -c 'LUA_PATH="../lua/?.lua;;" LUA_CPATH="../?.so" "$LUA" test.lua'
     # luafilesystem, whose setmode and lock read io's files as luaL_Stream.
     cp -r "$LFS_SRC" "$out/lfs" && chmod -R u+w "$out/lfs"
-    (cd "$out/lfs" && cc "${cflags[@]}" -o lfs.so src/lfs.c)
+    (cd "$out/lfs" && "${cc[@]}" "${cflags[@]}" -o lfs.so src/lfs.c)
     run lfs "$out/lfs/tests" cat sh -c 'LUA_CPATH="../?.so" "$LUA" test.lua'
     run lfs-lock test/capi cat sh -c 'LUA_CPATH="'"$out"'/lfs/?.so" "$LUA" lock.lua'
     # io handles shared with C modules: stream.c, and luaposix's posix.stdio
     # (fileno, fdopen) with the modules its cases use.
-    cc "${cflags[@]}" -o "$out/stream.so" test/capi/stream.c
+    "${cc[@]}" "${cflags[@]}" -o "$out/stream.so" test/capi/stream.c
     run handles test/capi cat sh -c 'LUA_CPATH="'"$out"'/?.so" "$LUA" handles.lua'
     p=$out/posix && mkdir -p "$p/posix/sys"
     for m in stdio unistd fcntl sys/stat; do
-        cc "${cflags[@]}" -w -I"$LUAPOSIX_SRC/ext/include" -DPACKAGE='"luaposix"' -DVERSION='"test"' -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -o "$p/posix/$m.so" "$LUAPOSIX_SRC/ext/posix/$m.c"
+        "${cc[@]}" "${cflags[@]}" -w -I"$LUAPOSIX_SRC/ext/include" -DPACKAGE='"luaposix"' -DVERSION='"test"' -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -o "$p/posix/$m.so" "$LUAPOSIX_SRC/ext/posix/$m.c"
     done
     run posix test/capi cat sh -c 'LUA_CPATH="'"$p"'/?.so" "$LUA" posix.lua'
     # Libraries close with the state, after every finalizer, the last
     # loaded first.
-    for n in 1 2; do cc "${cflags[@]}" -DN=$n -o "$out/unload$n.so" test/capi/unload.c; done
+    for n in 1 2; do "${cc[@]}" "${cflags[@]}" -DN=$n -o "$out/unload$n.so" test/capi/unload.c; done
     run unload test/capi cat sh -c 'LUA_CPATH="'"$out"'/?.so" "$LUA" unload.lua'
     # The C-API build's io is C's stdio, not the default build's: the
     # suite's files.lua (but its clock line) and every differential test.
     run files test/lua-5.5.1-tests "grep -v ^test.done.on" sh -c '"$LUA" -e"_U=true _soft=true _port=true _nomsg=true" files.lua'
     for f in test/diff/*.lua; do
+        # Under qemu-user glibc's system() leaves errno ENOSYS from a clone3
+        # that qemu refuses, so the foreign reference's os.execute of a
+        # failing command reports that error; io_os takes the native
+        # reference instead.
+        saved=$ref
+        if [ -n "$target" ] && [ "$f" = test/diff/io_os.lua ]; then ref=$(command -v lua); fi
         run "diff-$(basename "$f" .lua)" test/diff cat sh -c '"$LUA" '"$(basename "$f")"
+        ref=$saved
     done
     [ ${#failed[@]} -eq 0 ] || { printf 'differs: %s\n' "${failed[@]}"; exit 1; }
 

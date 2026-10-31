@@ -11,6 +11,7 @@ const debuginfo = @import("../debuginfo.zig");
 const aux = @import("../lib/auxlib.zig");
 const base = @import("../lib/base.zig");
 const capi = @import("capi.zig");
+const va = @import("va.zig");
 
 const Error = Value.Error;
 // The headers' type names, as in capi.zig.
@@ -196,6 +197,17 @@ fn lauxError(L: *lua_State, fmt: [*:0]const u8, ...) callconv(.c) c_int {
     const r = capi.pushVfString(L, fmt, &ap);
     @cVaEnd(&ap);
     _ = capi.check(L, r);
+    raiseMessage(L);
+}
+
+/// `luaL_error` past its `...`, for aarch64 Linux (`va.zig`).
+fn lauxErrorv(L: *lua_State, fmt: [*:0]const u8, ap: *va.List) callconv(.c) c_int {
+    _ = capi.check(L, capi.pushVfString(L, fmt, ap));
+    raiseMessage(L);
+}
+
+/// Raises the message `luaL_error` formatted, which is on top.
+fn raiseMessage(L: *lua_State) noreturn {
     const msg = L.stack[L.top - 1].asString();
     var aw: std.Io.Writer.Allocating = .init(L.heap().allocator());
     const s = errorMessage(L, &aw, msg.bytes());
@@ -555,7 +567,7 @@ comptime {
     @export(&lauxTestudata, .{ .name = "luaL_testudata" });
     @export(&lauxCheckudata, .{ .name = "luaL_checkudata" });
     @export(&lauxWhere, .{ .name = "luaL_where" });
-    @export(&lauxError, .{ .name = "luaL_error" });
+    @export(if (va.native) &lauxError else &va.Entry(&lauxErrorv).entry, .{ .name = "luaL_error" });
     @export(&lauxCheckoption, .{ .name = "luaL_checkoption" });
     @export(&lauxFileresult, .{ .name = "luaL_fileresult" });
     @export(&lauxRef, .{ .name = "luaL_ref" });

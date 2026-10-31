@@ -29,6 +29,7 @@ const debuginfo = @import("../debuginfo.zig");
 const aux = @import("../lib/auxlib.zig");
 const base = @import("../lib/base.zig");
 const jmp = @import("jmp.zig");
+const va = @import("va.zig");
 
 const lauxlib = @import("lauxlib.zig");
 
@@ -480,7 +481,7 @@ fn cfunction(v: Value) ?lua_CFunction {
     if (v.tag != .native_closure) return null;
     const c = v.asNativeClosure();
     if (c.f != &trampoline) return null;
-    return @ptrCast(c.cfn.?);
+    return @ptrCast(@alignCast(c.cfn.?));
 }
 
 pub fn luaTocfunction(L: *lua_State, idx: c_int) callconv(.c) ?lua_CFunction {
@@ -587,7 +588,7 @@ pub fn luaPushstring(L: *lua_State, s: ?[*:0]const u8) callconv(.c) ?[*:0]const 
     return str.bytesZ().ptr;
 }
 
-pub fn luaPushvfstring(L: *lua_State, fmt: [*:0]const u8, ap: *std.builtin.VaList) callconv(.c) [*:0]const u8 {
+pub fn luaPushvfstring(L: *lua_State, fmt: [*:0]const u8, ap: *va.List) callconv(.c) [*:0]const u8 {
     return check(L, pushVfString(L, fmt, ap));
 }
 
@@ -600,7 +601,7 @@ pub fn luaPushfstring(L: *lua_State, fmt: [*:0]const u8, ...) callconv(.c) [*:0]
 
 /// `luaO_pushvfstring`: `%s`, `%c`, `%d`, `%I`, `%f`, `%p`, `%U`, and
 /// `%%`; any other conversion is kept as written.
-pub inline fn pushVfString(th: *Thread, fmt_z: [*:0]const u8, ap: *std.builtin.VaList) Error![*:0]const u8 {
+pub inline fn pushVfString(th: *Thread, fmt_z: [*:0]const u8, ap: *va.List) Error![*:0]const u8 {
     var b: aux.Buffer = .init(th.state);
     defer b.deinit();
     const w = &b.writer;
@@ -611,15 +612,15 @@ pub inline fn pushVfString(th: *Thread, fmt_z: [*:0]const u8, ap: *std.builtin.V
         var nbuf: [number.max_len]u8 = undefined;
         switch (spec) {
             's' => {
-                const s = @cVaArg(ap, ?[*:0]const u8);
+                const s = va.arg(ap, ?[*:0]const u8);
                 w.writeAll(if (s) |p| span(p) else "(null)") catch return error.OutOfMemory;
             },
-            'c' => w.writeByte(@truncate(@as(c_uint, @bitCast(@cVaArg(ap, c_int))))) catch return error.OutOfMemory,
-            'd' => w.writeAll(vm.formatNumber(.int(@cVaArg(ap, c_int)), &nbuf)) catch return error.OutOfMemory,
-            'I' => w.writeAll(vm.formatNumber(.int(@cVaArg(ap, i64)), &nbuf)) catch return error.OutOfMemory,
-            'f' => w.writeAll(vm.formatNumber(.float(@cVaArg(ap, f64)), &nbuf)) catch return error.OutOfMemory,
+            'c' => w.writeByte(@truncate(@as(c_uint, @bitCast(va.arg(ap, c_int))))) catch return error.OutOfMemory,
+            'd' => w.writeAll(vm.formatNumber(.int(va.arg(ap, c_int)), &nbuf)) catch return error.OutOfMemory,
+            'I' => w.writeAll(vm.formatNumber(.int(va.arg(ap, i64)), &nbuf)) catch return error.OutOfMemory,
+            'f' => w.writeAll(vm.formatNumber(.float(va.arg(ap, f64)), &nbuf)) catch return error.OutOfMemory,
             'p' => {
-                const p = @cVaArg(ap, ?*anyopaque);
+                const p = va.arg(ap, ?*anyopaque);
                 if (p) |q|
                     w.print("0x{x}", .{@intFromPtr(q)}) catch return error.OutOfMemory
                 else
@@ -627,7 +628,7 @@ pub inline fn pushVfString(th: *Thread, fmt_z: [*:0]const u8, ap: *std.builtin.V
             },
             'U' => {
                 var ubuf: [8]u8 = undefined;
-                w.writeAll(utf8Escape(&ubuf, @truncate(@cVaArg(ap, c_ulong)))) catch return error.OutOfMemory;
+                w.writeAll(utf8Escape(&ubuf, @truncate(va.arg(ap, c_ulong)))) catch return error.OutOfMemory;
             },
             '%' => w.writeByte('%') catch return error.OutOfMemory,
             else => w.writeAll(fmt[e..@min(e + 2, fmt.len)]) catch return error.OutOfMemory,
@@ -1361,7 +1362,8 @@ comptime {
     @export(&luaPushexternalstring, .{ .name = "lua_pushexternalstring" });
     @export(&luaPushstring, .{ .name = "lua_pushstring" });
     @export(&luaPushvfstring, .{ .name = "lua_pushvfstring" });
-    @export(&luaPushfstring, .{ .name = "lua_pushfstring" });
+    // aarch64 Linux has no Zig `...` to read (`va.zig`).
+    @export(if (va.native) &luaPushfstring else &va.Entry(&luaPushvfstring).entry, .{ .name = "lua_pushfstring" });
     @export(&luaPushcclosure, .{ .name = "lua_pushcclosure" });
     @export(&luaPushboolean, .{ .name = "lua_pushboolean" });
     @export(&luaPushlightuserdata, .{ .name = "lua_pushlightuserdata" });

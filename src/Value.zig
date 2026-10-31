@@ -248,7 +248,7 @@ pub inline fn asNativeClosure(v: Value) *Proto.NativeClosure {
 
 pub inline fn asNative(v: Value) NativeFn {
     std.debug.assert(v.tag == .native_fn);
-    return @ptrCast(v.payload.ptr);
+    return @ptrCast(@alignCast(v.payload.ptr));
 }
 
 pub inline fn asUserdata(v: Value) *Userdata {
