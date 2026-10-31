@@ -33,7 +33,11 @@ const Writer = std.Io.Writer;
 /// that `State` does not have (the warning mode). The embedder owns it; it must outlive the Lua state.
 pub const Host = struct {
     io: std.Io,
-    stdout: std.Io.File.Writer,
+    /// Where `print` and `io.stdout` write: `file_stdout` unless the
+    /// embedder points it elsewhere.
+    stdout: *Writer,
+    /// The process's standard output, buffered.
+    file_stdout: std.Io.File.Writer,
     stdout_buf: [4096]u8 = undefined,
     warn: enum { off, on, cont } = .off,
     /// The process environment for `os.getenv` and `package`'s paths; none
@@ -45,8 +49,9 @@ pub const Host = struct {
     /// A host on the process's standard streams. Call `init` in place: the
     /// stdout writer points into the struct.
     pub fn init(host: *Host, io: std.Io) void {
-        host.* = .{ .io = io, .stdout = undefined };
-        host.stdout = std.Io.File.stdout().writerStreaming(io, &host.stdout_buf);
+        host.* = .{ .io = io, .stdout = undefined, .file_stdout = undefined };
+        host.file_stdout = std.Io.File.stdout().writerStreaming(io, &host.stdout_buf);
+        host.stdout = &host.file_stdout.interface;
     }
 
     /// Writes to standard error, unbuffered, ignoring failures as C's
@@ -58,11 +63,11 @@ pub const Host = struct {
     /// Writes to the buffered standard output, ignoring failures as C's
     /// `lua_writestring` does.
     pub fn writeStdout(host: *Host, bytes: []const u8) void {
-        host.stdout.interface.writeAll(bytes) catch return;
+        host.stdout.writeAll(bytes) catch return;
     }
 
     pub fn flushStdout(host: *Host) void {
-        host.stdout.interface.flush() catch return;
+        host.stdout.flush() catch return;
     }
 };
 

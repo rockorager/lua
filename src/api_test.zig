@@ -506,3 +506,29 @@ test "a state cleans up after allocation failure at any point" {
     }
     try testing.expect(i > 100);
 }
+
+test "print and io.stdout write where the host says" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    {
+        // No I/O at all, and print still reaches the host.
+        const state = try lua.State.init(testing.allocator, .{ .stdout = &out.writer });
+        defer state.close();
+        try state.doString(void, "print('a', 1, nil, 2.5)", .{});
+        try testing.expectEqualStrings("a\t1\tnil\t2.5\n", out.written());
+        try testing.expectEqual(&out.writer, state.stdout());
+    }
+    out.clearRetainingCapacity();
+    {
+        const state = try lua.State.init(testing.allocator, .{ .io = testing.io, .stdout = &out.writer });
+        defer state.close();
+        try state.doString(void, "io.write('x', 2) print('y') io.stdout:write('z')", .{});
+        // Standard output is the host's writer, not a file to seek.
+        try testing.expectEqualStrings("nil Illegal seek 29", try state.doString([]const u8,
+            \\local pos, msg, code = io.stdout:seek('set', 0)
+            \\return tostring(pos) .. ' ' .. msg .. ' ' .. code
+        , .{}));
+    }
+    // `close` flushed what io.write left buffered.
+    try testing.expectEqualStrings("x2y\nz", out.written());
+}

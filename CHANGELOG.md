@@ -22,6 +22,7 @@ All notable changes to lua are recorded here. The format follows
 - To-be-closed variables (`local x <close>`), `__concat`, and named vararg tables (`function f(...t)`) run instead of raising "not implemented yet".
 - The collector is Lua 5.5's: weak tables (`__mode` "k", "v", "kv") with ephemerons, `__gc` finalizers on tables and userdata (set with the metatable, run in reverse order, resurrection, errors as "error in __gc" warnings, every pending one at `State.destroy` and `os.exit(code, true)`), incremental collection, and generational mode; `collectgarbage` supports every 5.5 option, and the standalone `lua` runs in generational mode as the reference's does. Files left open close when collected.
 - `lua.Options.strings`, an allocator for string objects, and `SmallAllocator`, a single-threaded allocator with size classes 8 bytes apart up to 128 bytes; the standalone `lua` allocates strings with it.
+- `lua.Options.stdout`, a `*std.Io.Writer` for `print` and `io.write` in place of the process's standard output, and `state.stdout()`, the writer in use.
 
 ### Changed
 

@@ -204,6 +204,11 @@ pub const Options = struct {
     /// it. Without it every operation fails: `print` prints nothing and
     /// no file opens, so scripts reach nothing outside the state.
     io: ?std.Io = null,
+    /// Where `print` and `io.stdout` write, in place of the process's
+    /// standard output: a GUI host captures them here, with or without
+    /// `io`. It must outlive the state, which flushes it after each
+    /// `print` and at `close`.
+    stdout: ?*std.Io.Writer = null,
     /// The environment for `os.getenv` and `package`'s paths; none when
     /// null. It must outlive the state.
     environ: ?*const std.process.Environ.Map = null,
@@ -260,6 +265,7 @@ pub const State = opaque {
         if (options.io == null and (libs.contains(.io) or libs.contains(.os)))
             @panic("lua: the io and os libraries need Options.io");
         extra.host.init(options.io orelse .failing);
+        if (options.stdout) |w| extra.host.stdout = w;
         extra.host.environ = options.environ;
         const s = try IState.create(gpa, .{ .seed = options.seed, .strings = options.strings });
         errdefer s.destroy();
@@ -289,6 +295,13 @@ pub const State = opaque {
     /// `Options.context`, as a `*T`.
     pub fn context(state: *State, comptime T: type) *T {
         return @ptrCast(@alignCast(extraOf(state.thread().state).context.?));
+    }
+
+    /// The writer `print` and `io.stdout` use: `Options.stdout`, or the
+    /// process's buffered standard output. Write the host's own output
+    /// through it to keep it in order with the script's.
+    pub fn stdout(state: *State) *std.Io.Writer {
+        return extraOf(state.thread().state).host.stdout;
     }
 
     // -----------------------------------------------------------------

@@ -289,8 +289,8 @@ const Stream = struct {
     fn flush(s: *Stream, th: *Thread) bool {
         if (s.host_stdout) {
             const h = host(th);
-            h.stdout.interface.flush() catch {
-                s.err = errnoOf(h.stdout.err orelse error.InputOutput);
+            h.stdout.flush() catch {
+                s.err = errnoOf(h.file_stdout.err orelse error.InputOutput);
                 return false;
             };
             return true;
@@ -313,7 +313,7 @@ const Stream = struct {
         const nl = if (s.vbuf == .line) std.mem.findScalarLast(u8, data, '\n') else null;
         if (s.host_stdout) {
             const h = host(th);
-            const w = &h.stdout.interface;
+            const w = h.stdout;
             // Up to the flush point, then the rest stays buffered.
             const cut = if (s.vbuf == .no) data.len else if (nl) |k| k + 1 else 0;
             w.writeAll(data[0..cut]) catch return s.stdoutFailed(h);
@@ -359,7 +359,7 @@ const Stream = struct {
     }
 
     fn stdoutFailed(s: *Stream, h: *base.Host) bool {
-        s.err = errnoOf(h.stdout.err orelse error.InputOutput);
+        s.err = errnoOf(h.file_stdout.err orelse error.InputOutput);
         return false;
     }
 
@@ -368,8 +368,13 @@ const Stream = struct {
         if (!s.flush(th)) return null;
         const h = host(th);
         const io = h.io;
-        const file = if (s.host_stdout) h.stdout.file else s.file;
-        const logical: u64 = if (s.host_stdout) h.stdout.pos else switch (s.mode) {
+        if (s.host_stdout and h.stdout != &h.file_stdout.interface) {
+            // The embedder took standard output, so there is no file.
+            s.err = 29;
+            return null;
+        }
+        const file = if (s.host_stdout) h.file_stdout.file else s.file;
+        const logical: u64 = if (s.host_stdout) h.file_stdout.pos else switch (s.mode) {
             .reading => s.pos - (s.rend - s.rpos),
             else => s.pos,
         };
@@ -391,7 +396,7 @@ const Stream = struct {
             s.err = errnoOf(e);
             return null;
         };
-        if (s.host_stdout) h.stdout.pos = t;
+        if (s.host_stdout) h.file_stdout.pos = t;
         s.rpos = 0;
         s.rend = 0;
         s.mode = .idle;
