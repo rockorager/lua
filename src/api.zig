@@ -1171,16 +1171,16 @@ fn modeString(m: Mode) []const u8 {
 // References
 // ---------------------------------------------------------------------------
 
-/// The registry slot that heads the free list of references, `freelist`
-/// in lauxlib.c; references start after it.
-const freelist = 3;
+/// The registry slot that heads the free list of references, `t[1]` in
+/// lauxlib.c's `luaL_ref`; false until the first reference.
+const freelist = 1;
 
 fn newRef(th: *Thread, v: IValue) Error!Ref {
     const reg = th.state.registry;
     const heap = th.heap();
     var r: i64 = 0;
     const head = reg.getInt(freelist);
-    if (head.isNil()) {
+    if (head.tag != .int) {
         try reg.setInt(heap, freelist, .int(0));
     } else {
         r = head.asInt();

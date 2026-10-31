@@ -19,8 +19,10 @@ strings: String.Interner,
 /// The hash seed, random per state unless `Options.seed` fixes it.
 seed: u64,
 main: *Thread,
-/// The registry: `registry[1]` is the main thread and `registry[2]` the
-/// globals table, as in PUC-Rio (`LUA_RIDX_MAINTHREAD`, `LUA_RIDX_GLOBALS`).
+/// The registry, laid out as 5.5.1's: `registry[1]` heads the free list
+/// of references (false until the first), `registry[2]` is the globals
+/// table, and `registry[3]` the main thread (`LUA_RIDX_GLOBALS`,
+/// `LUA_RIDX_MAINTHREAD`).
 registry: *Table,
 globals: *Table,
 /// Metatables for values that have no metatable of their own, by basic
@@ -133,10 +135,11 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
     state.main = try Thread.create(state);
     // The main thread can never yield.
     state.main.nny = 1;
-    state.registry = try Table.create(&state.heap, 2, 0);
+    state.registry = try Table.create(&state.heap, 3, 0);
     state.globals = try Table.create(&state.heap, 0, 0);
-    try state.registry.setInt(&state.heap, 1, .thread(state.main));
+    try state.registry.setInt(&state.heap, 1, .false);
     try state.registry.setInt(&state.heap, 2, .table(state.globals));
+    try state.registry.setInt(&state.heap, 3, .thread(state.main));
     return state;
 }
 
@@ -257,8 +260,9 @@ test "metamethod names and the registry layout" {
     defer state.destroy();
     try testing.expectEqualStrings("__index", state.tm_names[@intFromEnum(Tm.index)].bytes());
     try testing.expectEqualStrings("__close", state.tm_names[@intFromEnum(Tm.close)].bytes());
-    try testing.expectEqual(state.main, state.registry.getInt(1).asThread());
+    try testing.expect(state.registry.getInt(1).tag == .bool_false);
     try testing.expectEqual(state.globals, state.registry.getInt(2).asTable());
+    try testing.expectEqual(state.main, state.registry.getInt(3).asThread());
 }
 
 test "the absence cache answers repeated misses and sees new handlers" {

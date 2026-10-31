@@ -35,6 +35,7 @@ All notable changes to lua are recorded here. The format follows
 
 ### Changed
 
+- The registry is laid out as Lua 5.5.1's: `debug.getregistry()[2]` is the globals table and `[3]` the main thread (it was 5.4's, with the main thread at `[1]`).
 - The interpreter is faster on float arithmetic, table indexing with integer and string keys, and calls: against reference Lua 5.5.1, mandelbrot, nbody, hash_int, hash_string, array, binary_trees, and fib now run faster, and every `bench/` program peaks at or below the reference's memory.
 - `String.len` is a method, `len()`: a string is 32 bytes plus its contents, in PUC-Rio's `TString` layout.
 - `table.concat`, `string.format`, `gsub`, and the other functions that build strings in an `auxlib.Buffer` no longer copy a long result into a new string, and grow their buffer by half instead of doubling, halving table_concat's peak memory.
