@@ -5,7 +5,8 @@
 //! with a finalizer, `tobefnz` for those waiting to run it, `fixedgc` for
 //! objects that live as long as the state); it is freed only here.
 //! All memory the Lua universe uses goes through `Heap.allocator()`, which
-//! counts bytes for pacing and `collectgarbage("count")`.
+//! counts bytes for pacing and `collectgarbage("count")`; objects take it
+//! through `Heap.raw()`, which skips the safe build's fill.
 //!
 //! Colors are the reference's: white (two whites, flipped each cycle so
 //! objects made during a sweep are not taken for dead), gray (reached, in a
@@ -19,6 +20,7 @@
 //! seen half done. A step can run finalizers, which are Lua code.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Value = @import("Value.zig");
 const String = @import("String.zig");
@@ -172,6 +174,17 @@ pub const Heap = struct {
         return .{ .ptr = heap, .vtable = &Counting("strings").vtable };
     }
 
+    /// The counting allocator through `Raw`, for objects and the blocks
+    /// they own.
+    pub fn raw(heap: *Heap) Raw {
+        return .{ .a = heap.allocator() };
+    }
+
+    /// The strings' counting allocator through `Raw`.
+    pub fn rawStrings(heap: *Heap) Raw {
+        return .{ .a = heap.stringAllocator() };
+    }
+
     /// Links a new object into `allgc`, white and new.
     pub fn link(heap: *Heap, h: *Header, tag: Value.Tag) void {
         h.* = .{ .next = heap.allgc, .tag = tag, .marked = heap.currentwhite & mark.white_bits };
@@ -247,6 +260,83 @@ pub const Heap = struct {
                 heap.bytes -= memory.len;
             }
         };
+    }
+};
+
+/// `std.mem.Allocator`'s calls for objects and the blocks they own, minus
+/// the `undefined` fill: in safe builds the standard interface writes 0xAA
+/// over every block it allocates and frees, which was half of ReleaseSafe's
+/// cost and all of its extra peak memory
+/// (`docs/slop/results/safe-poison-20261031.md`). Every object is
+/// initialized before anything can reach it and freed only once nothing
+/// can, so nothing reads the fill; Debug builds still write it.
+pub const Raw = struct {
+    a: Allocator,
+
+    inline fn fill(bytes: []u8) void {
+        if (builtin.mode == .Debug) @memset(bytes, undefined);
+    }
+
+    pub fn create(r: Raw, comptime T: type) Allocator.Error!*T {
+        const p = r.a.rawAlloc(@sizeOf(T), .of(T), @returnAddress()) orelse return error.OutOfMemory;
+        fill(p[0..@sizeOf(T)]);
+        return @ptrCast(@alignCast(p));
+    }
+
+    pub fn destroy(r: Raw, ptr: anytype) void {
+        const T = @typeInfo(@TypeOf(ptr)).pointer.child;
+        const p: [*]u8 = @ptrCast(@constCast(ptr));
+        fill(p[0..@sizeOf(T)]);
+        r.a.rawFree(p[0..@sizeOf(T)], .of(T), @returnAddress());
+    }
+
+    pub fn alloc(r: Raw, comptime T: type, n: usize) Allocator.Error![]T {
+        return r.alignedAlloc(T, null, n);
+    }
+
+    pub fn alignedAlloc(
+        r: Raw,
+        comptime T: type,
+        comptime alignment: ?std.mem.Alignment,
+        n: usize,
+    ) Allocator.Error![]align(if (alignment) |a| a.toByteUnits() else @alignOf(T)) T {
+        const a = comptime alignment orelse std.mem.Alignment.of(T);
+        const Ptr = [*]align(a.toByteUnits()) T;
+        const len = std.math.mul(usize, @sizeOf(T), n) catch return error.OutOfMemory;
+        if (len == 0) return @as(Ptr, @ptrFromInt(comptime a.backward(std.math.maxInt(usize))))[0..n];
+        const p = r.a.rawAlloc(len, a, @returnAddress()) orelse return error.OutOfMemory;
+        fill(p[0..len]);
+        return @as(Ptr, @ptrCast(@alignCast(p)))[0..n];
+    }
+
+    pub fn free(r: Raw, memory: anytype) void {
+        const info = @typeInfo(@TypeOf(memory)).pointer;
+        const bytes: []u8 = @ptrCast(@constCast(memory));
+        if (bytes.len == 0) return;
+        fill(bytes);
+        r.a.rawFree(bytes, .fromByteUnits(info.alignment orelse @alignOf(info.child)), @returnAddress());
+    }
+
+    /// `Allocator.realloc`: in place when the allocator can, else a new
+    /// block with the contents copied.
+    pub fn realloc(r: Raw, old: anytype, n: usize) Allocator.Error!@TypeOf(old) {
+        const info = @typeInfo(@TypeOf(old)).pointer;
+        const T = info.child;
+        const a = comptime std.mem.Alignment.fromByteUnits(info.alignment orelse @alignOf(T));
+        if (old.len == 0) return r.alignedAlloc(T, a, n);
+        if (n == 0) {
+            r.free(old);
+            return r.alignedAlloc(T, a, 0);
+        }
+        const old_bytes: []u8 = @ptrCast(old);
+        const len = std.math.mul(usize, @sizeOf(T), n) catch return error.OutOfMemory;
+        const p = r.a.rawRemap(old_bytes, a, len, @returnAddress()) orelse blk: {
+            const q = r.a.rawAlloc(len, a, @returnAddress()) orelse return error.OutOfMemory;
+            @memcpy(q[0..@min(len, old_bytes.len)], old_bytes[0..@min(len, old_bytes.len)]);
+            r.free(old);
+            break :blk q;
+        };
+        return @as([*]align(a.toByteUnits()) T, @ptrCast(@alignCast(p)))[0..n];
     }
 };
 

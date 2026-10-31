@@ -90,11 +90,11 @@ pub const Entry = struct { key: Value, value: Value };
 /// A new empty table with room for `narray` array slots and `nhash` other
 /// keys, linked into the heap.
 pub fn create(heap: *gc.Heap, narray: u32, nhash: u32) error{OutOfMemory}!*Table {
-    const t = try heap.allocator().create(Table);
+    const t = try heap.raw().create(Table);
     t.* = .{ .header = undefined };
     if (narray > 0 or nhash > 0) {
         t.resize(heap, narray, nhash) catch |e| {
-            heap.allocator().destroy(t);
+            heap.raw().destroy(t);
             return e;
         };
     }
@@ -104,12 +104,12 @@ pub fn create(heap: *gc.Heap, narray: u32, nhash: u32) error{OutOfMemory}!*Table
 
 pub fn destroy(heap: *gc.Heap, t: *Table) void {
     freeParts(heap, t.array, t.asize, t.node, t.lsizenode);
-    heap.allocator().destroy(t);
+    heap.raw().destroy(t);
 }
 
 fn freeParts(heap: *gc.Heap, array: ?[*]align(8) u8, asize: u32, node: [*]Node, lsizenode: u8) void {
-    if (array) |a| heap.allocator().free(arrayBlock(a, asize));
-    if (node != @as([*]Node, &dummy_node)) heap.allocator().free(node[0..(@as(usize, 1) << @intCast(lsizenode))]);
+    if (array) |a| heap.raw().free(arrayBlock(a, asize));
+    if (node != @as([*]Node, &dummy_node)) heap.raw().free(node[0..(@as(usize, 1) << @intCast(lsizenode))]);
 }
 
 inline fn arrayBlockLen(asize: u32) usize {
@@ -554,7 +554,7 @@ fn computeSizes(c: *Counters) u32 {
 /// Resizes both parts: `new_asize` array slots and room for `nhash` keys
 /// in the hash part. On failure the table is unchanged.
 pub fn resize(t: *Table, heap: *gc.Heap, new_asize: u32, nhash: u32) error{OutOfMemory}!void {
-    const gpa = heap.allocator();
+    const gpa = heap.raw();
     const lsize = if (nhash == 0) 0 else ceilLog2(nhash);
     if (lsize > max_hbits or new_asize > (@as(u64, 1) << max_abits)) return error.OutOfMemory;
 

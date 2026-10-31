@@ -232,7 +232,14 @@ reference.
   it is 33% slower than ReleaseFast and still faster than the reference.
   Half of that and all of its extra peak memory is the standard allocator
   interface writing 0xAA over every allocation and free; then
-  `SmpAllocator`'s own safe build. The loop's checks are spread thin
+  `SmpAllocator`'s own safe build. Landed in wave 7: objects and the
+  blocks they own allocate through `gc.Raw` (`Heap.raw()`,
+  `Heap.rawStrings()`), the same calls on the vtable without the fill,
+  which Debug builds keep: ReleaseSafe −10.5% on the geomean and −3.8%
+  peak RSS (array −27%, table_concat −24%), ReleaseFast's loop byte for
+  byte the same (`results/safe-poison-20261031.md`). Allocate a new kind
+  of object through `Heap.raw()`, and call `rawAlloc` and `rawFree`
+  directly in anything that inlines into the loop. The loop's checks are spread thin
   (`results/release-safe-20261031.md`). Measure it with
   `just optimize=ReleaseSafe bench-compare`. Landed in wave 5: a
   `Buffer` is declared `.init(state)`, not `undefined`, which a safe
@@ -342,3 +349,8 @@ lookup in `getSlow` were measured and not landed: the gain (methods
 −6%) is the size of the loop's layout noise
 (`results/index-chain-20261031.md`). The comparison with the reference
 at the end of wave 6 is `results/bench-compare-wave6-20261031.md`.
+
+Wave 7: memory. Line information in luac's encoding (decision 13,
+`results/lineinfo-20261031.md`), which also makes `string.dump`'s line
+info luac's in every case (decision 14), and ReleaseSafe without the
+allocator's fill (the hot-path rules, `results/safe-poison-20261031.md`).

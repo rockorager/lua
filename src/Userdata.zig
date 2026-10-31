@@ -23,7 +23,7 @@ inline fn bytesOffset(nuvalue: usize) usize {
 
 /// A new userdata of `len` bytes, contents undefined, with nil user values.
 pub fn create(heap: *gc.Heap, len: usize, nuvalue: u16) error{OutOfMemory}!*Userdata {
-    const mem = try heap.allocator().alignedAlloc(u8, alignment, bytesOffset(nuvalue) + len);
+    const mem = try heap.raw().alignedAlloc(u8, alignment, bytesOffset(nuvalue) + len);
     const u: *Userdata = @ptrCast(mem.ptr);
     u.* = .{ .header = undefined, .nuvalue = nuvalue, .len = len };
     @memset(u.userValues(), Value.nil);
@@ -33,7 +33,7 @@ pub fn create(heap: *gc.Heap, len: usize, nuvalue: u16) error{OutOfMemory}!*User
 
 pub fn destroy(heap: *gc.Heap, u: *Userdata) void {
     const p: [*]align(alignment.toByteUnits()) u8 = @ptrCast(@alignCast(u));
-    heap.allocator().free(p[0..(bytesOffset(u.nuvalue) + u.len)]);
+    heap.raw().free(p[0..(bytesOffset(u.nuvalue) + u.len)]);
 }
 
 /// The bytes the userdata holds, for the collector's pacing.

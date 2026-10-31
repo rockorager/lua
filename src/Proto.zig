@@ -93,14 +93,14 @@ pub const LocVar = struct {
 
 /// A new empty prototype, linked into the heap.
 pub fn create(heap: *gc.Heap) error{OutOfMemory}!*Proto {
-    const p = try heap.allocator().create(Proto);
+    const p = try heap.raw().create(Proto);
     p.* = .{ .header = undefined };
     heap.link(&p.header, .proto);
     return p;
 }
 
 pub fn destroy(heap: *gc.Heap, p: *Proto) void {
-    const a = heap.allocator();
+    const a = heap.raw();
     a.free(p.code);
     a.free(p.k);
     a.free(p.kslot);
@@ -192,7 +192,7 @@ pub const LuaClosure = struct {
     /// A new closure with `n` upvalue slots, which the caller fills before
     /// the collector can run.
     pub fn create(heap: *gc.Heap, proto: *Proto, n: u8) error{OutOfMemory}!*LuaClosure {
-        const mem = try heap.allocator().alignedAlloc(u8, .of(LuaClosure), allocSize(n));
+        const mem = try heap.raw().alignedAlloc(u8, .of(LuaClosure), allocSize(n));
         const c: *LuaClosure = @ptrCast(mem.ptr);
         c.* = .{ .header = undefined, .nupvalues = n, .proto = proto };
         heap.link(&c.header, .lua_closure);
@@ -201,7 +201,7 @@ pub const LuaClosure = struct {
 
     pub fn destroy(heap: *gc.Heap, c: *LuaClosure) void {
         const p: [*]align(@alignOf(LuaClosure)) u8 = @ptrCast(c);
-        heap.allocator().free(p[0..allocSize(c.nupvalues)]);
+        heap.raw().free(p[0..allocSize(c.nupvalues)]);
     }
 
     pub inline fn upvals(c: *LuaClosure) []*Upval {
@@ -230,7 +230,7 @@ pub const NativeClosure = struct {
 
     /// A new native closure whose `n` upvalues are nil.
     pub fn create(heap: *gc.Heap, f: Value.NativeFn, n: u8) error{OutOfMemory}!*NativeClosure {
-        const mem = try heap.allocator().alignedAlloc(u8, .of(NativeClosure), allocSize(n));
+        const mem = try heap.raw().alignedAlloc(u8, .of(NativeClosure), allocSize(n));
         const c: *NativeClosure = @ptrCast(mem.ptr);
         c.* = .{ .header = undefined, .nupvalues = n, .f = f };
         @memset(c.upvalues(), Value.nil);
@@ -240,7 +240,7 @@ pub const NativeClosure = struct {
 
     pub fn destroy(heap: *gc.Heap, c: *NativeClosure) void {
         const p: [*]align(@alignOf(NativeClosure)) u8 = @ptrCast(c);
-        heap.allocator().free(p[0..allocSize(c.nupvalues)]);
+        heap.raw().free(p[0..allocSize(c.nupvalues)]);
     }
 
     pub inline fn upvalues(c: *NativeClosure) []Value {
@@ -289,7 +289,7 @@ pub const Upval = struct {
 
     /// A new closed upvalue holding `v`.
     pub fn createClosed(heap: *gc.Heap, v: Value) error{OutOfMemory}!*Upval {
-        const uv = try heap.allocator().create(Upval);
+        const uv = try heap.raw().create(Upval);
         uv.* = .{ .header = undefined, .v = undefined, .closed = v };
         uv.v = &uv.closed;
         heap.link(&uv.header, .upval);
@@ -304,7 +304,7 @@ pub const Upval = struct {
 
     pub fn destroy(heap: *gc.Heap, uv: *Upval) void {
         if (uv.isOpen()) uv.unlink();
-        heap.allocator().destroy(uv);
+        heap.raw().destroy(uv);
     }
 
     /// Removes an open upvalue from its thread's list.

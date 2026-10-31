@@ -88,7 +88,7 @@ pub fn eqlLong(a: *const String, b: *const String) bool {
 /// Allocates a string object with room for `n` bytes, not yet linked: a
 /// short one when `n` is at most `max_short_len`.
 fn alloc(heap: *gc.Heap, n: usize) error{OutOfMemory}!*String {
-    const mem = try heap.stringAllocator().alignedAlloc(u8, alignment, allocSize(n));
+    const mem = try heap.rawStrings().alignedAlloc(u8, alignment, allocSize(n));
     const s: *String = @ptrCast(mem.ptr);
     init(s, 0, n);
     return s;
@@ -133,7 +133,7 @@ pub inline fn mutableBytes(s: *String) []u8 {
 
 pub fn destroy(heap: *gc.Heap, s: *String) void {
     const p: [*]align(alignment.toByteUnits()) u8 = @ptrCast(s);
-    heap.stringAllocator().free(p[0..allocSize(s.len())]);
+    heap.rawStrings().free(p[0..allocSize(s.len())]);
 }
 
 /// The state's set of short strings, a chained hash set through `hnext`.
@@ -145,13 +145,13 @@ pub const Interner = struct {
     const initial_buckets = 128;
 
     pub fn init(heap: *gc.Heap, seed: u64) error{OutOfMemory}!Interner {
-        const buckets = try heap.allocator().alloc(?*String, initial_buckets);
+        const buckets = try heap.raw().alloc(?*String, initial_buckets);
         @memset(buckets, null);
         return .{ .buckets = buckets, .seed = seed };
     }
 
     pub fn deinit(self: *Interner, heap: *gc.Heap) void {
-        heap.allocator().free(self.buckets);
+        heap.raw().free(self.buckets);
         self.* = undefined;
     }
 
@@ -201,7 +201,7 @@ pub const Interner = struct {
     }
 
     fn resize(self: *Interner, heap: *gc.Heap, n: usize) void {
-        const new = heap.allocator().alloc(?*String, n) catch return;
+        const new = heap.raw().alloc(?*String, n) catch return;
         @memset(new, null);
         for (self.buckets) |head| {
             var it = head;
@@ -212,7 +212,7 @@ pub const Interner = struct {
                 slot.* = s;
             }
         }
-        heap.allocator().free(self.buckets);
+        heap.raw().free(self.buckets);
         self.buckets = new;
     }
 

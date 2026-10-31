@@ -15,6 +15,7 @@ const String = @import("../String.zig");
 const Table = @import("../Table.zig");
 const Thread = @import("../Thread.zig");
 const State = @import("../State.zig");
+const gc = @import("../gc.zig");
 const vm = @import("../vm.zig");
 const Proto = @import("../Proto.zig");
 const opcodes = @import("../opcodes.zig");
@@ -301,7 +302,7 @@ pub const equal = vm.equal;
 /// `var b: Buffer = .init(state)`; it must not move once written to.
 pub const Buffer = struct {
     writer: Writer,
-    gpa: std.mem.Allocator,
+    gpa: gc.Raw,
     on_heap: bool,
     /// Past `inline_len`: room for a `String` header, the bytes, and a
     /// trailing zero, so a long result becomes its string in place.
@@ -323,7 +324,7 @@ pub const Buffer = struct {
     pub fn init(state: *State) Buffer {
         return .{
             .writer = .{ .vtable = &vtable, .buffer = &.{} },
-            .gpa = state.heap.stringAllocator(),
+            .gpa = state.heap.rawStrings(),
             .on_heap = false,
         };
     }

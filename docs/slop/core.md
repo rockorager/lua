@@ -80,6 +80,10 @@ Wave 3 replaced the stop-the-world collector with a port of lgc.c
   thread closes whatever is left; either sweep order is safe.
 - All memory goes through `Heap.allocator()`, a counting wrapper around the
   state's allocator, so `Heap.bytes` is every byte the state holds.
+  Objects and the blocks they own call it through `gc.Raw`
+  (`Heap.raw()`, `Heap.rawStrings()`), which skips the 0xAA fill the
+  standard interface writes in safe builds
+  (`results/safe-poison-20261031.md`).
 
 ### Threads, calls, and metamethods
 

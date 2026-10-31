@@ -195,13 +195,14 @@ pub const Frame = struct {
 /// A new thread with an empty stack, linked into the state's heap.
 pub fn create(state: *State) error{OutOfMemory}!*Thread {
     const gpa = state.heap.allocator();
-    const stack = try gpa.alloc(Value, initial_stack + extra_stack);
-    errdefer gpa.free(stack);
+    const raw = state.heap.raw();
+    const stack = try raw.alloc(Value, initial_stack + extra_stack);
+    errdefer raw.free(stack);
     @memset(stack, Value.nil);
     var frames: std.ArrayList(Frame) = .empty;
     try frames.append(gpa, baseFrame());
     errdefer frames.deinit(gpa);
-    const th = try gpa.create(Thread);
+    const th = try raw.create(Thread);
     th.* = .{ .header = undefined, .state = state, .stack = stack, .top = 1, .frames = frames };
     th.twups = th;
     state.heap.link(&th.header, .thread);
@@ -224,10 +225,10 @@ pub fn inheritHook(th: *Thread, from: *const Thread) void {
 pub fn destroy(h: *gc.Heap, th: *Thread) void {
     closeAllUpvals(th);
     const gpa = h.allocator();
-    gpa.free(th.stack);
+    h.raw().free(th.stack);
     th.frames.deinit(gpa);
     th.tbc.deinit(gpa);
-    gpa.destroy(th);
+    h.raw().destroy(th);
 }
 
 pub fn closeAllUpvals(th: *Thread) void {
@@ -286,7 +287,7 @@ pub fn shrinkStack(th: *Thread) void {
 
 fn reallocStack(th: *Thread, new_len: usize) error{OutOfMemory}!void {
     const old_len = th.stack.len;
-    th.stack = try th.heap().allocator().realloc(th.stack, new_len);
+    th.stack = try th.heap().raw().realloc(th.stack, new_len);
     if (new_len > old_len) @memset(th.stack[old_len..], Value.nil);
     var it = th.open_upvals;
     while (it) |uv| : (it = uv.open.next) uv.v = &th.stack[uv.open.level];
@@ -300,7 +301,7 @@ pub fn findUpval(th: *Thread, level: u32) error{OutOfMemory}!*Upval {
         if (uv.open.level == level) return uv;
         link = &uv.open.next;
     }
-    const uv = try th.heap().allocator().create(Upval);
+    const uv = try th.heap().raw().create(Upval);
     uv.* = .{
         .header = undefined,
         .v = &th.stack[level],
