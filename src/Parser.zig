@@ -917,11 +917,16 @@ fn parList(ls: *Parser) Error!void {
 }
 
 fn body(ls: *Parser, e: *ExpDesc, ismethod: bool, line: u32) Error!void {
-    var new_fs: FuncState = .{ .f = try ls.addPrototype(), .ls = ls };
+    // The function's state, with its seven growing lists, is on the heap:
+    // on the stack it was 264 of the 416 bytes every level of nested
+    // functions costs (`results/lean-20261031.md`).
+    const new_fs = try ls.gpa.create(FuncState);
+    defer ls.gpa.destroy(new_fs);
+    new_fs.* = .{ .f = try ls.addPrototype(), .ls = ls };
     errdefer new_fs.deinit();
     new_fs.f.linedefined = line;
     var bl: BlockCnt = .{};
-    ls.openFunc(&new_fs, &bl);
+    ls.openFunc(new_fs, &bl);
     try ls.checkNext(.lparen);
     if (ismethod) {
         _ = try ls.newLocalVarLiteral("self");
