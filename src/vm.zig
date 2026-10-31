@@ -38,6 +38,7 @@ const number = @import("number.zig");
 // The reference's `pow`, so results match it bit for bit.
 const libm = @import("lib/libm.zig");
 const debuginfo = @import("debuginfo.zig");
+const lua_options = @import("lua_options");
 
 const Error = Value.Error;
 const KFn = Value.KFn;
@@ -1666,8 +1667,18 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     ci = th.frame();
                     continue :newframe;
                 }
-                if (callee.tag == .native_fn) {
-                    try callNative(th, func, nres, callee.asNative());
+                // In a C-API build C functions, which are native closures,
+                // go straight to `callNative` too, not through `preCall`.
+                // The default build's loop keeps its one test: the other
+                // shifted its registers, at 2% on bench/patterns
+                // (`results/lean-20261031.md`).
+                const direct = if (lua_options.c_api)
+                    callee.tag == .native_fn or callee.tag == .native_closure
+                else
+                    callee.tag == .native_fn;
+                if (direct) {
+                    const f = if (callee.tag == .native_fn) callee.asNative() else callee.asNativeClosure().f;
+                    try callNative(th, func, nres, f);
                 } else {
                     const depth = th.frames.items.len;
                     try preCall(th, func, nres);
