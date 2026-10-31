@@ -270,7 +270,9 @@ inline fn ret1(th: *Thread, v: Value) u32 {
 /// Compiles a chunk, or loads a binary one, into a function whose first
 /// upvalue is the globals table and whose others are nil, `lua_load`.
 /// `mode` holds 'b' and/or 't'. Raises the syntax or format error.
-pub fn loadChunk(th: *Thread, src: [:0]const u8, chunkname: []const u8, mode: []const u8) Error!Value {
+pub fn loadChunk(th: *Thread, src: [:0]const u8, chunkname_arg: []const u8, mode: []const u8) Error!Value {
+    // `lua_load` takes the name as a C string: it ends at the first zero.
+    const chunkname = chunkname_arg[0 .. std.mem.findScalar(u8, chunkname_arg, 0) orelse chunkname_arg.len];
     const binary = src.len > 0 and src[0] == 0x1b;
     if (binary and std.mem.findScalar(u8, mode, 'b') == null)
         return throwFmt(th, "attempt to load a binary chunk (mode is '{s}')", .{mode});

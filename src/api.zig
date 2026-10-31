@@ -1064,8 +1064,11 @@ fn messageHandler(th: *Thread, b: u32) IError!u32 {
     extra.trace.clearRetainingCapacity();
     var aw: std.Io.Writer.Allocating = .fromArrayList(extra.gpa, &extra.trace);
     defer extra.trace = aw.toArrayList();
-    // Without memory for it the error goes on without a traceback.
-    debuginfo.traceback(&aw.writer, th, errorText(v, &buf), 1) catch return 1;
+    // Without memory for it the error goes on without a traceback. The
+    // message ends at a zero byte, as `luaL_traceback`'s C string does.
+    const text = errorText(v, &buf);
+    const msg = text[0 .. std.mem.findScalar(u8, text, 0) orelse text.len];
+    debuginfo.traceback(&aw.writer, th, msg, 1) catch return 1;
     return 1;
 }
 

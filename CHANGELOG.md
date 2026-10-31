@@ -60,3 +60,4 @@ All notable changes to lua are recorded here. The format follows
 - The result of an arithmetic, `__len`, or `__index` metamethod, and the error a `__close` handler raises inside `pcall`, are no longer lost (or written to freed memory) when the call grows the stack; `'0' + 1` could give `'0'`.
 - `setmetatable(t)` without a second argument raises "bad argument #2 to 'setmetatable' (nil or table expected, got no value)", as in the reference.
 - `#t` on a table with holes in its array part returns the border the reference returns.
+- A chunk name passed to `load` ends at its first zero byte, and the standalone `lua` prints an error message, and its traceback, only up to a zero byte, as the reference's C strings do.

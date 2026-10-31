@@ -35,7 +35,10 @@ const Interp = struct {
         std.Io.File.stderr().writeStreamingAll(it.io, bytes) catch return;
     }
 
-    fn message(it: *Interp, msg: []const u8) void {
+    /// `l_message`: lua.c prints with "%s", so a message ends at its
+    /// first zero byte.
+    fn message(it: *Interp, text: []const u8) void {
+        const msg = text[0 .. std.mem.findScalar(u8, text, 0) orelse text.len];
         if (it.progname) |p| {
             it.writeStderr(p);
             it.writeStderr(": ");

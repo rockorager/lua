@@ -31,3 +31,5 @@ print(pcall(load("global function gf() return 1 end; return gf()")))
 local up = 1
 local function closure() return up end
 print(load(string_dump_missing and "" or "return 1")())
+-- A chunk name ends at its first zero byte, as a C string (found by fuzzing).
+print(load("\0")) print(load("x\0y")) print(load("return +", "=a\0b"))
