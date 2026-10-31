@@ -159,7 +159,9 @@ fn protectedCall(th: *Thread, func: u32, nresults: i16, msgh: u32) Error!Status 
         const err = errorObject(th, e);
         th.frames.items.len = frames;
         th.allowhook = old_allowhook;
-        th.stack[func] = closeProtected(th, func, err, &status) orelse err;
+        // The `__close` handlers can move the stack: index it after.
+        const final = closeProtected(th, func, err, &status) orelse err;
+        th.stack[func] = final;
         if (th.closed_self) return error.LuaError;
         th.top = func + 1;
         th.shrinkStack();
@@ -2044,7 +2046,10 @@ noinline fn getSlow(
             h = th.state.tmOf(t, .index) orelse return typeError(th, t, "index", org);
         }
         if (h.isFunction()) {
-            th.stack[dest] = try callTm(th, caller, ci, h, t, key, null, 1) orelse return false;
+            // Not `th.stack[dest] = try callTm(...)`: Zig takes the
+            // destination's address first, and the call can move the stack.
+            const r = try callTm(th, caller, ci, h, t, key, null, 1) orelse return false;
+            th.stack[dest] = r;
             return true;
         }
         t = h;
@@ -2137,7 +2142,9 @@ noinline fn arithSlow(
             },
         }
     };
-    th.stack[dest] = try callTm(th, caller, ci, h, a, b, null, 1) orelse return false;
+    // The call can move the stack: index it after (see `getSlow`).
+    const r = try callTm(th, caller, ci, h, a, b, null, 1) orelse return false;
+    th.stack[dest] = r;
     return true;
 }
 
@@ -2158,7 +2165,9 @@ noinline fn lenSlow(
         }
         return typeError(th, v, "get length of", origin);
     };
-    th.stack[dest] = try callTm(th, caller, ci, h, v, v, null, 1) orelse return false;
+    // The call can move the stack: index it after (see `getSlow`).
+    const r = try callTm(th, caller, ci, h, v, v, null, 1) orelse return false;
+    th.stack[dest] = r;
     return true;
 }
 

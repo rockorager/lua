@@ -856,3 +856,30 @@ test "coroutine status and close" {
     try expectRuntime(state, "not enough memory", said.@"resume"(state, void, .{}));
     try expectRuntime(state, "not enough memory", said.close(state));
 }
+
+// Regressions found by fuzzing (test/fuzz).
+
+test "a metamethod's result lands in the stack after the call moved it" {
+    // Each body runs in a frame of k locals, for every k up to 40, so for
+    // some k the metamethod's call grows the stack under it.
+    const state = try lua.State.init(testing.allocator, .{});
+    defer state.close();
+    try testing.expect(try state.doString(bool,
+        \\local function locals(k)
+        \\  local t = {}
+        \\  for i = 1, k do t[i] = 'a' .. i end
+        \\  return k > 0 and 'local ' .. table.concat(t, ', ') .. ' ' or ''
+        \\end
+        \\local close = "return pcall(function() local c <close> = setmetatable({}, " ..
+        \\  "{__close = function() error('in close', 0) end}) error('body', 0) end)"
+        \\for k = 0, 40 do
+        \\  local function run(body) return coroutine.wrap(assert(load(locals(k) .. body)))() end
+        \\  assert(run("return '0' + 1") == 1, k)
+        \\  assert(run("return #setmetatable({}, {__len = rawlen})") == 0, k)
+        \\  assert(run("return setmetatable({}, {__index = rawequal}).x") == false, k)
+        \\  assert(select(2, run(close)) == 'in close', k)
+        \\  assert(select(2, assert(load(locals(k) .. close))()) == 'in close', k)
+        \\end
+        \\return true
+    , .{}));
+}

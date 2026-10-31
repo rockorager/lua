@@ -57,3 +57,4 @@ All notable changes to lua are recorded here. The format follows
 - `string.dump` writes the same bytes as `luac` for a function with a call whose parentheses enclose 128 or more lines; before, its line information differed (the lines it decoded to did not).
 - `load` of a binary chunk with an instruction whose opcode is not one of Lua 5.5.1's fails with "bad binary format (invalid opcode)" instead of loading a function that crashes when called.
 - A Zig function that calls Lua with `state.call` no longer leaves a coroutine that fails inside that call with a corrupt stack for `debug.traceback`.
+- The result of an arithmetic, `__len`, or `__index` metamethod, and the error a `__close` handler raises inside `pcall`, are no longer lost (or written to freed memory) when the call grows the stack; `'0' + 1` could give `'0'`.
