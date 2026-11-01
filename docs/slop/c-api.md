@@ -78,35 +78,56 @@ C code calls `lua_error`/`luaL_error` and expects them not to return. Our VM
 unwinds with Zig error unions, which cannot pass through C frames. The design
 is the one proposed, with one change, the fused protected call:
 
-1. **The trampoline makes a protected call.** `jmp.call(regs, f, L, a1, a2)`
-   (`src/capi/jmp.zig`, two naked functions) saves rbx, rbp, r12 to r15, the
-   stack pointer after its return, and its return address, then calls `f`
-   (on aarch64: x19 to x30, the stack pointer, and d8 to d15, under a frame
-   record; see "aarch64" below).
-   `jmp.jump(regs)` restores them and returns from that same call with
-   `aborted` (~0, which a C `int` zero-extended can never be). The trampoline
-   keeps a thread-local chain of these (`current`), innermost first.
+1. **C runs inside a protected call.** `jmp.call(regs, f, a0, a1, a2)`
+   (`src/capi/jmp.zig`) is inline assembly in its caller: it notes the
+   stack and frame pointers in `regs` (on aarch64 also the resume
+   address), calls `f`, and tells the compiler the call clobbers every
+   other register, callee-saved ones included, so the caller keeps
+   nothing in registers across it. `jmp.jump(regs)` puts back the two
+   pointers and resumes after the call with `aborted` (~0, which a C
+   `int` zero-extended can never be). Wave 12 made it inline: until then
+   `call` was a naked function that saved the eight callee-saved
+   registers and its return address. A thread-local chain (`current`)
+   holds the protected calls, innermost first. Where they sit: the
+   interpreter loop runs inside one per entry (`vm.execute` is
+   `capi.protectLoop`), and the C functions its `CALL` and `TAILCALL`
+   call run without one of their own (`vm.callNativeDirect`,
+   `capi.callCDirect`). A C function called any other way (`pcall(f)`, a
+   metamethod, `lua_call` of a C function from C) gets one per call
+   (`vm.callNative` inlines `capi.callC`, the trampoline's body).
 2. **An API function that fails throws.** Every export that can raise wraps
    the Zig call in `check(L, ...)`, which on error stores the error in a
    thread-local and `jump`s to the innermost protected call. `lua_error`
    throws `L.throw(v)`, `lua_yieldk` throws `error.Yield` after
    `vm.yieldk`.
-3. **The trampoline returns the error.** On `aborted` it returns the stored
+3. **The protected call returns the error.** On `aborted` the
+   trampoline, or `protectLoop` for the loop's region, returns the stored
    Zig error, and from there the VM unwinds as for any native's error:
    `pcall`, message handlers, to-be-closed variables, and coroutines need
-   nothing new.
+   nothing new. For the loop's region the jump skips the loop's frames,
+   which return an error by `try` alone and hold nothing to clean up, so
+   `execute` returns what the error's return through them would have.
 
 Why fused, rather than C's setjmp: `setjmp` returns twice, and Zig has no
 `returns_twice` for a call it makes, so locals the optimizer keeps in
 registers across it could be stale after the second return. `jmp.call` is an
 ordinary call that returns once, either way, so the optimizer needs no
 knowledge of it. It also saves no signal mask (no syscall), like `_setjmp`.
+Because the compiler does not see a call, C-API builds turn off x86-64's
+red zone (`build.zig`): a function holding one keeps nothing below the
+stack pointer. The clobbers name each vector register at every width,
+as LLVM drops a clobber of a register class the target lacks: without
+AVX-512 the zmm names alone left xmm8 live across the call.
 
 **The invariant that makes the jump safe:** between a protected call and a
-`throw` sit only C frames and the one API function that throws. VM frames
-under a C function's `lua_call` have already returned their Zig error to
-`lua_callk` before it throws; a C function called from that Lua code has its
-own protected call. The API function throwing has no pending `defer` or
+`throw` sit only C frames, the one API function that throws, and, for the
+loop's region, the chain from `protectLoop` to the C call (`loopEntry`,
+`runLoops`, `runLoop`, `callNativeDirect`, `callNativeIn`,
+`callCDirect`), none of which has a `defer` or `errdefer` or calls the
+next but by `try` or `return`. VM frames under a C function's `lua_call`
+have already returned their Zig error to `lua_callk` before it throws; a
+C function called from that Lua code runs inside the region of the loop
+`lua_callk` entered, or has its own protected call. The API function throwing has no pending `defer` or
 `errdefer` at the throw (where one would hold memory, the memory lives in a
 userdata on the stack instead: `Box` for `lua_load`'s chunk and for
 `luaL_Buffer`'s heap part, which the collector frees if a jump abandons it).
@@ -115,8 +136,8 @@ uses `lightCFunction`, not `lua_pushcfunction`, for that reason. Wave 11
 made this a test, below.
 
 Every place Zig calls C code goes through a protected call of its own:
-the trampoline for C functions, `cK` for continuations, and `protect` for
-the rest, so an error a callback raises stops at the Zig frame that called
+the trampoline (`callC`) or the loop's region for C functions, `cK` for
+continuations, and `protect` for the rest, so an error a callback raises stops at the Zig frame that called
 it: `lua_load`'s reader (`readShim`), `lua_dump`'s writer (`writeShim`),
 hooks (`cHook`), the warning function (`cWarn`, which drops the error, as
 the collector warns from deep in Zig code), and `lua_closeslot`'s and
@@ -140,6 +161,13 @@ the same struct resolves to it; an `extern fn` named `lua*` (`liolib.zig`
 calls the API by its C names) counts as C code, other externs as libc.
 It found `cWarn` calling the warning function directly; it now goes
 through `protect`.
+
+Wave 12 added the loop's region (`checkRegion`): each function on the
+chain above must exist, have no `defer` or `errdefer`, call the next
+only right after `try` or `return`, and be named only by the one before
+it (`execute` may name `runLoop` if its body opens with the C-API
+build's `return capi.protectLoop(th)`), so no code outside the region
+reaches the unprotected call. A seeded test breaks each rule once.
 
 An error raised on another Lua thread than the protected call's (a coroutine
 resumed from C) moves its error object to the catching thread first.
@@ -202,11 +230,20 @@ with addresses masked (identical):
   x86-64 GCC gives `.eh_frame` by default) would make a call into C free of
   the register saves. It needs a personality routine and landing pad in the
   trampoline, which Zig does not emit, and libgcc_s; a throw would cost
-  microseconds instead of nanoseconds. The saves are 8 stores of the 14 ns;
-  not worth it before the rest of the call path.
+  microseconds instead of nanoseconds. Wave 12's inline call leaves two
+  stores, and the loop's region takes even those off most C calls.
 - **One protected call per API call** instead of per C function would make
   every `lua_*` call pay for it. Per C function, a C function that raises
-  nothing pays once.
+  nothing pays once; per loop entry (wave 12), a C function the loop calls
+  pays nothing, and a C → Lua callback pays once.
+- **Arming lazily** (linking the loop's region into `current` only when
+  the loop calls C) would move the chain's two thread-local stores from
+  each loop entry onto every C call; a callback enters the loop once and
+  calls C as often. **A catch slot per thread or state** instead of the
+  chain is wrong: a coroutine resumed from C raises to the resumer's
+  protected call, on another thread.
+- **Skipping the red zone** inside `call` (`sub $128, %rsp`) instead of
+  turning it off cost 128 bytes of native stack per C → Lua level.
 
 ## io handles are `luaL_Stream`
 
@@ -255,7 +292,10 @@ What follows from being the reference's code on the reference's libc:
   lauxlib's box then grew by copying into a new userdata; reading 20.6
   MB whole took 3.1× the reference's time without the hint. The box now
   reallocates in place (`capi.Box`, below), and the hint no longer paid
-  (`results/capi-full-20261031.md`), so it went.
+  (`results/capi-full-20261031.md`), so it went. It still took 1.6× the
+  reference's time: building the string copied the box into a second
+  fresh 20 MB map, so each read faulted in 40 MB. Wave 12 makes the box's
+  block the string (`results/capi-perf-20261101.md`).
 - `lib/io.zig`'s tests run on this io in a C-API build (they only run Lua
   chunks), and `just capi-test` runs `files.lua` and every `test/diff`
   case on the C-API `lua` against the reference.
@@ -300,19 +340,26 @@ exit with both still mapped.
 
 `jmp.zig` has an aarch64 pair beside the x86-64 one, for AAPCS64 (Linux)
 and Apple's arm64 ABI, which agree on everything it touches. `call`
-stores x19 to x28, x29 and x30, the stack pointer at entry, and d8 to d15
-(AAPCS64 has the callee keep the low 64 bits of v8 to v15, which x86-64
-System V has no counterpart for), pushes a frame record and sets x29 (Apple
-requires x29 to address a valid frame record at every call; unwinders
-follow it), calls `f`, and zero-extends its `int` (`mov w0, w0`). `jump`
-reloads them, sets the stack pointer, and `ret`s to x30 with x0 = ~0. x18,
-Apple's platform register, is never touched; it is not callee-saved on
-Linux either. No BTI landing pad: Zig does not mark its objects for BTI,
-so no page is guarded.
+stores the stack pointer, x29, and the address after its `blr` (`adr`) in
+`regs`, calls `f`, and zero-extends its `int` (`mov w0, w0`); its
+clobbers name x5 to x28, x30 (as `lr`: LLVM ignores the name `x30`, and
+kept a pointer in x30 across the call until it was spelled so), and v0
+to v31. `jump` reloads x29 and the stack pointer and branches to the
+saved address with x0 = ~0. x18, Apple's platform register, is never
+touched; it is not callee-saved on Linux either. No BTI landing pad: Zig
+does not mark its objects for BTI, so no page is guarded. Until wave 12
+`call` was a naked function that saved x19 to x30 and d8 to d15 under a
+frame record of its own; with frame pointers kept, x29 at the call is
+the caller's frame record, which Apple's unwinders want, but an
+omitted-frame-pointer build lets the compiler keep a value there, which
+`jump` restores.
 
-A test in `jmp.zig` loads 100 + n into every callee-saved register, makes
-a protected call to a function that overwrites them all and jumps, and
-checks each came back (on x86-64 too). Dropping one restore fails it.
+Tests in `jmp.zig` keep 24 values live across a protected call to a
+function that overwrites every callee-saved register and the frame
+pointer, moves the stack pointer, and jumps, and check each came back
+(on x86-64 too); another checks a returning call's `int` is
+zero-extended. Dropping the frame pointer's restore fails them in
+Debug, ReleaseSafe, and ReleaseFast.
 
 The rest of the API needed two changes for aarch64:
 
@@ -452,10 +499,15 @@ identities.
 - `lua_load` and `luaL_loadbufferx`/`luaL_loadfilex` never raise: a reader
   that raises, a syntax error, or no memory comes back as the status.
 - `luaL_Buffer`'s box and `lua_load`'s chunk live in `capi.Box`, lauxlib.c's
-  box: a userdata holding a pointer to memory from the state's heap, which
-  grows with `realloc` (in place where the allocator can; large blocks
-  `mremap`), with a `__gc` that frees it if an error abandons the box.
-  `luaL_pushresult` and `lua_load` free it at once. Wave 8's box was the
+  box: a userdata holding a pointer to memory from the state's string
+  allocator, which grows with `realloc` (in place where the allocator
+  can; large blocks `mremap`), with a `__gc` that frees it if an error
+  abandons the box. The bytes start after room for a `String` header, so
+  `luaL_pushresult` makes a long result its string in place
+  (`Box.toString`: the block shrinks to the string's size and
+  `String.adoptLong` takes it), as 5.5.1 makes its box an external
+  string; a short one is interned by copy and the box freed. `lua_load`
+  frees it at once. Wave 8's box was the
   bytes in a userdata, copied into a new one at each growth, the old ones
   left to the collector. While the state closes, finalizers no longer
   register, so a box made then is the old kind.
@@ -522,9 +574,16 @@ Detail and raw output in `results/c-api-20261031.md`.
   the reference's 9.6 (base 14.4); net of the loop 8.6 against 5.2, of
   which the protected call per C function is 2.6 and `callNative` 2.8.
   C calls Lua: 51.3 ns against 30.6 (`results/lean-20261031.md`).
+  Wave 12, with the loop's protected region and the inline `jmp.call`:
+  an empty call 11.10 ns a loop iteration against 10.75 (base 15.23 on
+  the same run), C → Lua 43.1 against 37.6 (base 47.7); a coroutine
+  resume pays for the region (bench/coroutines +7.8%)
+  (`results/capi-perf-20261101.md`).
 - Native stack per C → `lua_call` → Lua level: 1903 bytes against 351;
   `runLoop`'s frame is 1432 of it, the trampoline ~160. Wave 9: 656,
-  with `runLoop`'s frame 272 (`results/stack-20261031.md`).
+  with `runLoop`'s frame 272 (`results/stack-20261031.md`). Wave 12: 608.
+- io against the reference (wave 12): −27.5% time and −15.9% peak RSS
+  geomean, `read("a")` −6.6% time and −32% peak.
 - Startup: 1.29 ms against the reference's 1.34 and the default's 0.80.
 - lua-cjson and lpeg workloads run ~9% faster than on the reference,
   with 0.4 to 0.9 MiB more peak memory.

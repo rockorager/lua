@@ -200,8 +200,11 @@ reference.
     `fileno` and `fdopen` work), C libraries close with the state in
     5.5.1's order, and aarch64 Linux (`jmp.zig`'s pair, `va.zig` for the
     `...` functions Zig refuses there), tested under qemu-user
-    (`results/c-api-io-20261031.md`). Still to decide: whether the C-API
-    build becomes a release artifact.
+    (`results/c-api-io-20261031.md`). Wave 12 moved the protected call
+    from each C function the loop calls to each entry into the loop
+    (`capi.protectLoop`, `jmp.call` inline), and made `luaL_Buffer`'s
+    box its string (`results/capi-perf-20261101.md`). Still to decide:
+    whether the C-API build becomes a release artifact.
     Landed: `src/api.zig`, exported at the
     module's root (`lua.State`, `lua.Value`, `lua.Ref`, ...), with the engine
     under `lua.internal` for the tools. `State` is an opaque
@@ -476,3 +479,23 @@ box reallocates in place, and capi's index lookup returns a pointer
 (C → Lua calls −21%, `io.write` loops −15%). The default build's
 `.text` is byte for byte 3e3d9b8's; the C-API build's loop is too, and
 its floor is level after `just order`.
+
+Wave 12: C call cost and `read("a")` in the C-API build
+(`results/capi-perf-20261101.md`). `jmp.call` is inline assembly that
+saves only the stack and frame pointers, with every other register
+clobbered (C-API builds have no red zone); the interpreter loop runs
+inside one protected region per entry (`capi.protectLoop`), and `CALL`
+and `TAILCALL` call C functions unprotected inside it
+(`vm.callNativeDirect`, `capi.callCDirect`), which `unwind.zig`'s
+`checkRegion` keeps sound. `luaL_Buffer`'s box is a block of the string
+allocator with room for a `String` header, and `luaL_pushresult` makes
+it the string. An empty C call 15.2 ns to 11.1 a loop iteration (the
+reference 10.75), C → Lua 47.7 to 43.1 (37.6), 608 bytes of native
+stack per level instead of 672; `read("a")` +61% to −6.6% against the
+reference, its peak −32%; io −27.5% geomean. Costs: a coroutine resume
+enters a region (bench/coroutines +7.8%), and bench/ is +1.45% on the
+C-API build. The default build's `.text.hot`, `.text`, and `.rodata`
+are byte for byte 8ed7529's. Owner of `src/capi/jmp.zig`, the C-API
+paths of `vm.zig` (`callNativeIn`, `callNativeDirect`, `runLoops`,
+`execute`'s first line, `callYieldable`'s fast path), `capi.Box`, and
+`checkRegion`.
