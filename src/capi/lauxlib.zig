@@ -539,6 +539,13 @@ fn lauxAddvalue(B: *Buffer) callconv(.c) void {
 
 fn lauxPushresult(B: *Buffer) callconv(.c) void {
     const L = B.L;
+    // A long result in a box becomes its string in place, as 5.5.1's
+    // `luaL_pushresult` makes its box an external string: no copy, and
+    // no second block (results/capi-perf-20261101.md).
+    if (B.b != &B.init.b) if (capi.check(L, capi.Box.toString(L, L.top - 1, B.n))) |s| {
+        L.stack[L.top - 1] = .string(s);
+        return;
+    };
     _ = capi.luaPushlstring(L, B.b, B.n);
     if (B.b != &B.init.b) capi.Box.release(L, L.top - 2);
     capi.luaRotate(L, -2, -1);

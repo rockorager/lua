@@ -969,9 +969,14 @@ pub fn luaPcallk(
 /// collector frees if an error abandons it: `lua_load` and lauxlib's
 /// buffers keep no memory a jump could leak.
 pub const Box = struct {
-    /// The box's bytes: memory from the state's heap, outside the
-    /// userdata, so it can grow in place.
-    const Data = extern struct { ptr: ?[*]u8, len: usize };
+    /// The box's block: memory from the state's string allocator, outside
+    /// the userdata, so it can grow in place. The bytes start after room
+    /// for a `String` header, so `toString` can make the block a string
+    /// without a copy, as 5.5.1's `luaL_pushresult` makes its box an
+    /// external string.
+    const Data = extern struct { ptr: ?[*]align(String.alignment.toByteUnits()) u8, len: usize };
+
+    const header_len = @sizeOf(String);
 
     /// Makes the value at stack slot `slot` a box of `size` bytes that
     /// starts with `keep`, and returns its bytes. A box there already
@@ -980,10 +985,11 @@ pub const Box = struct {
     /// of its bytes. Otherwise a new box holds a copy of `keep`.
     pub fn grow(th: *Thread, slot: u32, keep: []const u8, size: usize) error{OutOfMemory}![]u8 {
         const heap = th.heap();
+        const len = std.math.add(usize, size, header_len) catch return error.OutOfMemory;
         if (data(th, th.stack[slot])) |d| {
-            const b = try heap.raw().realloc(d.ptr.?[0..d.len], size);
+            const b = try heap.rawStrings().realloc(d.ptr.?[0..d.len], len);
             d.* = .{ .ptr = b.ptr, .len = b.len };
-            return b;
+            return b[header_len..];
         }
         if (heap.stopped & gc.stop.closing != 0) {
             // Finalizers no longer register while the state closes: the
@@ -1000,18 +1006,31 @@ pub const Box = struct {
         d.* = .{ .ptr = null, .len = 0 };
         th.stack[slot] = .userdata(u);
         th.state.setMetatable(.userdata(u), mt);
-        const b = try heap.raw().alloc(u8, size);
-        @memcpy(b[0..keep.len], keep);
-        d.* = .{ .ptr = b.ptr, .len = size };
-        return b;
+        const b = try heap.rawStrings().alignedAlloc(u8, String.alignment, len);
+        @memcpy(b[header_len..][0..keep.len], keep);
+        d.* = .{ .ptr = b.ptr, .len = len };
+        return b[header_len..];
     }
 
     /// Frees the bytes of the box at `slot` now, if it is one, instead of
     /// at its collection (lauxlib.c's `lua_closeslot` of the box).
     pub fn release(th: *Thread, slot: u32) void {
         const d = data(th, th.stack[slot]) orelse return;
-        if (d.ptr) |p| th.heap().raw().free(p[0..d.len]);
+        if (d.ptr) |p| th.heap().rawStrings().free(p[0..d.len]);
         d.* = .{ .ptr = null, .len = 0 };
+    }
+
+    /// The first `n` bytes of the box at `slot` as a long string made of
+    /// its block, which the box gives up; null when `slot` holds no box
+    /// (a placeholder, or a box made while the state closes) or `n` is
+    /// short, for the caller to copy.
+    pub fn toString(th: *Thread, slot: u32, n: usize) error{OutOfMemory}!?*String {
+        if (n <= String.max_short_len) return null;
+        const d = data(th, th.stack[slot]) orelse return null;
+        const heap = th.heap();
+        const block = try heap.rawStrings().realloc(d.ptr.?[0..d.len], String.allocSize(n));
+        d.* = .{ .ptr = null, .len = 0 };
+        return String.adoptLong(heap, th.state.seed, block, n);
     }
 
     fn data(th: *Thread, v: Value) ?*Data {
@@ -1040,7 +1059,7 @@ pub const Box = struct {
     fn gcf(L: *lua_State) callconv(.c) c_int {
         const v = get(L, 1);
         const d: *Data = @ptrCast(@alignCast(v.asUserdata().bytes().ptr));
-        if (d.ptr) |p| L.heap().raw().free(p[0..d.len]);
+        if (d.ptr) |p| L.heap().rawStrings().free(p[0..d.len]);
         d.* = .{ .ptr = null, .len = 0 };
         return 0;
     }
