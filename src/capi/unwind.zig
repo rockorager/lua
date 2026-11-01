@@ -16,6 +16,13 @@
 //!   a `defer` or `errdefer` that is still pending, nor inside one.
 //! - No code outside `src/capi/` calls a C-API function that may throw:
 //!   Zig natives sit below no protected call of their own.
+//! - The interpreter's protected region (`region`): the interpreter loop
+//!   calls C functions without a protected call each, inside one that
+//!   `capi.protectLoop` makes around the loop. No function on the chain
+//!   from that region to the C call has a `defer` or `errdefer`, each
+//!   calls the next only as `try` or `return` does, so a jump skips only
+//!   what the error's return would, and each is named only by the one
+//!   before it.
 //!
 //! The tests run it on the tree and on sources seeded with each kind of
 //! violation.
@@ -147,7 +154,138 @@ pub fn analyze(gpa: std.mem.Allocator, sources: []const Source) !Report {
             try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ file.path, t.line, t.text }));
         };
     }
+    try checkRegion(a, &r);
     return r;
+}
+
+/// The interpreter's protected region. `capi.protectLoop` runs the loop
+/// through one protected call, and the loop calls C functions without
+/// one of their own, so a C function's error jumps over every frame on
+/// this chain, from the function the region calls to the C call: none
+/// may have a `defer` or `errdefer`, and each calls the next (`calls`)
+/// only after `try` or `return`, where an error would have returned
+/// straight through it anyway. Each link is named only by the one
+/// before it (a mention, since `callNativeDirect` passes `callCDirect`
+/// to the inline `callNativeIn`), so nothing reaches the unprotected
+/// call from outside the region. `execute` may name `runLoop` too,
+/// after its first statement returns through `protectLoop` in C-API
+/// builds: the rest is the default build's.
+const region = [_]struct { path: []const u8, name: []const u8, by: []const []const u8, calls: ?[]const u8 = null }{
+    // Its `catch` ends the region: the error becomes the call's result,
+    // as a jump's becomes `failure.err`.
+    .{ .path = "src/capi/capi.zig", .name = "loopEntry", .by = &.{"protectLoop"} },
+    .{ .path = "src/vm.zig", .name = "runLoops", .by = &.{"loopEntry"}, .calls = "runLoop" },
+    .{ .path = "src/vm.zig", .name = "runLoop", .by = &.{ "runLoops", "execute" }, .calls = "callNativeDirect" },
+    .{ .path = "src/vm.zig", .name = "callNativeDirect", .by = &.{"runLoop"}, .calls = "callNativeIn" },
+    // `callC` is its parameter, `callCDirect` here.
+    .{ .path = "src/vm.zig", .name = "callNativeIn", .by = &.{ "callNative", "callNativeDirect" }, .calls = "callC" },
+    .{ .path = "src/capi/capi.zig", .name = "callCDirect", .by = &.{"callNativeDirect"} },
+};
+
+/// The tokens `execute` must start with.
+const execute_guard = "if(comptimelua_options.c_api)returncapi.protectLoop(th);";
+
+fn checkRegion(a: std.mem.Allocator, r: *Report) !void {
+    // Sources without the interpreter (the seeded tests of the rest).
+    for (r.files) |f| {
+        if (std.mem.eql(u8, f.path, "src/vm.zig")) break;
+    } else return;
+    for (region) |link| {
+        const fi = for (r.files, 0..) |f, i| {
+            if (std.mem.eql(u8, f.path, link.path)) break i;
+        } else {
+            const fmt = "{s}: the protected region's {s} is missing";
+            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, link.name }));
+            continue;
+        };
+        const toks = r.files[fi].toks;
+        const body = fnBody(toks, link.name) orelse {
+            const fmt = "{s}: the protected region's {s} is missing";
+            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, link.name }));
+            continue;
+        };
+        for (toks[body[0]..body[1]]) |t| if (t.tag == .keyword_defer or t.tag == .keyword_errdefer) {
+            const fmt = "{s}:{d}: {s}, inside the protected region, has a {s}";
+            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, t.line, link.name, t.text }));
+        };
+        if (link.calls) |callee| for (body[0]..body[1]) |i| {
+            const t = toks[i];
+            if (t.tag != .identifier or !std.mem.eql(u8, t.text, callee) or toks[i + 1].tag != .l_paren) continue;
+            const before = toks[i - 1].tag;
+            if (before == .keyword_try or before == .keyword_return) continue;
+            const fmt = "{s}:{d}: {s} calls {s} other than with try or return, inside the protected region";
+            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, t.line, link.name, callee }));
+        };
+        // Who names it.
+        for (r.files) |file| {
+            for (file.toks, 0..) |t, i| {
+                if (t.tag != .identifier or !std.mem.eql(u8, t.text, link.name)) continue;
+                if (i > 0 and file.toks[i - 1].tag == .keyword_fn) continue;
+                const by = enclosing(file.toks, i) orelse "";
+                const allowed = for (link.by) |b| {
+                    if (std.mem.eql(u8, b, by)) break true;
+                } else false;
+                const guarded = !std.mem.eql(u8, by, "execute") or startsWith(file.toks, by, execute_guard);
+                if (!allowed or !guarded) {
+                    const fmt = "{s}:{d}: {s} names {s}, which runs C code inside the protected region";
+                    try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ file.path, t.line, by, link.name }));
+                }
+            }
+        }
+    }
+}
+
+/// The body, between its braces, of the function `name` declared in
+/// `toks`.
+fn fnBody(toks: []const Tok, name: []const u8) ?[2]usize {
+    var i: usize = 0;
+    while (i + 2 < toks.len) : (i += 1) {
+        if (toks[i].tag != .keyword_fn or toks[i + 1].tag != .identifier or toks[i + 2].tag != .l_paren) continue;
+        if (!std.mem.eql(u8, toks[i + 1].text, name)) continue;
+        const e = skipFn(toks, i);
+        if (toks[e].tag != .r_brace) return null;
+        return .{ matchingOpen(toks, e) + 1, e };
+    }
+    return null;
+}
+
+/// The name of the innermost function whose body holds token `i`.
+fn enclosing(toks: []const Tok, i: usize) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var j: usize = 0;
+    while (j + 2 < toks.len and j < i) : (j += 1) {
+        if (toks[j].tag != .keyword_fn or toks[j + 1].tag != .identifier or toks[j + 2].tag != .l_paren) continue;
+        const e = skipFn(toks, j);
+        if (toks[e].tag == .r_brace and matchingOpen(toks, e) < i and i < e) best = toks[j + 1].text;
+    }
+    return best;
+}
+
+/// Whether the body of function `name` starts with the tokens of `text`,
+/// spaces left out.
+fn startsWith(toks: []const Tok, name: []const u8, text: []const u8) bool {
+    const body = fnBody(toks, name) orelse return false;
+    var rest = text;
+    for (toks[body[0]..body[1]]) |t| {
+        if (rest.len == 0) return true;
+        if (!std.mem.startsWith(u8, rest, t.text)) return false;
+        rest = rest[t.text.len..];
+    }
+    return rest.len == 0;
+}
+
+/// The index of the token that opens the brace closed at `e`.
+fn matchingOpen(toks: []const Tok, e: usize) usize {
+    var depth: usize = 0;
+    var j = e;
+    while (true) : (j -= 1) {
+        if (toks[j].tag == .r_brace) depth += 1;
+        if (toks[j].tag == .l_brace) {
+            depth -= 1;
+            if (depth == 0) return j;
+        }
+        if (j == 0) return 0;
+    }
 }
 
 fn isCapi(path: []const u8) bool {
@@ -509,6 +647,7 @@ test "no Zig frame with a pending defer lies between a protected call and a jump
         .{ "src/capi/capi.zig", "luaSettop" },             .{ "src/capi/capi.zig", "readShim" },
         .{ "src/capi/lauxlib.zig", "lauxError" },          .{ "src/capi/lauxlib.zig", "argError" },
         .{ "src/capi/state.zig", "lauxOpenselectedlibs" }, .{ "src/capi/liolib.zig", "readAll" },
+        .{ "src/capi/capi.zig", "callCDirect" },
     };
     for (throwing) |t| try testing.expectEqual(@as(?bool, true), r.mayThrow(t[0], t[1]));
     const quiet = [_][2][]const u8{
@@ -517,6 +656,7 @@ test "no Zig frame with a pending defer lies between a protected call and a jump
         .{ "src/capi/capi.zig", "deinitThread" },   .{ "src/capi/capi.zig", "cWarn" },
         .{ "src/capi/loadlib.zig", "lookForFunc" }, .{ "src/capi/loadlib.zig", "loadFunc" },
         .{ "src/capi/capi.zig", "activeLines" },    .{ "src/capi/lauxlib.zig", "lauxLoadbufferx" },
+        .{ "src/capi/capi.zig", "callC" },          .{ "src/capi/capi.zig", "protectLoop" },
     };
     for (quiet) |t| try testing.expectEqual(@as(?bool, false), r.mayThrow(t[0], t[1]));
 }
@@ -625,4 +765,85 @@ test "the check finds each kind of violation" {
     try testing.expectEqual(@as(?bool, true), r.mayThrow("src/capi/capi.zig", "luaGood"));
     try testing.expectEqual(@as(?bool, false), r.mayThrow("src/capi/capi.zig", "shim"));
     try testing.expectEqual(@as(?bool, true), r.mayThrow("src/capi/capi.zig", "send"));
+}
+
+const seeded_region_vm =
+    \\fn execute(th: *Thread) Error!void {
+    \\    while (try runLoop(th, false)) {}
+    \\}
+    \\
+++ seeded_region_rest;
+
+const seeded_region_rest =
+    \\pub inline fn runLoops(th: *Thread) Error!void {
+    \\    while (runLoop(th, false) catch |e| return e) {}
+    \\}
+    \\fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
+    \\    var x = alloc();
+    \\    defer x.free();
+    \\    try callNativeDirect(th, 0, 0, x.f);
+    \\    return hooked;
+    \\}
+    \\noinline fn callNative(th: *Thread, func: u32, n: i16, f: NativeFn) Error!void {
+    \\    return callNativeIn(th, func, n, f, capi.callC);
+    \\}
+    \\noinline fn callNativeDirect(th: *Thread, func: u32, n: i16, f: NativeFn) Error!void {
+    \\    return callNativeIn(th, func, n, f, capi.callCDirect);
+    \\}
+    \\inline fn callNativeIn(th: *Thread, func: u32, n: i16, f: NativeFn, comptime callC: anytype) Error!void {
+    \\    _ = try callC(th, func + n);
+    \\}
+    \\fn sneaky(th: *Thread) Error!void {
+    \\    try callNativeDirect(th, 0, 0, null);
+    \\}
+;
+
+const seeded_region_capi =
+    \\pub fn throw(th: *Thread, e: Error) noreturn { jmp.jump(e); }
+    \\pub inline fn callCDirect(th: *Thread, b: u32) Error!u32 {
+    \\    const f: lua_CFunction = cfunction(th, b);
+    \\    return @bitCast(f(th));
+    \\}
+    \\pub inline fn protectLoop(th: *Thread) Error!void {
+    \\    if (jmp.call(&regs, &loopEntry, th, 0, 0) != 0) return failure.err;
+    \\}
+    \\fn loopEntry(th: *Thread) callconv(.c) c_int {
+    \\    vm.runLoops(th) catch return 1;
+    \\    return 0;
+    \\}
+;
+
+const seeded_region_lib =
+    \\const capi = @import("../capi/capi.zig");
+    \\fn grab() void {
+    \\    _ = capi.callCDirect;
+    \\}
+;
+
+test "the check keeps the interpreter's protected region closed" {
+    var r = try analyze(testing.allocator, &.{
+        .{ .path = "src/vm.zig", .text = seeded_region_vm },
+        .{ .path = "src/capi/capi.zig", .text = seeded_region_capi },
+        .{ .path = "src/lib/grab.zig", .text = seeded_region_lib },
+    });
+    defer r.deinit();
+    const expected = [_][]const u8{
+        "src/vm.zig:5: runLoops calls runLoop other than with try or return, inside the protected region",
+        "src/vm.zig:9: runLoop, inside the protected region, has a defer",
+        "src/vm.zig:2: execute names runLoop, which runs C code inside the protected region",
+        "src/vm.zig:23: sneaky names callNativeDirect, which runs C code inside the protected region",
+        "src/lib/grab.zig:3: grab names callCDirect, which runs C code inside the protected region",
+    };
+    try testing.expectEqual(expected.len, r.violations.items.len);
+    for (expected, r.violations.items) |e, v| try testing.expectEqualStrings(e, v);
+    // With its guard, `execute` may name `runLoop`.
+    const guarded = "fn execute(th: *Thread) Error!void {\n" ++
+        "    if (comptime lua_options.c_api) return capi.protectLoop(th);\n" ++
+        "    while (try runLoop(th, false)) {}\n}\n";
+    var g = try analyze(testing.allocator, &.{
+        .{ .path = "src/vm.zig", .text = guarded ++ seeded_region_rest },
+        .{ .path = "src/capi/capi.zig", .text = seeded_region_capi },
+    });
+    defer g.deinit();
+    for (g.violations.items) |v| try testing.expect(std.mem.find(u8, v, "execute") == null);
 }

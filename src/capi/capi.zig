@@ -152,8 +152,15 @@ const Catch = struct {
 /// raises.
 threadlocal var current: ?*Catch = null;
 
-/// The native body of every C function.
-fn trampoline(th: *Thread, b: u32) Error!u32 {
+/// The native body of every C function. `vm.callNative` does not call
+/// it but inlines `callC`, its body.
+pub fn trampoline(th: *Thread, b: u32) Error!u32 {
+    return callC(th, b);
+}
+
+/// Calls the C function at stack slot `b - 1`, protected: its result
+/// count, or the error it raised.
+pub inline fn callC(th: *Thread, b: u32) Error!u32 {
     const cl = th.stack[b - 1].asNativeClosure();
     const r = protect(th, cl.cfn.?, 0, 0);
     // One compare for the common case, `aborted` included.
@@ -163,6 +170,51 @@ fn trampoline(th: *Thread, b: u32) Error!u32 {
     }
     if (th.tbc.items.len != 0) return closeReturn(th, b, @intCast(r));
     return @intCast(r);
+}
+
+/// `callC` without a protected call of its own, for the interpreter
+/// loop's `CALL` and `TAILCALL` (`vm.callNativeDirect`): an error the C
+/// function raises jumps to the region `protectLoop` set up around the
+/// loop, past the loop's frame and `callNativeDirect`'s, which hold
+/// nothing to clean up (`unwind.zig` checks).
+pub inline fn callCDirect(th: *Thread, b: u32) Error!u32 {
+    const cl = th.stack[b - 1].asNativeClosure();
+    const f: lua_CFunction = @ptrCast(@alignCast(cl.cfn.?));
+    const r: u32 = @bitCast(f(th));
+    if (r > th.top - b) return tooMany(th);
+    if (th.tbc.items.len != 0) return closeReturn(th, b, r);
+    return r;
+}
+
+noinline fn tooMany(th: *Thread) Error {
+    @branchHint(.cold);
+    return th.runError("C function returned more results than it pushed", .{});
+}
+
+/// `vm.execute`'s loops inside one protected region, the target of an
+/// error raised by a C function the loop calls directly
+/// (`callCDirect`): one protected call per entry into the loop, not one
+/// per C function (results/capi-perf-20261101.md).
+pub inline fn protectLoop(th: *Thread) Error!void {
+    var c: Catch = .{ .prev = current, .th = th };
+    current = &c;
+    const r = jmp.call(&c.regs, &loopEntry, @intFromPtr(th), 0, 0);
+    current = c.prev;
+    if (r != 0) return loopFailed(r);
+}
+
+/// The loops, with their error as the result, or 0.
+fn loopEntry(th: *Thread) callconv(.c) c_int {
+    vm.runLoops(th) catch |e| return @intFromError(e);
+    return 0;
+}
+
+/// The error `protectLoop`'s call ended with: a C function's, or the
+/// loop's own.
+noinline fn loopFailed(r: u64) Error {
+    @branchHint(.cold);
+    if (r == jmp.aborted) return failure.err;
+    return @errorCast(@errorFromInt(@as(@Int(.unsigned, @bitSizeOf(anyerror)), @intCast(r))));
 }
 
 /// A C function returned `n` results: closes the to-be-closed slots it
@@ -193,7 +245,7 @@ threadlocal var failure: struct { r: u64, err: Error } = undefined;
 inline fn failed(th: *Thread, _: u32) Error!u32 {
     @branchHint(.cold);
     if (failure.r == jmp.aborted) return failure.err;
-    return th.runError("C function returned more results than it pushed", .{});
+    return tooMany(th);
 }
 
 /// The continuation of every native frame that called `lua_callk`,
@@ -324,8 +376,12 @@ fn at(th: *Thread, idx: c_int) ?*const Value {
 
 threadlocal var registry_scratch: Value = .nil;
 
+/// The value at an index, read field by field: a whole copy's 16-byte
+/// load stalls on store forwarding when the slot was just written that
+/// way (an argument by the loop's `MOVE`, the registry's scratch slot).
 inline fn get(th: *Thread, idx: c_int) Value {
-    return if (at(th, idx)) |p| p.* else .nil;
+    const p = at(th, idx) orelse return .nil;
+    return .{ .payload = p.payload, .tag = p.tag };
 }
 
 /// Stores `v` at a valid index, an upvalue with its barrier.
@@ -431,7 +487,15 @@ pub fn luaCloseslot(L: *lua_State, idx: c_int) callconv(.c) void {
 }
 
 pub fn luaPushvalue(L: *lua_State, idx: c_int) callconv(.c) void {
-    push(L, get(L, idx));
+    // Field by field: the value was often just written that way (a
+    // C function's argument, by the loop's `MOVE`), and a whole copy's
+    // 16-byte load would stall on store forwarding.
+    const dst = &L.stack[L.top];
+    if (at(L, idx)) |p| {
+        dst.payload = p.payload;
+        dst.tag = p.tag;
+    } else dst.* = .nil;
+    L.top += 1;
 }
 
 fn reverse(s: []Value) void {

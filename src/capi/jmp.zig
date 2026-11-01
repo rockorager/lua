@@ -2,14 +2,26 @@
 //! longjmp fused into a call, for x86-64 System V and for aarch64 (Linux's
 //! AAPCS64 and Apple's arm64 ABI, which agree on everything used here).
 //!
-//! `call(regs, f, a0, a1, a2)` saves the callee-saved registers, the
-//! stack pointer, and its return address in `regs`, then calls
-//! `f(a0, a1, a2)` and returns its `int` result zero-extended. `jump(regs)`
-//! restores what `call` saved and resumes at its return address with
-//! `aborted` as the result. To the Zig caller either way is an ordinary
-//! return from an ordinary call, so nothing returns twice: no local can be
-//! stale and the optimizer needs no `returns_twice`. C's setjmp cannot
-//! promise that, which is why there is none here (docs/slop/c-api.md).
+//! `call(regs, f, a0, a1, a2)` is inline assembly in its caller: it notes
+//! the stack pointer and the frame pointer in `regs` (and on aarch64 where
+//! to resume), calls `f(a0, a1, a2)`, and gives its `int` result
+//! zero-extended. `jump(regs)` puts back the stack and frame pointers and
+//! resumes right after that call with `aborted` as the result. The
+//! assembly tells the compiler that the call clobbers every register but
+//! the frame and stack pointers, callee-saved ones included, so the
+//! caller keeps nothing in them across it, and nothing needs restoring
+//! but those two: two stores a call, where saving the callee-saved
+//! registers took eight and a function of its own
+//! (docs/slop/results/capi-perf-20261101.md). To the Zig caller either
+//! way is one pass through one piece of assembly, so nothing returns
+//! twice: no local can be stale and the optimizer needs no
+//! `returns_twice`. C's setjmp cannot promise that, which is why there is
+//! none here (docs/slop/c-api.md).
+//!
+//! The jump is sound because between a protected call and its jump sit
+//! only C frames and the one API function that throws (`unwind.zig`
+//! checks it): the return address the call pushed (x86-64) is still in
+//! place, as the C function has not returned.
 //!
 //! The signal mask and the floating-point control and status registers
 //! (x87 control word and MXCSR; FPCR and FPSR) are not saved; C code does
@@ -31,21 +43,18 @@ comptime {
         "and aarch64 Linux and Apple only");
 }
 
-/// What `call` saves. x86-64: rbx, rbp, r12 to r15, the stack pointer
-/// after `call` returns, and its return address. aarch64: x19 to x28, the
-/// frame pointer x29, the return address x30, the stack pointer at entry,
-/// and d8 to d15 (the low halves of v8 to v15, which AAPCS64 has the
-/// callee keep).
+/// What `call` notes: the stack pointer and the frame pointer (rbp, x29)
+/// at the call, and on aarch64 where to resume, as `bl` keeps the return
+/// address in a register.
 pub const Regs = switch (arch) {
     .x86_64 => extern struct {
-        gp: [6]usize = undefined,
         sp: usize = undefined,
-        ip: usize = undefined,
+        fp: usize = undefined,
     },
     else => extern struct {
-        gp: [12]usize = undefined,
         sp: usize = undefined,
-        fp: [8]u64 = undefined,
+        fp: usize = undefined,
+        ip: usize = undefined,
     },
 };
 
@@ -55,103 +64,251 @@ pub const aborted: u64 = ~@as(u64, 0);
 
 /// Calls `f(a0, a1, a2)`; returns its `int` result as an unsigned 32-bit
 /// value, or `aborted` when a `jump` to `regs` ended the call.
+///
+/// The compiler does not see the call, so a function holding one must
+/// keep nothing below the stack pointer: C-API builds have no red zone
+/// (`build.zig`). x86-64: the call is 16-byte aligned whatever the
+/// caller's frame, the stack pointer before it stays in r12 (a C
+/// function keeps it, and `jump` sets it), and the result's zero
+/// extension is the two bytes `jump` skips. aarch64 keeps the stack
+/// pointer 16-byte aligned always; `jump` resumes at the label.
 pub inline fn call(regs: *Regs, f: *const anyopaque, a0: usize, a1: usize, a2: usize) u64 {
-    const p: *const fn (*Regs, *const anyopaque, usize, usize, usize) callconv(.c) u64 = @ptrCast(&callNaked);
-    return p(regs, f, a0, a1, a2);
+    var r: u64 = undefined;
+    var d0: usize = undefined;
+    var d1: usize = undefined;
+    var d2: usize = undefined;
+    var d3: usize = undefined;
+    switch (arch) {
+        .x86_64 => asm volatile (
+            \\  movq %%rsp, %%r12
+            \\  movq %%rsp, 0(%%rcx)
+            \\  movq %%rbp, 8(%%rcx)
+            \\  andq $-16, %%rsp
+            \\  callq *%%rax
+            \\  movl %%eax, %%eax
+            \\  movq %%r12, %%rsp
+            : [r] "={rax}" (r),
+              [d0] "={rdi}" (d0),
+              [d1] "={rsi}" (d1),
+              [d2] "={rdx}" (d2),
+              [d3] "={rcx}" (d3),
+            : [f] "{rax}" (f),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+              [regs] "{rcx}" (regs),
+            : x86_clobbers),
+        // The resume address is the instruction after the zero
+        // extension.
+        else => asm volatile (
+            \\  mov x16, sp
+            \\  str x16, [x3, #0]
+            \\  str x29, [x3, #8]
+            \\  adr x17, 1f
+            \\  str x17, [x3, #16]
+            \\  blr x4
+            \\  mov w0, w0
+            \\1:
+            : [r] "={x0}" (r),
+              [d0] "={x1}" (d0),
+              [d1] "={x2}" (d1),
+              [d2] "={x3}" (d2),
+              [d3] "={x4}" (d3),
+            : [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+              [regs] "{x3}" (regs),
+              [f] "{x4}" (f),
+            : aarch64_clobbers),
+    }
+    return r;
 }
 
-/// Ends the `call` that saved `regs`, which returns `aborted`.
+/// Every register a C call may change or the call sequence uses, but the
+/// operands, the frame pointer, and the stack pointer. LLVM drops a
+/// clobber whose register class the target lacks, so each vector register
+/// is named at every width: without AVX-512 the zmm names do nothing and
+/// the xmm ones carry the clobber. The AVX-512 mask registers and the x87
+/// stack have no names here; the code around a call holds nothing in
+/// them.
+const x86_clobbers: std.builtin.assembly.Clobbers = if (arch == .x86_64) .{
+    .memory = true,
+    .cc = true,
+    .dirflag = true,
+    .fpsr = true,
+    .rbx = true,
+    .r8 = true,
+    .r9 = true,
+    .r10 = true,
+    .r11 = true,
+    .r12 = true,
+    .r13 = true,
+    .r14 = true,
+    .r15 = true,
+    .xmm0 = true,
+    .xmm1 = true,
+    .xmm2 = true,
+    .xmm3 = true,
+    .xmm4 = true,
+    .xmm5 = true,
+    .xmm6 = true,
+    .xmm7 = true,
+    .xmm8 = true,
+    .xmm9 = true,
+    .xmm10 = true,
+    .xmm11 = true,
+    .xmm12 = true,
+    .xmm13 = true,
+    .xmm14 = true,
+    .xmm15 = true,
+    .ymm0 = true,
+    .ymm1 = true,
+    .ymm2 = true,
+    .ymm3 = true,
+    .ymm4 = true,
+    .ymm5 = true,
+    .ymm6 = true,
+    .ymm7 = true,
+    .ymm8 = true,
+    .ymm9 = true,
+    .ymm10 = true,
+    .ymm11 = true,
+    .ymm12 = true,
+    .ymm13 = true,
+    .ymm14 = true,
+    .ymm15 = true,
+    .zmm0 = true,
+    .zmm1 = true,
+    .zmm2 = true,
+    .zmm3 = true,
+    .zmm4 = true,
+    .zmm5 = true,
+    .zmm6 = true,
+    .zmm7 = true,
+    .zmm8 = true,
+    .zmm9 = true,
+    .zmm10 = true,
+    .zmm11 = true,
+    .zmm12 = true,
+    .zmm13 = true,
+    .zmm14 = true,
+    .zmm15 = true,
+    .zmm16 = true,
+    .zmm17 = true,
+    .zmm18 = true,
+    .zmm19 = true,
+    .zmm20 = true,
+    .zmm21 = true,
+    .zmm22 = true,
+    .zmm23 = true,
+    .zmm24 = true,
+    .zmm25 = true,
+    .zmm26 = true,
+    .zmm27 = true,
+    .zmm28 = true,
+    .zmm29 = true,
+    .zmm30 = true,
+    .zmm31 = true,
+} else undefined;
+
+/// x18 is Apple's platform register, which nothing may touch, and a
+/// temporary on Linux. The v names cover the whole vector registers.
+const aarch64_clobbers: std.builtin.assembly.Clobbers = if (arch == .aarch64) .{
+    .memory = true,
+    .nzcv = true,
+    .fpsr = true,
+    .x5 = true,
+    .x6 = true,
+    .x7 = true,
+    .x8 = true,
+    .x9 = true,
+    .x10 = true,
+    .x11 = true,
+    .x12 = true,
+    .x13 = true,
+    .x14 = true,
+    .x15 = true,
+    .x16 = true,
+    .x17 = true,
+    .x18 = !builtin.os.tag.isDarwin(),
+    .x19 = true,
+    .x20 = true,
+    .x21 = true,
+    .x22 = true,
+    .x23 = true,
+    .x24 = true,
+    .x25 = true,
+    .x26 = true,
+    .x27 = true,
+    .x28 = true,
+    // x30 by LLVM's name for it; `.x30` alone does not reach it.
+    .lr = true,
+    .v0 = true,
+    .v1 = true,
+    .v2 = true,
+    .v3 = true,
+    .v4 = true,
+    .v5 = true,
+    .v6 = true,
+    .v7 = true,
+    .v8 = true,
+    .v9 = true,
+    .v10 = true,
+    .v11 = true,
+    .v12 = true,
+    .v13 = true,
+    .v14 = true,
+    .v15 = true,
+    .v16 = true,
+    .v17 = true,
+    .v18 = true,
+    .v19 = true,
+    .v20 = true,
+    .v21 = true,
+    .v22 = true,
+    .v23 = true,
+    .v24 = true,
+    .v25 = true,
+    .v26 = true,
+    .v27 = true,
+    .v28 = true,
+    .v29 = true,
+    .v30 = true,
+    .v31 = true,
+} else undefined;
+
+/// Ends the `call` that noted `regs`, which returns `aborted`.
 pub inline fn jump(regs: *const Regs) noreturn {
     const p: *const fn (*const Regs) callconv(.c) noreturn = @ptrCast(&jumpNaked);
     p(regs);
 }
 
-// Naked functions rather than module-level assembly, which Zig's own
+// A naked function rather than module-level assembly, which Zig's own
 // x86-64 backend (Debug builds) does not emit.
-fn callNaked() callconv(.naked) void {
-    switch (arch) {
-        .x86_64 => asm volatile (
-            \\  movq %%rbx, 0(%%rdi)
-            \\  movq %%rbp, 8(%%rdi)
-            \\  movq %%r12, 16(%%rdi)
-            \\  movq %%r13, 24(%%rdi)
-            \\  movq %%r14, 32(%%rdi)
-            \\  movq %%r15, 40(%%rdi)
-            \\  leaq 8(%%rsp), %%rax
-            \\  movq %%rax, 48(%%rdi)
-            \\  movq (%%rsp), %%rax
-            \\  movq %%rax, 56(%%rdi)
-            \\  movq %%rsi, %%rax
-            \\  movq %%rdx, %%rdi
-            \\  movq %%rcx, %%rsi
-            \\  movq %%r8, %%rdx
-            \\  subq $8, %%rsp
-            \\  callq *%%rax
-            \\  addq $8, %%rsp
-            \\  movl %%eax, %%eax
-            \\  retq
-        ),
-        // x0 = regs, x1 = f, x2..x4 = its arguments. The frame record
-        // pushed before the call keeps x29 a valid chain, as Apple's ABI
-        // requires at every call and unwinders expect; x18, the platform
-        // register on Apple, is not touched.
-        else => asm volatile (
-            \\  stp x19, x20, [x0, #0]
-            \\  stp x21, x22, [x0, #16]
-            \\  stp x23, x24, [x0, #32]
-            \\  stp x25, x26, [x0, #48]
-            \\  stp x27, x28, [x0, #64]
-            \\  stp x29, x30, [x0, #80]
-            \\  mov x9, sp
-            \\  str x9, [x0, #96]
-            \\  stp d8, d9, [x0, #104]
-            \\  stp d10, d11, [x0, #120]
-            \\  stp d12, d13, [x0, #136]
-            \\  stp d14, d15, [x0, #152]
-            \\  stp x29, x30, [sp, #-16]!
-            \\  mov x29, sp
-            \\  mov x9, x1
-            \\  mov x0, x2
-            \\  mov x1, x3
-            \\  mov x2, x4
-            \\  blr x9
-            \\  ldp x29, x30, [sp], #16
-            \\  mov w0, w0
-            \\  ret
-        ),
-    }
-}
-
 fn jumpNaked() callconv(.naked) void {
     switch (arch) {
+        // The stack pointer `call` aligned its call at, then the return
+        // address that call pushed, two bytes past which is the end of
+        // `call`'s zero extension. The stack pointer moves up to that
+        // address's slot only after it is read.
         .x86_64 => asm volatile (
-            \\  movq 0(%%rdi), %%rbx
             \\  movq 8(%%rdi), %%rbp
-            \\  movq 16(%%rdi), %%r12
-            \\  movq 24(%%rdi), %%r13
-            \\  movq 32(%%rdi), %%r14
-            \\  movq 40(%%rdi), %%r15
-            \\  movq 48(%%rdi), %%rsp
+            \\  movq 0(%%rdi), %%r12
+            \\  movq %%r12, %%rax
+            \\  andq $-16, %%rax
+            \\  movq -8(%%rax), %%rcx
+            \\  movq %%rax, %%rsp
+            \\  addq $2, %%rcx
             \\  movq $-1, %%rax
-            \\  jmpq *56(%%rdi)
+            \\  jmpq *%%rcx
         ),
-        // Back to `call`'s caller with `call`'s own registers and stack,
-        // as its `ret` would.
         else => asm volatile (
-            \\  ldp x19, x20, [x0, #0]
-            \\  ldp x21, x22, [x0, #16]
-            \\  ldp x23, x24, [x0, #32]
-            \\  ldp x25, x26, [x0, #48]
-            \\  ldp x27, x28, [x0, #64]
-            \\  ldp x29, x30, [x0, #80]
-            \\  ldr x9, [x0, #96]
-            \\  mov sp, x9
-            \\  ldp d8, d9, [x0, #104]
-            \\  ldp d10, d11, [x0, #120]
-            \\  ldp d12, d13, [x0, #136]
-            \\  ldp d14, d15, [x0, #152]
+            \\  ldr x29, [x0, #8]
+            \\  ldr x16, [x0, #0]
+            \\  mov sp, x16
+            \\  ldr x17, [x0, #16]
             \\  mov x0, #-1
-            \\  ret
+            \\  br x17
         ),
     }
 }
@@ -163,18 +320,24 @@ fn jumpNaked() callconv(.naked) void {
 /// The `Regs` the clobbering function jumps to.
 var test_regs: Regs = .{};
 
-/// Overwrites every callee-saved register, then jumps to `test_regs`
-/// without returning, so only `jump` can give the caller its registers
-/// back.
-fn clobberAndJump(_: usize, _: usize, _: usize) callconv(.c) c_int {
+/// Overwrites every callee-saved register and the frame pointer, then
+/// jumps to `regs` (its first argument) through `j` (its second,
+/// `jumpNaked`) without returning, so only `jump` can give the caller its
+/// frame back.
+fn clobberAndJump() callconv(.naked) void {
     switch (arch) {
         .x86_64 => asm volatile (
+            \\  movq %%rsi, %%rax
             \\  movq $-1, %%rbx
+            \\  movq $-1, %%rbp
             \\  movq $-1, %%r12
             \\  movq $-1, %%r13
             \\  movq $-1, %%r14
             \\  movq $-1, %%r15
-            ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true }),
+            \\  movq $-1, %%rsi
+            \\  subq $256, %%rsp
+            \\  jmpq *%%rax
+        ),
         else => asm volatile (
             \\  mov x9, #-1
             \\  mov x19, x9
@@ -187,6 +350,7 @@ fn clobberAndJump(_: usize, _: usize, _: usize) callconv(.c) c_int {
             \\  mov x26, x9
             \\  mov x27, x9
             \\  mov x28, x9
+            \\  mov x29, x9
             \\  fmov d8, x9
             \\  fmov d9, x9
             \\  fmov d10, x9
@@ -195,158 +359,38 @@ fn clobberAndJump(_: usize, _: usize, _: usize) callconv(.c) c_int {
             \\  fmov d13, x9
             \\  fmov d14, x9
             \\  fmov d15, x9
-            ::: .{
-                .x9 = true,
-                .x19 = true,
-                .x20 = true,
-                .x21 = true,
-                .x22 = true,
-                .x23 = true,
-                .x24 = true,
-                .x25 = true,
-                .x26 = true,
-                .x27 = true,
-                .x28 = true,
-                .d8 = true,
-                .d9 = true,
-                .d10 = true,
-                .d11 = true,
-                .d12 = true,
-                .d13 = true,
-                .d14 = true,
-                .d15 = true,
-            }),
-    }
-    jump(&test_regs);
-}
-
-/// `probe(out, &test_regs, clobberAndJump, callNaked)` puts `100 + n` in
-/// callee-saved register n, makes the protected call
-/// `call(&test_regs, clobberAndJump, 0, 0, 0)`, and writes the registers
-/// and the call's result to `out`: rbx, rbp, r12 to r15, the result; or
-/// x19 to x28, d8 to d15, the result.
-fn probe() callconv(.naked) void {
-    switch (arch) {
-        .x86_64 => asm volatile (
-            \\  pushq %%rbx
-            \\  pushq %%rbp
-            \\  pushq %%r12
-            \\  pushq %%r13
-            \\  pushq %%r14
-            \\  pushq %%r15
-            \\  pushq %%rdi
-            \\  movq $100, %%rbx
-            \\  movq $101, %%rbp
-            \\  movq $102, %%r12
-            \\  movq $103, %%r13
-            \\  movq $104, %%r14
-            \\  movq $105, %%r15
-            \\  movq %%rcx, %%rax
-            \\  movq %%rsi, %%rdi
-            \\  movq %%rdx, %%rsi
-            \\  xorl %%edx, %%edx
-            \\  xorl %%ecx, %%ecx
-            \\  xorl %%r8d, %%r8d
-            \\  callq *%%rax
-            \\  popq %%rdi
-            \\  movq %%rbx, 0(%%rdi)
-            \\  movq %%rbp, 8(%%rdi)
-            \\  movq %%r12, 16(%%rdi)
-            \\  movq %%r13, 24(%%rdi)
-            \\  movq %%r14, 32(%%rdi)
-            \\  movq %%r15, 40(%%rdi)
-            \\  movq %%rax, 48(%%rdi)
-            \\  popq %%r15
-            \\  popq %%r14
-            \\  popq %%r13
-            \\  popq %%r12
-            \\  popq %%rbp
-            \\  popq %%rbx
-            \\  retq
-        ),
-        else => asm volatile (
-            \\  stp x29, x30, [sp, #-16]!
-            \\  mov x29, sp
-            \\  sub sp, sp, #160
-            \\  stp x19, x20, [sp, #0]
-            \\  stp x21, x22, [sp, #16]
-            \\  stp x23, x24, [sp, #32]
-            \\  stp x25, x26, [sp, #48]
-            \\  stp x27, x28, [sp, #64]
-            \\  stp d8, d9, [sp, #80]
-            \\  stp d10, d11, [sp, #96]
-            \\  stp d12, d13, [sp, #112]
-            \\  stp d14, d15, [sp, #128]
-            \\  str x0, [sp, #144]
-            \\  mov x19, #100
-            \\  mov x20, #101
-            \\  mov x21, #102
-            \\  mov x22, #103
-            \\  mov x23, #104
-            \\  mov x24, #105
-            \\  mov x25, #106
-            \\  mov x26, #107
-            \\  mov x27, #108
-            \\  mov x28, #109
-            \\  mov x10, #110
-            \\  fmov d8, x10
-            \\  mov x10, #111
-            \\  fmov d9, x10
-            \\  mov x10, #112
-            \\  fmov d10, x10
-            \\  mov x10, #113
-            \\  fmov d11, x10
-            \\  mov x10, #114
-            \\  fmov d12, x10
-            \\  mov x10, #115
-            \\  fmov d13, x10
-            \\  mov x10, #116
-            \\  fmov d14, x10
-            \\  mov x10, #117
-            \\  fmov d15, x10
-            \\  mov x9, x3
-            \\  mov x0, x1
-            \\  mov x1, x2
-            \\  mov x2, #0
-            \\  mov x3, #0
-            \\  mov x4, #0
-            \\  blr x9
-            \\  ldr x9, [sp, #144]
-            \\  stp x19, x20, [x9, #0]
-            \\  stp x21, x22, [x9, #16]
-            \\  stp x23, x24, [x9, #32]
-            \\  stp x25, x26, [x9, #48]
-            \\  stp x27, x28, [x9, #64]
-            \\  stp d8, d9, [x9, #80]
-            \\  stp d10, d11, [x9, #96]
-            \\  stp d12, d13, [x9, #112]
-            \\  stp d14, d15, [x9, #128]
-            \\  str x0, [x9, #144]
-            \\  ldp x19, x20, [sp, #0]
-            \\  ldp x21, x22, [sp, #16]
-            \\  ldp x23, x24, [sp, #32]
-            \\  ldp x25, x26, [sp, #48]
-            \\  ldp x27, x28, [sp, #64]
-            \\  ldp d8, d9, [sp, #80]
-            \\  ldp d10, d11, [sp, #96]
-            \\  ldp d12, d13, [sp, #112]
-            \\  ldp d14, d15, [sp, #128]
-            \\  add sp, sp, #160
-            \\  ldp x29, x30, [sp], #16
-            \\  ret
+            \\  sub sp, sp, #256
+            \\  br x1
         ),
     }
 }
 
-test "a jump gives the protected call's caller back its registers" {
-    const n = switch (arch) {
-        .x86_64 => 6,
-        else => 18,
-    };
-    var out: [n + 1]u64 = @splat(0);
-    const P = fn (*[n + 1]u64, *Regs, *const anyopaque, *const anyopaque) callconv(.c) void;
-    const p: *const P = @ptrCast(&probe);
-    p(&out, &test_regs, @ptrCast(&clobberAndJump), @ptrCast(&callNaked));
-    for (out[0..n], 0..) |v, i| try std.testing.expectEqual(100 + i, v);
-    try std.testing.expectEqual(aborted, out[n]);
+fn returnMinusOne(_: usize, _: usize, _: usize) callconv(.c) c_int {
+    return -1;
+}
+
+/// Values live across a protected call: more than there are registers,
+/// so the compiler keeps some in the frame and, where it can, one in the
+/// frame pointer, which only `jump` can give back.
+noinline fn liveAcross(seed: u64, f: *const anyopaque) [24]u64 {
+    var v: [24]u64 = undefined;
+    inline for (&v, 0..) |*x, i| x.* = seed *% (i + 3) +% i;
+    const r = call(&test_regs, f, @intFromPtr(&test_regs), @intFromPtr(&jumpNaked), 0);
+    var out: [24]u64 = undefined;
+    inline for (&out, v) |*o, x| o.* = x +% r;
+    return out;
+}
+
+test "a jump gives the protected call's caller back its frame and values" {
+    var seed: u64 = 0x1234_5678_9abc;
+    std.mem.doNotOptimizeAway(&seed);
+    const out = liveAcross(seed, @ptrCast(&clobberAndJump));
+    for (out, 0..) |o, i| try std.testing.expectEqual((seed *% (i + 3) +% i) +% aborted, o);
+}
+
+test "a protected call that returns zero-extends the int" {
+    var seed: u64 = 99;
+    std.mem.doNotOptimizeAway(&seed);
+    const out = liveAcross(seed, @ptrCast(&returnMinusOne));
+    for (out, 0..) |o, i| try std.testing.expectEqual((seed *% (i + 3) +% i) +% 0xffff_ffff, o);
 }

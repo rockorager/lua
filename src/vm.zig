@@ -39,6 +39,8 @@ const number = @import("number.zig");
 const libm = @import("lib/libm.zig");
 const debuginfo = @import("debuginfo.zig");
 const lua_options = @import("lua_options");
+/// Referenced only in C-API builds.
+const capi = @import("capi/capi.zig");
 
 const Error = Value.Error;
 const KFn = Value.KFn;
@@ -209,6 +211,14 @@ pub fn pcallk(th: *Thread, func: u32, nresults: i16, msgh: u32, ctx: u32, k: KFn
 fn callYieldable(th: *Thread, func: u32, nresults: i16) Error!void {
     try enterNative(th);
     defer th.native_calls -= 1;
+    if (comptime lua_options.c_api) {
+        const f = th.stack[func];
+        if (f.tag == .lua_closure) {
+            try pushLuaFrame(th, func, f.asLuaClosure().proto, nresults);
+            th.frame().flags.fresh = true;
+            return execute(th);
+        }
+    }
     const depth = th.frames.items.len;
     try preCall(th, func, nresults);
     if (th.frames.items.len > depth) {
@@ -386,6 +396,21 @@ inline fn pushLuaFrame(th: *Thread, func: u32, p: *const Proto, nresults: i16) E
 }
 
 noinline fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn) Error!void {
+    return callNativeIn(th, func, nresults, f, if (lua_options.c_api) capi.callC else {});
+}
+
+/// `callNative` for the loop's `CALL` and `TAILCALL` in C-API builds: a C
+/// function runs without a protected call of its own, inside the region
+/// `execute` protects, which a C function's error jumps to. Neither the
+/// loop nor this holds anything such a jump must clean up
+/// (`capi/unwind.zig` checks; results/capi-perf-20261101.md).
+noinline fn callNativeDirect(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn) Error!void {
+    return callNativeIn(th, func, nresults, f, capi.callCDirect);
+}
+
+/// A native call, with `callC` the C API's call of a C function in C-API
+/// builds.
+inline fn callNativeIn(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn, comptime callC: anytype) Error!void {
     try th.ensureStack(Thread.min_stack);
     if (th.frames.items.len == th.frames.capacity) try th.frames.ensureUnusedCapacity(th.heap().allocator(), 1);
     th.frames.appendAssumeCapacity(.{
@@ -396,7 +421,14 @@ noinline fn callNative(th: *Thread, func: u32, nresults: i16, f: Value.NativeFn)
     });
     if (th.hookmask & Thread.HookMask.call != 0) try callHook(th, .call, -1, 1, th.top - func - 1);
     const bytes = th.state.heap.bytes;
-    const n = try f(th, func + 1);
+    // A C function's trampoline runs here, inlined: one native frame
+    // fewer per call into C (results/capi-perf-20261101.md).
+    const n = if (comptime !lua_options.c_api)
+        try f(th, func + 1)
+    else if (f != &capi.trampoline)
+        try f(th, func + 1)
+    else
+        try callC(th, func + 1);
     std.debug.assert(n <= th.top - func - 1);
     if (th.hookmask != 0) try retHook(th, th.top - n, n);
     moveResults(th, func, th.top - n, n, nresults);
@@ -952,7 +984,17 @@ inline fn dispatchOp(i: Instruction) Dispatch {
 /// before each instruction and at calls and returns. Each switches to the
 /// other when the thread's hook mask changes, which only code the loop
 /// calls out to can do.
+///
+/// In C-API builds the loops run inside one protected region
+/// (`capi.protectLoop`), which a C function the loop calls directly
+/// (`callNativeDirect`) raises its errors to.
 fn execute(th: *Thread) Error!void {
+    if (comptime lua_options.c_api) return capi.protectLoop(th);
+    while (if (th.hookmask != 0) try runLoop(th, true) else try runLoop(th, false)) {}
+}
+
+/// `execute`'s loops, which `capi.protectLoop` runs in C-API builds.
+pub inline fn runLoops(th: *Thread) Error!void {
     while (if (th.hookmask != 0) try runLoop(th, true) else try runLoop(th, false)) {}
 }
 
@@ -1681,7 +1723,10 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     callee.tag == .native_fn;
                 if (direct) {
                     const f = if (callee.tag == .native_fn) callee.asNative() else callee.asNativeClosure().f;
-                    try callNative(th, func, nres, f);
+                    if (lua_options.c_api)
+                        try callNativeDirect(th, func, nres, f)
+                    else
+                        try callNative(th, func, nres, f);
                 } else {
                     const depth = th.frames.items.len;
                     try preCall(th, func, nres);
@@ -1729,7 +1774,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                 // results from this frame.
                 const callee = th.stack[func];
                 const f = if (callee.tag == .native_fn) callee.asNative() else callee.asNativeClosure().f;
-                try callNative(th, func, -1, f);
+                if (lua_options.c_api) try callNativeDirect(th, func, -1, f) else try callNative(th, func, -1, f);
                 ci = th.frame();
                 ci.func -= delta;
                 // The native may have set a hook: check the mask.

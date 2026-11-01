@@ -11,6 +11,10 @@ pub fn build(b: *std.Build) void {
         (b.option(bool, "c_api", "Same as -Dc-api, under the name a dependency passes") orelse false);
     const lua_options = b.addOptions();
     lua_options.addOption(bool, "c_api", c_api);
+    // The C API's protected calls call C from inline assembly the
+    // compiler does not see as a call, so code holding one must keep
+    // nothing below the stack pointer (src/capi/jmp.zig).
+    const red_zone: ?bool = if (c_api) false else null;
 
     // The one exported module. Everything below is a developer step, so a
     // consumer's fetch graph stops at this module.
@@ -19,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = if (c_api) true else null,
+        .red_zone = red_zone,
     });
     mod.addOptions("lua_options", lua_options);
 
@@ -40,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_fp,
         .unwind_tables = unwind,
         .link_libc = if (c_api) true else null,
+        .red_zone = red_zone,
     });
     exe_mod.addOptions("lua_options", lua_options);
     const exe = b.addExecutable(.{
@@ -79,6 +85,7 @@ pub fn build(b: *std.Build) void {
                 .omit_frame_pointer = omit_fp,
                 .link_libc = true,
                 .pic = true,
+                .red_zone = false,
             });
             lib_mod.addOptions("lua_options", lua_options);
             const liblua = b.addLibrary(.{
