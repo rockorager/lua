@@ -474,6 +474,11 @@ bench-compare ROUNDS="10" *PROGRAMS:
         exit 1
     fi
 
+[doc("Redraw the README's benchmark chart, docs/static/benchmark.svg and benchmark-dark.svg, from `just bench-compare`'s benchstat.txt or another FILE holding its tables: a bar per row for each of ARMS against ref, or for the first column alone")]
+[group("bench")]
+bench-plot FILE="zig-out/bench-compare/benchstat.txt" *ARMS:
+    lua bench/plot/plot.lua {{ quote(FILE) }} {{ ARMS }}
+
 [doc("The embedding API against the engine's own path (bench/api): each scenario, or only SCENARIOS, on both arms in interleaved rounds on one core, with time per operation and peak RSS, the work checked equal, then benchstat")]
 [group("bench")]
 bench-api ROUNDS="10" *SCENARIOS:

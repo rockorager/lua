@@ -50,6 +50,8 @@ Every run's output must match the reference's first run. A program whose output 
 
 `just bench-compare 20 fib nbody` runs only those programs, for a tighter A/B on one change.
 
+`just bench-plot` redraws the README's chart from the last run's `benchstat.txt`: each program's median wall time and peak RSS as a share of the reference's, one bar for each arm it names. After `just optimize="ReleaseFast ReleaseFast-capi" bench-compare`, the README's is `just bench-plot zig-out/bench-compare/benchstat.txt ours-ReleaseFast ours-ReleaseFast-capi`.
+
 ## The embedding API
 
 `bench/api/main.zig` is a Zig program, not a Lua one: it times calls through the embedding API (`lua.State`) against the same work written directly on the engine, as the standard library writes it. `just bench-api [ROUNDS] [SCENARIOS...]` runs both arms in interleaved rounds pinned to the last core, checks that they did the same work, and compares time per operation and peak RSS with benchstat.
