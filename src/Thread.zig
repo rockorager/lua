@@ -275,7 +275,8 @@ pub inline fn frame(th: *Thread) *Frame {
 
 /// Pushes a value; the caller made room.
 pub inline fn push(th: *Thread, v: Value) void {
-    th.stack[th.top] = v;
+    th.stack[th.top].payload = v.payload;
+    th.stack[th.top].tag = v.tag;
     th.top += 1;
 }
 

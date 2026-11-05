@@ -25,8 +25,9 @@ Headlines:
   776 KB to 811 KB. Startup is unchanged at 560 KiB.
 - Against the reference, 0.17 is −28.8% time (0.16: −27.6%); methods
   drops from −19% to −8% faster than the reference.
-- Not yet investigated: why `methods` (the `__index` chain and
-  metamethod calls) lost 14%.
+- `methods`: half the loss was a store-forwarding stall in
+  `Thread.push`, fixed in `thread-push-20261105.md`; the rest is register
+  allocation in the `GETFIELD`/`SELF` handler.
 
 Text size (`size`, ReleaseFast default build): 0.16 775781 bytes, 0.17 810808.
 
