@@ -148,13 +148,13 @@ const cstream = struct {
     }
 
     fn failed() isize {
-        std.c._errno().* = @intFromEnum(std.c.E.IO);
+        std.c._errno().* = @backingInt(std.c.E.IO);
         return -1;
     }
 
     /// The embedder's writer is not a file to seek.
     fn cookieSeek(_: *anyopaque, _: *i64, _: c_int) callconv(.c) c_int {
-        std.c._errno().* = @intFromEnum(std.c.E.SPIPE);
+        std.c._errno().* = @backingInt(std.c.E.SPIPE);
         return -1;
     }
 
@@ -246,7 +246,7 @@ pub noinline fn typeError(th: *Thread, base: u32, arg: u32, fname: []const u8, e
     @branchHint(.cold);
     var buf: [128]u8 = undefined;
     const got = typeNameForError(th, opt(th, base, arg));
-    const msg = std.fmt.bufPrint(&buf, "{s} expected, got {s}", .{ expected, got }) catch &buf;
+    const msg = std.mem.print(&buf, "{s} expected, got {s}", .{ expected, got }) catch &buf;
     return argError(th, arg, fname, msg);
 }
 
@@ -328,7 +328,7 @@ pub fn checkOption(
         (try checkString(th, base, arg, fname)).bytes();
     for (options, 0..) |o, i| if (std.mem.eql(u8, o, name)) return i;
     var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "invalid option '{s}'", .{name[0..@min(name.len, 80)]}) catch &buf;
+    const msg = std.mem.print(&buf, "invalid option '{s}'", .{name[0..@min(name.len, 80)]}) catch &buf;
     return argError(th, arg, fname, msg);
 }
 
@@ -397,7 +397,7 @@ pub fn loadChunk(th: *Thread, src: [:0]const u8, chunkname_arg: []const u8, mode
 /// message handler sees it (`luaD_throw`).
 fn throwFmt(th: *Thread, comptime fmt: []const u8, args: anytype) Error {
     var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch &buf;
+    const s = std.mem.print(&buf, fmt, args) catch &buf;
     return th.throwRaw(.string(try th.state.newString(s)));
 }
 
@@ -432,7 +432,7 @@ pub fn readSourceFile(th: *Thread, path: ?[]const u8) Error![:0]u8 {
     }
     if (start == 0) return raw;
     defer gpa.free(raw);
-    return gpa.dupeZ(u8, raw[start..]);
+    return gpa.dupeSentinel(u8, raw[start..], 0);
 }
 
 fn readAll(host: *Host, gpa: std.mem.Allocator, path: ?[]const u8) ![:0]u8 {

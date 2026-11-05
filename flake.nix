@@ -1,6 +1,8 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    # Zig 0.17.1 is on master but not yet on nixos-unstable; return to
+    # nixos-unstable once the channel has it.
+    nixpkgs.url = "github:nixos/nixpkgs/master";
     flake-parts.follows = "baskingspot/flake-parts";
     baskingspot = {
       url = "github:baskingspot/nix";
@@ -15,7 +17,7 @@
       # version: pick that once, in the import.
       imports = with inputs.baskingspot.flakeModules; [
         base
-        zig."0.16"
+        zig."0.17"
       ];
 
       perSystem =

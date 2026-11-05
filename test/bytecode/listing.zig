@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         // its newline, so line numbers stay.
         var src: [:0]const u8 = raw;
         if (src.len > 0 and src[0] == '#') src = src[std.mem.findScalar(u8, src, '\n') orelse src.len ..];
-        const name = try std.fmt.allocPrint(gpa, "@{s}", .{path});
+        const name = try gpa.print("@{s}", .{path});
         defer gpa.free(name);
         const p = lua.Parser.compile(state.main, src, name) catch |e| switch (e) {
             error.LuaError => {

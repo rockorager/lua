@@ -85,7 +85,7 @@ pub const Args = struct {
     pub noinline fn argError(a: *const Args, n: u32, comptime fmt: []const u8, args: anytype) Error {
         @branchHint(.cold);
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+        const msg = std.mem.print(&buf, fmt, args) catch buf[0..];
         return debuginfo.argError(a.th, n, a.name, msg);
     }
 

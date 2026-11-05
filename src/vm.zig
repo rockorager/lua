@@ -944,7 +944,7 @@ noinline fn traceExec(th: *Thread, pc: [*]const u32) Error!void {
 /// instruction before it (`luaP_isIT`).
 fn usesTop(i: Instruction) bool {
     const o = op(i);
-    if (!opcodes.props[@intFromEnum(o)].in_top) return false;
+    if (!opcodes.props[@backingInt(o)].in_top) return false;
     return if (o == .setlist) opcodes.vb(i) == 0 else getB(i) == 0;
 }
 
@@ -972,10 +972,15 @@ inline fn fetchSkip(pc: *[*]const u32, i: *Instruction) Dispatch {
 /// the compiler, whose encoders take an `OpCode`, or from `undump`, which
 /// rejects any other; a new source of code must check the same
 /// (`results/opcode-check-20261031.md`).
-const Dispatch = @Enum(u7, .nonexhaustive, std.meta.fieldNames(opcodes.OpCode), &std.simd.iota(u7, opcodes.props.len));
+const Dispatch = @Enum(
+    u7,
+    .nonexhaustive,
+    @typeInfo(opcodes.OpCode).@"enum".field_names,
+    &std.simd.iota(u7, opcodes.props.len),
+);
 
 inline fn dispatchOp(i: Instruction) Dispatch {
-    return @enumFromInt(@as(u7, @truncate(i)));
+    return @fromBackingInt(@intCast(@as(u7, @truncate(i))));
 }
 
 /// Runs Lua frames from the current one until a frame flagged `fresh`
@@ -1383,7 +1388,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     .addk, .subk, .mulk, .modk, .powk, .divk, .idivk => k[getC(i)],
                     else => base[getC(i)],
                 };
-                const ao: ArithOp = comptime arithOf(@enumFromInt(@intFromEnum(o)));
+                const ao: ArithOp = comptime arithOf(@fromBackingInt(@intCast(@backingInt(o))));
                 if (rb.tag == .int and rc.tag == .int and ao.intOp()) {
                     const x = rb.payload.int;
                     const y = rc.payload.int;
@@ -1459,7 +1464,7 @@ fn runLoop(th: *Thread, comptime hooked: bool) Error!bool {
                     o2 = o1;
                     o1 = .none;
                 }
-                const event: Tm = @enumFromInt(getC(i));
+                const event: Tm = @fromBackingInt(@intCast(getC(i)));
                 const dest = ci.base() + getA((pc - 2)[0]);
                 ci.pc = pc;
                 const depth = th.frames.items.len;
@@ -2514,7 +2519,7 @@ pub const ArithOp = enum(u8) {
     }
 
     fn event(a: ArithOp) Tm {
-        return @enumFromInt(@intFromEnum(Tm.add) + @intFromEnum(a));
+        return @fromBackingInt(@intCast(@backingInt(Tm.add) + @backingInt(a)));
     }
 };
 
@@ -3531,7 +3536,7 @@ test "Lua metamethods finish their instructions: __index, __add, __lt" {
         // The __lt result was cached as present; __eq's absence is cached
         // after a miss.
         try testing.expectEqual(@as(?Value, null), state.fastTm(mt, .eq));
-        try testing.expect(mt.flags & (1 << @intFromEnum(Tm.eq)) != 0);
+        try testing.expect(mt.flags & (1 << @backingInt(Tm.eq)) != 0);
     }
 }
 
@@ -3588,7 +3593,7 @@ test "concatenation of strings and numbers, short and long results" {
     defer state.destroy();
     const main = try makeProto(state, .{
         .maxstack = 6,
-        .k = &.{ try str(state, "a"), try str(state, "b"), .float(2.5), try str(state, "x" ** 40) },
+        .k = &.{ try str(state, "a"), try str(state, "b"), .float(2.5), try str(state, &@as([40]u8, @splat('x'))) },
         .code = &.{
             abx(.loadk, 0, 0),
             asbx(.loadi, 1, 1),
@@ -3605,7 +3610,7 @@ test "concatenation of strings and numbers, short and long results" {
     const r = try run(state, main);
     try testing.expectEqualStrings("a1b2.5", r[0].asString().bytes());
     try testing.expect(r[0].asString().isShort());
-    try testing.expectEqualStrings("a1b2.5" ++ "x" ** 40, r[1].asString().bytes());
+    try testing.expectEqualStrings("a1b2.5" ++ &@as([40]u8, @splat('x')), r[1].asString().bytes());
     try testing.expect(!r[1].asString().isShort());
 }
 

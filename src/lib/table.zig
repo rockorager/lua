@@ -1004,7 +1004,7 @@ test "sort keeps the values it holds across collections" {
     const n = 40;
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(
+        const s = std.mem.print(
             &buf,
             "a long string, longer than forty bytes: {d:0>4}",
             .{(i * 17) % n},
@@ -1014,7 +1014,7 @@ test "sort keeps the values it holds across collections" {
     _ = try h.ok(state, try h.global(state, "table.sort"), &.{ .table(t), .native(&collectingLess) });
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "a long string, longer than forty bytes: {d:0>4}", .{i}) catch unreachable;
+        const s = std.mem.print(&buf, "a long string, longer than forty bytes: {d:0>4}", .{i}) catch unreachable;
         try testing.expectEqualStrings(s, t.getInt(@intCast(i + 1)).asString().bytes());
     }
 }

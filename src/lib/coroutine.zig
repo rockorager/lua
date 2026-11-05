@@ -35,7 +35,7 @@ pub fn open(state: *State) Error!void {
 noinline fn argError(th: *Thread, arg: u32, comptime fmt: []const u8, args: anytype) Error {
     @branchHint(.cold);
     var msgbuf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msgbuf, fmt, args) catch "?";
+    const msg = std.mem.print(&msgbuf, fmt, args) catch "?";
     return debuginfo.argError(th, arg, "?", msg);
 }
 

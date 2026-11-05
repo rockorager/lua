@@ -692,7 +692,7 @@ fn loadZone(th: *Thread) Zone {
     const path = if (spec.len > 0 and spec[0] == '/')
         spec
     else
-        std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ getenv(state, "TZDIR") orelse zoneinfo, spec }) catch spec;
+        std.mem.print(&path_buf, "{s}/{s}", .{ getenv(state, "TZDIR") orelse zoneinfo, spec }) catch spec;
     if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20))) |data| {
         z.data = data;
         if (z.parseTzif(data)) return z;

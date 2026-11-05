@@ -91,9 +91,9 @@ pub fn varInfo(th: *Thread, origin: Origin, buf: []u8) []const u8 {
 /// " (kind 'name')", or "" for no name, `formatvarinfo`.
 pub fn format(n: ?Name, buf: []u8) []const u8 {
     const v = n orelse return "";
-    return std.fmt.bufPrint(buf, " ({s} '{s}')", .{ v.kind, v.name }) catch blk: {
+    return std.mem.print(buf, " ({s} '{s}')", .{ v.kind, v.name }) catch blk: {
         // Names are bounded by what fits; cut a long one.
-        const s = std.fmt.bufPrint(buf, " ({s} '", .{v.kind}) catch break :blk "";
+        const s = std.mem.print(buf, " ({s} '", .{v.kind}) catch break :blk "";
         const room = buf.len - s.len - 2;
         @memcpy(buf[s.len..][0..room], v.name[0..room]);
         @memcpy(buf[s.len + room ..][0..2], "')");
@@ -130,7 +130,7 @@ pub fn funcNameFromCode(state: *const State, p: *const Proto, pc: usize) ?Name {
         .tforcall => return .{ .kind = "for iterator", .name = "for iterator" },
         .self, .gettabup, .gettable, .geti, .getfield => .index,
         .settabup, .settable, .seti, .setfield => .newindex,
-        .mmbin, .mmbini, .mmbink => @enumFromInt(opcodes.c(i)),
+        .mmbin, .mmbini, .mmbink => @fromBackingInt(@intCast(opcodes.c(i))),
         .unm => .unm,
         .bnot => .bnot,
         .len => .len,
@@ -141,7 +141,7 @@ pub fn funcNameFromCode(state: *const State, p: *const Proto, pc: usize) ?Name {
         .close, .@"return" => .close,
         else => return null,
     };
-    return .{ .kind = "metamethod", .name = state.tm_names[@intFromEnum(tm)].bytes()[2..] };
+    return .{ .kind = "metamethod", .name = state.tm_names[@backingInt(tm)].bytes()[2..] };
 }
 
 /// The last instruction before `lastpc` that changed register `reg`, or
@@ -149,7 +149,7 @@ pub fn funcNameFromCode(state: *const State, p: *const Proto, pc: usize) ?Name {
 fn findSetReg(p: *const Proto, lastpc_in: usize, reg: u32) ?usize {
     var lastpc = lastpc_in;
     // The metamethod instruction after an arithmetic one did not run.
-    if (opcodes.props[@intFromEnum(op(p.code[lastpc]))].is_mm) lastpc -= 1;
+    if (opcodes.props[@backingInt(op(p.code[lastpc]))].is_mm) lastpc -= 1;
     var setreg: ?usize = null;
     var jmptarget: usize = 0;
     for (p.code[0..lastpc], 0..) |i, pc| {
@@ -163,7 +163,7 @@ fn findSetReg(p: *const Proto, lastpc_in: usize, reg: u32) ?usize {
                 if (dest <= lastpc and dest > jmptarget) jmptarget = @intCast(dest);
                 break :blk false;
             },
-            else => |o| opcodes.props[@intFromEnum(o)].sets_a and reg == a,
+            else => |o| opcodes.props[@backingInt(o)].sets_a and reg == a,
         };
         if (change) setreg = if (pc < jmptarget) null else pc;
     }
@@ -361,15 +361,15 @@ pub fn globalFuncName(state: *State, f: Value, buf: []u8) ?[]const u8 {
     while (it) |mod| : (it = loaded.asTable().next(mod.key) catch return null) {
         if (!mod.key.isString()) continue;
         if (Value.rawEquals(mod.value, f))
-            return std.fmt.bufPrint(buf, "{s}", .{mod.key.asString().bytes()}) catch null;
+            return std.mem.print(buf, "{s}", .{mod.key.asString().bytes()}) catch null;
         if (!mod.value.isTable()) continue;
         var jt = mod.value.asTable().next(.nil) catch continue;
         while (jt) |field| : (jt = mod.value.asTable().next(field.key) catch null) {
             if (!field.key.isString() or !Value.rawEquals(field.value, f)) continue;
             const m = mod.key.asString().bytes();
             const n = field.key.asString().bytes();
-            if (std.mem.eql(u8, m, "_G")) return std.fmt.bufPrint(buf, "{s}", .{n}) catch null;
-            return std.fmt.bufPrint(buf, "{s}.{s}", .{ m, n }) catch null;
+            if (std.mem.eql(u8, m, "_G")) return std.mem.print(buf, "{s}", .{n}) catch null;
+            return std.mem.print(buf, "{s}.{s}", .{ m, n }) catch null;
         }
     }
     return null;

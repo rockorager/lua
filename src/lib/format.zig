@@ -29,7 +29,7 @@ pub const Diagnostic = struct {
     }
 
     fn fail(d: *Diagnostic, arg: u32, comptime fmt: []const u8, args: anytype) Error {
-        const s = std.fmt.bufPrint(&d.buf, fmt, args) catch unreachable;
+        const s = std.mem.print(&d.buf, fmt, args) catch unreachable;
         d.arg = arg;
         d.len = @intCast(s.len);
         return error.FormatError;
@@ -905,7 +905,7 @@ test "format matches the reference" {
             },
             .want = "%%%%%%%%%%%%%%%%%%%%",
         },
-        .{ .fmt = "%20s", .args = &.{.{ .string = "y" ** 120 }}, .want = "y" ** 120 },
+        .{ .fmt = "%20s", .args = &.{.{ .string = &@as([120]u8, @splat('y')) }}, .want = &@as([120]u8, @splat('y')) },
         .{ .fmt = "%5p|%-7p|%p", .args = &.{ .nil, .{ .boolean = false }, .table }, .want = "(null)|(null) |0x1234" },
         .{ .fmt = "%%%d", .args = &.{.{ .integer = 10 }}, .want = "%10" },
         .{

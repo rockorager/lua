@@ -198,7 +198,7 @@ pub const max_len = 64;
 
 /// An integer as `tostring` writes it: plain decimal.
 pub fn formatInt(buf: *[max_len]u8, i: i64) []const u8 {
-    return std.fmt.bufPrint(buf, "{d}", .{i}) catch unreachable;
+    return std.mem.print(buf, "{d}", .{i}) catch unreachable;
 }
 
 /// A float as `tostring` writes it. Like C's `%.15g`, or `%.17g` when 15
@@ -240,12 +240,12 @@ pub fn formatFloat(buf: *[max_len]u8, f: f64) []const u8 {
         x += 1;
     }
     var digits_buf: [20]u8 = undefined;
-    var ds: []const u8 = std.fmt.bufPrint(&digits_buf, "{d}", .{m}) catch unreachable;
+    var ds: []const u8 = std.mem.print(&digits_buf, "{d}", .{m}) catch unreachable;
     x += @as(i32, @intCast(ds.len)) - 1;
     var precision: i32 = 15;
     if (a < math.floatMin(f64)) {
         const r = exactDigits(a, x, 15);
-        const ds15 = std.mem.trimEnd(u8, std.fmt.bufPrint(&digits_buf, "{d}", .{r.digits}) catch unreachable, "0");
+        const ds15 = std.mem.trimEnd(u8, std.mem.print(&digits_buf, "{d}", .{r.digits}) catch unreachable, "0");
         var check: [max_len]u8 = undefined;
         const n = layoutG(&check, ds15, r.exp, 15);
         if (std.fmt.parseFloat(f64, check[0..n]) catch unreachable == a) {
@@ -260,7 +260,7 @@ pub fn formatFloat(buf: *[max_len]u8, f: f64) []const u8 {
     if (precision == 17) {
         const r = exactDigits(a, x, 17);
         x = r.exp;
-        ds = std.mem.trimEnd(u8, std.fmt.bufPrint(&digits_buf, "{d}", .{r.digits}) catch unreachable, "0");
+        ds = std.mem.trimEnd(u8, std.mem.print(&digits_buf, "{d}", .{r.digits}) catch unreachable, "0");
     }
     len += layoutG(buf[len..], ds, x, precision);
     // Looks like an integer: no point and no exponent.

@@ -51,7 +51,7 @@ fn argError(th: *Thread, arg: c_int, msg: []const u8) noreturn {
 fn typeError(th: *Thread, arg: c_int, tname: []const u8) noreturn {
     const got = if (argNone(th, arg)) "no value" else aux.typeName(th.state, value(th, arg));
     var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s} expected, got {s}", .{ tname, got }) catch buf[0..];
+    const msg = std.mem.print(&buf, "{s} expected, got {s}", .{ tname, got }) catch buf[0..];
     argError(th, arg, msg);
 }
 
@@ -72,7 +72,7 @@ fn lauxGetmetafield(L: *lua_State, obj: c_int, e: [*:0]const u8) callconv(.c) c_
     }
     L.top -= 1;
     L.stack[L.top - 1] = v;
-    return @intFromEnum(v.typeOf());
+    return @backingInt(v.typeOf());
 }
 
 fn lauxCallmeta(L: *lua_State, obj_in: c_int, e: [*:0]const u8) callconv(.c) c_int {
@@ -234,7 +234,7 @@ fn lauxCheckoption(
         if (std.mem.orderZ(u8, opt, name) == .eq) return @intCast(i);
     }
     var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "invalid option '{s}'", .{span(name)}) catch buf[0..];
+    const msg = std.mem.print(&buf, "invalid option '{s}'", .{span(name)}) catch buf[0..];
     argError(L, arg, msg);
 }
 

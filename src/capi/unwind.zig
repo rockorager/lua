@@ -151,7 +151,7 @@ pub fn analyze(gpa: std.mem.Allocator, sources: []const Source) !Report {
         for (list.items) |c| if (c.target == .func and r.funcs.items[c.target.func].may_throw) {
             const t = file.toks[c.tok];
             const fmt = "{s}:{d}: Zig code outside src/capi calls {s}, which may throw";
-            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ file.path, t.line, t.text }));
+            try r.violations.append(a, try a.print(fmt, .{ file.path, t.line, t.text }));
         };
     }
     try checkRegion(a, &r);
@@ -195,18 +195,18 @@ fn checkRegion(a: std.mem.Allocator, r: *Report) !void {
             if (std.mem.eql(u8, f.path, link.path)) break i;
         } else {
             const fmt = "{s}: the protected region's {s} is missing";
-            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, link.name }));
+            try r.violations.append(a, try a.print(fmt, .{ link.path, link.name }));
             continue;
         };
         const toks = r.files[fi].toks;
         const body = fnBody(toks, link.name) orelse {
             const fmt = "{s}: the protected region's {s} is missing";
-            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, link.name }));
+            try r.violations.append(a, try a.print(fmt, .{ link.path, link.name }));
             continue;
         };
         for (toks[body[0]..body[1]]) |t| if (t.tag == .keyword_defer or t.tag == .keyword_errdefer) {
             const fmt = "{s}:{d}: {s}, inside the protected region, has a {s}";
-            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, t.line, link.name, t.text }));
+            try r.violations.append(a, try a.print(fmt, .{ link.path, t.line, link.name, t.text }));
         };
         if (link.calls) |callee| for (body[0]..body[1]) |i| {
             const t = toks[i];
@@ -214,7 +214,7 @@ fn checkRegion(a: std.mem.Allocator, r: *Report) !void {
             const before = toks[i - 1].tag;
             if (before == .keyword_try or before == .keyword_return) continue;
             const fmt = "{s}:{d}: {s} calls {s} other than with try or return, inside the protected region";
-            try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ link.path, t.line, link.name, callee }));
+            try r.violations.append(a, try a.print(fmt, .{ link.path, t.line, link.name, callee }));
         };
         // Who names it.
         for (r.files) |file| {
@@ -228,7 +228,7 @@ fn checkRegion(a: std.mem.Allocator, r: *Report) !void {
                 const guarded = !std.mem.eql(u8, by, "execute") or startsWith(file.toks, by, execute_guard);
                 if (!allowed or !guarded) {
                     const fmt = "{s}:{d}: {s} names {s}, which runs C code inside the protected region";
-                    try r.violations.append(a, try std.fmt.allocPrint(a, fmt, .{ file.path, t.line, by, link.name }));
+                    try r.violations.append(a, try a.print(fmt, .{ file.path, t.line, by, link.name }));
                 }
             }
         }
@@ -574,8 +574,7 @@ fn checkDefers(a: std.mem.Allocator, r: *Report, f: Func, callback_fields: *cons
                 }
                 var inside: std.ArrayList(Call) = .empty;
                 try collectCalls(a, r, f.file, i + 1, e, callback_fields, &inside);
-                for (inside.items) |c| if (throws(r, c.target)) try r.violations.append(a, try std.fmt.allocPrint(
-                    a,
+                for (inside.items) |c| if (throws(r, c.target)) try r.violations.append(a, try a.print(
                     "{s}:{d}: {s}: the {s} at this line calls {s}, which may throw",
                     .{ file.path, t.line, f.name, t.text, toks[c.tok].text },
                 ));
@@ -594,8 +593,7 @@ fn checkDefers(a: std.mem.Allocator, r: *Report, f: Func, callback_fields: *cons
                     continue;
                 }
                 const target = resolve(r, f.file, i, callback_fields) orelse continue;
-                if (throws(r, target)) try r.violations.append(a, try std.fmt.allocPrint(
-                    a,
+                if (throws(r, target)) try r.violations.append(a, try a.print(
                     "{s}:{d}: {s} calls {s}, which may throw, while the defer at line {d} is pending",
                     .{ file.path, t.line, f.name, t.text, pending.items[pending.items.len - 1].line },
                 ));

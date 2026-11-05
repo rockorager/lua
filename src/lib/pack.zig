@@ -28,7 +28,7 @@ pub const Diagnostic = struct {
     }
 
     fn fail(d: *Diagnostic, arg: u32, comptime fmt: []const u8, args: anytype) Error {
-        const s = std.fmt.bufPrint(&d.buf, fmt, args) catch unreachable;
+        const s = std.mem.print(&d.buf, fmt, args) catch unreachable;
         d.arg = arg;
         d.len = @intCast(s.len);
         return error.PackError;
@@ -525,7 +525,7 @@ test "pack matches the reference" {
             },
             .want = "\x01\x02\x03\x00",
         },
-        .{ .fmt = "!xXi16", .args = &.{}, .want = "\x00" ** 16 },
+        .{ .fmt = "!xXi16", .args = &.{}, .want = &@as([16]u8, @splat(0)) },
         .{ .fmt = "i\x00garbage", .args = &.{.{ .integer = 1 }}, .want = "\x01\x00\x00\x00" },
         .{
             .fmt = "i0",
@@ -584,7 +584,7 @@ test "pack matches the reference" {
         .{
             .fmt = "s1",
             .args = &.{
-                .{ .string = "x" ** 256 },
+                .{ .string = &@as([256]u8, @splat('x')) },
             },
             .want = "error: bad argument #2 to 'pack' (string length does not fit in given size)",
         },
@@ -867,11 +867,11 @@ test "pack and unpack round-trip every integer size" {
     for (1..max_int_size + 1) |i| {
         var diag: Diagnostic = .{};
         var w: Writer = .fixed(&buf);
-        try pack(&w, try std.fmt.bufPrint(&fmt_buf, "i{d}", .{i}), TestArgs{ .list = &.{.{ .integer = -1 }} }, &diag);
+        try pack(&w, try std.mem.print(&fmt_buf, "i{d}", .{i}), TestArgs{ .list = &.{.{ .integer = -1 }} }, &diag);
         try testing.expectEqual(i, w.end);
         try testing.expect(std.mem.allEqual(u8, w.buffered(), 0xff));
         w = .fixed(&buf);
-        const unsigned = try std.fmt.bufPrint(&fmt_buf, ">I{d}", .{i});
+        const unsigned = try std.mem.print(&fmt_buf, ">I{d}", .{i});
         try pack(&w, unsigned, TestArgs{ .list = &.{.{ .integer = 0xAA }} }, &diag);
         try testing.expectEqual(0xAA, w.buffered()[i - 1]);
         try testing.expect(std.mem.allEqual(u8, w.buffered()[0 .. i - 1], 0));

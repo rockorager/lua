@@ -87,7 +87,7 @@ pub const Tm = enum(u8) {
     call,
     close,
 
-    pub const count = @typeInfo(Tm).@"enum".fields.len;
+    pub const count = @typeInfo(Tm).@"enum".field_names.len;
 
     /// The field name, such as "__index".
     pub fn name(tm: Tm) []const u8 {
@@ -145,7 +145,7 @@ pub fn create(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!*Stat
     state.memerr = try state.fixedString("not enough memory");
     state.name_key = try state.fixedString("__name");
     state.n_key = try state.fixedString("n");
-    for (&state.tm_names, 0..) |*n, i| n.* = try state.fixedString(@as(Tm, @enumFromInt(i)).name());
+    for (&state.tm_names, 0..) |*n, i| n.* = try state.fixedString(@as(Tm, @fromBackingInt(@intCast(i))).name());
     state.main = try Thread.create(state);
     // The main thread can never yield.
     state.main.nny = 1;
@@ -194,7 +194,7 @@ pub fn metatableOf(state: *const State, v: Value) ?*Table {
     return switch (v.tag) {
         .table => v.asTable().metatable,
         .userdata => v.asUserdata().metatable,
-        else => state.metatables[@intFromEnum(v.typeOf())],
+        else => state.metatables[@backingInt(v.typeOf())],
     };
 }
 
@@ -207,7 +207,7 @@ pub fn setMetatable(state: *State, v: Value, mt: ?*Table) void {
         .table => v.asTable().metatable = mt,
         .userdata => v.asUserdata().metatable = mt,
         else => return {
-            state.metatables[@intFromEnum(v.typeOf())] = mt;
+            state.metatables[@backingInt(v.typeOf())] = mt;
         },
     }
     gc.barrier(&state.heap, v.payload.gc, mtv);
@@ -218,9 +218,9 @@ pub fn setMetatable(state: *State, v: Value, mt: ?*Table) void {
 /// events a miss is remembered in `mt.flags` until a key is added to `mt`.
 pub inline fn fastTm(state: *const State, mt: ?*Table, tm: Tm) ?Value {
     const t = mt orelse return null;
-    const bit = @as(u8, 1) << @intCast(@intFromEnum(tm));
+    const bit = @as(u8, 1) << @intCast(@backingInt(tm));
     if (t.flags & bit != 0) return null;
-    const v = t.getShortStr(state.tm_names[@intFromEnum(tm)]);
+    const v = t.getShortStr(state.tm_names[@backingInt(tm)]);
     if (v.isNil()) {
         t.flags |= bit;
         return null;
@@ -247,7 +247,7 @@ pub fn typeName(state: *const State, v: Value) []const u8 {
 /// The handler for any event `tm` of value `v`, or null.
 pub fn tmOf(state: *const State, v: Value, tm: Tm) ?Value {
     const mt = state.metatableOf(v) orelse return null;
-    const h = mt.getShortStr(state.tm_names[@intFromEnum(tm)]);
+    const h = mt.getShortStr(state.tm_names[@backingInt(tm)]);
     return if (h.isNil()) null else h;
 }
 
@@ -290,8 +290,8 @@ const testing = std.testing;
 test "metamethod names and the registry layout" {
     const state = try State.create(testing.allocator, .{ .seed = 7 });
     defer state.destroy();
-    try testing.expectEqualStrings("__index", state.tm_names[@intFromEnum(Tm.index)].bytes());
-    try testing.expectEqualStrings("__close", state.tm_names[@intFromEnum(Tm.close)].bytes());
+    try testing.expectEqualStrings("__index", state.tm_names[@backingInt(Tm.index)].bytes());
+    try testing.expectEqualStrings("__close", state.tm_names[@backingInt(Tm.close)].bytes());
     try testing.expect(state.registry.getInt(1).tag == .bool_false);
     try testing.expectEqual(state.globals, state.registry.getInt(2).asTable());
     try testing.expectEqual(state.main, state.registry.getInt(3).asThread());
@@ -304,7 +304,7 @@ test "the absence cache answers repeated misses and sees new handlers" {
     try testing.expectEqual(@as(?Value, null), state.fastTm(mt, .index));
     try testing.expect(mt.flags & 1 != 0);
     try testing.expectEqual(@as(?Value, null), state.fastTm(mt, .index));
-    try mt.setShortStr(&state.heap, state.tm_names[@intFromEnum(Tm.index)], .true);
+    try mt.setShortStr(&state.heap, state.tm_names[@backingInt(Tm.index)], .true);
     try testing.expect(state.fastTm(mt, .index).?.isFalsy() == false);
     try testing.expectEqual(@as(?Value, null), state.fastTm(null, .eq));
 }

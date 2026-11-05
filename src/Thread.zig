@@ -128,7 +128,7 @@ pub const max_native_calls = 200;
 /// function, as in the reference) need more than 1 KiB a level. Debug
 /// builds' frames are several times larger, so they get more
 /// (`results/stack-20261031.md`).
-pub const max_native_stack: usize = if (builtin.mode == .Debug) 4 << 20 else 192 << 10;
+pub const max_native_stack: usize = if (builtin.mode == .debug) 4 << 20 else 192 << 10;
 
 const initial_stack = 2 * min_stack;
 
@@ -433,12 +433,12 @@ pub const FormatArg = union(enum) {
         const fields = comptime fieldsOf(@TypeOf(args));
         if (specs.len != fields.len) @compileError("format \"" ++ fmt ++ "\" does not match its arguments");
         var out: [fields.len]FormatArg = undefined;
-        inline for (fields, 0..) |field, i| out[i] = from(specs[i], @field(args, field.name));
+        inline for (fields, 0..) |name, i| out[i] = from(specs[i], @field(args, name));
         return out;
     }
 
-    fn fieldsOf(T: type) []const std.builtin.Type.StructField {
-        return @typeInfo(T).@"struct".fields;
+    fn fieldsOf(T: type) []const [:0]const u8 {
+        return @typeInfo(T).@"struct".field_names;
     }
 
     fn from(comptime spec: u8, x: anytype) FormatArg {

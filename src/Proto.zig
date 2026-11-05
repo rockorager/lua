@@ -125,7 +125,7 @@ pub fn byteSize(p: *const Proto) usize {
 pub fn initSlots(p: *Proto, gpa: std.mem.Allocator) error{OutOfMemory}!void {
     for (p.code) |i| {
         const o: u7 = @truncate(i);
-        if (o == @intFromEnum(opcodes.OpCode.gettabup) or o == @intFromEnum(opcodes.OpCode.settabup)) {
+        if (o == @backingInt(opcodes.OpCode.gettabup) or o == @backingInt(opcodes.OpCode.settabup)) {
             p.kslot = try gpa.alloc(u32, p.k.len);
             @memset(p.kslot, 0);
             return;

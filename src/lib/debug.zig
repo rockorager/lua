@@ -68,7 +68,7 @@ fn typeError(th: *Thread, base: u32, n: u32, expected: []const u8) Error {
         "light userdata"
     else
         th.state.typeName(v);
-    const msg = std.fmt.bufPrint(&buf, "{s} expected, got {s}", .{ expected, got }) catch "?";
+    const msg = std.mem.print(&buf, "{s} expected, got {s}", .{ expected, got }) catch "?";
     return argError(th, n, msg);
 }
 
@@ -479,7 +479,7 @@ pub fn hookf(th: *Thread, event: Thread.HookEvent, line: i32, frame: usize) Erro
     try th.ensureStack(3);
     const func = th.top;
     th.push(f);
-    try pushString(th, hook_names[@intFromEnum(event)]);
+    try pushString(th, hook_names[@backingInt(event)]);
     th.push(if (line >= 0) .int(line) else .nil);
     try vm.call(th, func, 0);
 }

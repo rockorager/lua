@@ -74,8 +74,8 @@ pub const lua_tnone = -1;
 
 comptime {
     // lua.h's type codes are `Value.Type`'s order.
-    std.debug.assert(@intFromEnum(Value.Type.thread) == 8);
-    std.debug.assert(@intFromEnum(Value.Type.light_userdata) == 2);
+    std.debug.assert(@backingInt(Value.Type.thread) == 8);
+    std.debug.assert(@backingInt(Value.Type.light_userdata) == 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +404,7 @@ inline fn top(th: *Thread, n: u32) Value {
 }
 
 fn typeCode(v: ?*const Value) c_int {
-    return if (v) |x| @intFromEnum(x.typeOf()) else lua_tnone;
+    return if (v) |x| @backingInt(x.typeOf()) else lua_tnone;
 }
 
 /// A NUL-terminated C string as a slice.
@@ -653,7 +653,7 @@ pub fn luaTopointer(L: *lua_State, idx: c_int) callconv(.c) ?*const anyopaque {
 // ---------------------------------------------------------------------------
 
 pub fn luaArith(L: *lua_State, op: c_int) callconv(.c) void {
-    const o: vm.ArithOp = @enumFromInt(op);
+    const o: vm.ArithOp = @fromBackingInt(@intCast(op));
     const unary = o == .unm or o == .bnot;
     // The reference pushes a copy of a unary operator's operand.
     if (unary) push(L, top(L, 1));
@@ -858,12 +858,12 @@ pub fn luaPushthread(L: *lua_State) callconv(.c) c_int {
 /// Replaces the top with `v` and returns its type.
 inline fn replaceTop(th: *Thread, v: Value) c_int {
     th.stack[th.top - 1] = v;
-    return @intFromEnum(v.typeOf());
+    return @backingInt(v.typeOf());
 }
 
 inline fn pushType(th: *Thread, v: Value) c_int {
     push(th, v);
-    return @intFromEnum(v.typeOf());
+    return @backingInt(v.typeOf());
 }
 
 pub fn luaGetglobal(L: *lua_State, name: [*:0]const u8) callconv(.c) c_int {
@@ -1367,7 +1367,7 @@ pub fn luaGc(L: *lua_State, what: c_int, ...) callconv(.c) c_int {
 fn luaGcv(L: *lua_State, what: c_int, ap: *va.List) callconv(.c) c_int {
     const heap = L.heap();
     if (heap.stopped & (gc.stop.internal | gc.stop.closing) != 0) return -1;
-    switch (@as(GcOption, @enumFromInt(what))) {
+    switch (@as(GcOption, @fromBackingInt(@intCast(what)))) {
         .stop => heap.stopped = gc.stop.user,
         .restart => {
             heap.setDebt(0);
@@ -1391,8 +1391,8 @@ fn luaGcv(L: *lua_State, what: c_int, ap: *va.List) callconv(.c) c_int {
         },
         .isrunning => return @intFromBool(heap.running()),
         .gen, .inc => {
-            const old = @intFromEnum(if (heap.kind == .incremental) GcOption.inc else GcOption.gen);
-            gc.changeMode(L, if (what == @intFromEnum(GcOption.gen)) .gen_minor else .incremental);
+            const old = @backingInt(if (heap.kind == .incremental) GcOption.inc else GcOption.gen);
+            gc.changeMode(L, if (what == @backingInt(GcOption.gen)) .gen_minor else .incremental);
             return old;
         },
         .param => {
@@ -1721,7 +1721,7 @@ pub fn luaSetlocal(L: *lua_State, ar: *const lua_Debug, n: c_int) callconv(.c) ?
 fn cHook(th: *Thread, event: Thread.HookEvent, line: i32, frame: usize) Error!void {
     const h = hookSlot(th).* orelse return;
     var ar: lua_Debug = undefined;
-    ar.event = @intFromEnum(event);
+    ar.event = @backingInt(event);
     ar.currentline = line;
     ar.i_ci = frame + 1;
     if (protect(th, h, @intFromPtr(&ar), 0) == jmp.aborted) return failure.err;
@@ -1730,7 +1730,7 @@ fn cHook(th: *Thread, event: Thread.HookEvent, line: i32, frame: usize) Error!vo
 /// What `lua_gethook` returns while the debug library's hook is set: a C
 /// function that runs it, which `lua_sethook` turns back into it.
 fn luaHook(L: *lua_State, ar: *lua_Debug) callconv(.c) void {
-    check(L, debug.hookf(L, @enumFromInt(ar.event), ar.currentline, ar.i_ci - 1));
+    check(L, debug.hookf(L, @fromBackingInt(@intCast(ar.event)), ar.currentline, ar.i_ci - 1));
 }
 
 pub fn luaSethook(L: *lua_State, func: ?lua_Hook, mask: c_int, count: c_int) callconv(.c) void {

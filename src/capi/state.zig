@@ -105,22 +105,21 @@ var threaded_ready: std.atomic.Value(bool) = .init(false);
 const io_vtable: std.Io.VTable = blk: {
     const full = std.Io.Threaded.global_single_threaded.io().vtable.*;
     const unused = [_][]const u8{
-        "async",                   "concurrent",            "await",                 "cancel",
-        "groupAsync",              "groupConcurrent",       "groupAwait",            "groupCancel",
-        "dirCreateDirPath",        "dirCreateDirPathOpen",  "dirCreateFileAtomic",   "dirRenamePreserve",
-        "dirSymLink",              "dirReadLink",           "dirSetOwner",           "dirSetFileOwner",
-        "dirSetPermissions",       "dirSetFilePermissions", "dirSetTimestamps",      "dirHardLink",
-        "fileWriteFilePositional", "fileSetOwner",          "fileSetPermissions",    "fileSetTimestamps",
-        "fileLock",                "fileTryLock",           "fileUnlock",            "fileDowngradeLock",
-        "fileRealPath",            "fileHardLink",          "fileMemoryMapCreate",   "fileMemoryMapDestroy",
-        "fileMemoryMapSetLength",  "fileMemoryMapRead",     "fileMemoryMapWrite",    "processExecutableOpen",
-        "processExecutablePath",   "processSetCurrentDir",  "processSetCurrentPath", "processReplace",
-        "processReplacePath",      "progressParentFile",    "netListenIp",           "netAccept",
-        "netBindIp",               "netConnectIp",          "netListenUnix",         "netConnectUnix",
-        "netSocketCreatePair",     "netSend",               "netRead",               "netWrite",
-        "netWriteFile",            "netClose",              "netShutdown",           "netInterfaceNameResolve",
-        "netInterfaceName",        "netLookup",             "lockStderr",            "tryLockStderr",
-        "unlockStderr",
+        "async",                   "concurrent",              "await",                 "cancel",
+        "groupAsync",              "groupConcurrent",         "groupAwait",            "groupCancel",
+        "dirCreateDirPath",        "dirCreateDirPathOpen",    "dirCreateFileAtomic",   "dirRenamePreserve",
+        "dirSymLink",              "dirReadLink",             "dirSetOwner",           "dirSetFileOwner",
+        "dirSetPermissions",       "dirSetFilePermissions",   "dirSetTimestamps",      "dirHardLink",
+        "fileWriteFilePositional", "fileSetOwner",            "fileSetPermissions",    "fileSetTimestamps",
+        "fileLock",                "fileTryLock",             "fileUnlock",            "fileDowngradeLock",
+        "fileRealPath",            "fileHardLink",            "fileMemoryMapCreate",   "fileMemoryMapDestroy",
+        "fileMemoryMapSetLength",  "fileMemoryMapRead",       "fileMemoryMapWrite",    "processExecutableOpen",
+        "processExecutablePath",   "processSetCurrentDir",    "processSetCurrentPath", "processReplace",
+        "progressParentFile",      "inheritParentDir",        "inheritParentFile",     "netListenIp",
+        "netAccept",               "netBindIp",               "netConnectIp",          "netListenUnix",
+        "netConnectUnix",          "netSocketCreatePair",     "netWriteFile",          "netClose",
+        "netShutdown",             "netInterfaceNameResolve", "netInterfaceName",      "netLookup",
+        "lockStderr",              "tryLockStderr",           "unlockStderr",
     };
     var v = full;
     for (unused) |name| @field(v, name) = @ptrCast(&Unsupported(name).f);
@@ -227,7 +226,7 @@ fn openLib(L: *Thread, comptime which: lib.Lib) Error!void {
         L.push(.table(state.globals));
         return;
     }
-    const name = try state.newString(lib_names[@intFromEnum(which)]);
+    const name = try state.newString(lib_names[@backingInt(which)]);
     const old = state.globals.getStr(name);
     switch (which) {
         .package => try lib.package.open(L),
@@ -261,7 +260,7 @@ fn lauxOpenselectedlibs(L: *lua_State, load: c_int, preload: c_int) callconv(.c)
     _ = lauxlib.lauxGetsubtable(L, capi.registry_index, "_PRELOAD");
     inline for (lib_names, 0..) |name, i| {
         const mask = @as(c_int, 1) << i;
-        const f = &Opener(@enumFromInt(i)).f;
+        const f = &Opener(@fromBackingInt(@intCast(i))).f;
         if (load & mask != 0) {
             lauxlib.lauxRequiref(L, name, f, 1);
             capi.luaSettop(L, -2);
@@ -280,6 +279,6 @@ comptime {
     @export(&lauxOpenselectedlibs, .{ .name = "luaL_openselectedlibs" });
     for (lib_names, 0..) |name, i| {
         const sym = if (i == 0) "luaopen_base" else "luaopen_" ++ name;
-        @export(&Opener(@enumFromInt(i)).f, .{ .name = sym });
+        @export(&Opener(@fromBackingInt(@intCast(i))).f, .{ .name = sym });
     }
 }

@@ -241,7 +241,7 @@ test "short strings intern to one object; long strings do not" {
     try testing.expectEqualStrings("hello", a.bytesZ());
     try testing.expectEqual(@as(u8, 0), a.bytesZ()[5]);
 
-    const long = "x" ** (max_short_len + 1);
+    const long = &@as([max_short_len + 1]u8, @splat('x'));
     const c = try interner.create(&heap, long);
     const d = try interner.create(&heap, long);
     try testing.expect(c != d);
@@ -265,11 +265,11 @@ test "the interner keeps every string findable as it grows" {
     var first: [1000]*String = undefined;
     var buf: [16]u8 = undefined;
     for (&first, 0..) |*s, i| {
-        s.* = try interner.create(&heap, try std.fmt.bufPrint(&buf, "k{d}", .{i}));
+        s.* = try interner.create(&heap, try std.mem.print(&buf, "k{d}", .{i}));
     }
     try testing.expect(interner.buckets.len >= 1000);
     for (first, 0..) |s, i| {
-        try testing.expectEqual(s, try interner.create(&heap, try std.fmt.bufPrint(&buf, "k{d}", .{i})));
+        try testing.expectEqual(s, try interner.create(&heap, try std.mem.print(&buf, "k{d}", .{i})));
     }
     try testing.expectEqual(@as(usize, 1000), interner.count);
 }

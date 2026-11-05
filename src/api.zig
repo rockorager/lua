@@ -66,13 +66,15 @@ pub const Type = enum(u8) {
 
     /// The name `type()` returns.
     pub fn name(t: Type) []const u8 {
-        return @as(IValue.Type, @enumFromInt(@intFromEnum(t))).name();
+        return @as(IValue.Type, @fromBackingInt(@intCast(@backingInt(t)))).name();
     }
 };
 
 comptime {
-    for (@typeInfo(Type).@"enum".fields, @typeInfo(IValue.Type).@"enum".fields) |a, b| {
-        std.debug.assert(std.mem.eql(u8, a.name, b.name) and a.value == b.value);
+    const a = @typeInfo(Type).@"enum";
+    const b = @typeInfo(IValue.Type).@"enum";
+    for (a.field_names, a.field_values, b.field_names, b.field_values) |a_name, a_value, b_name, b_value| {
+        std.debug.assert(std.mem.eql(u8, a_name, b_name) and a_value == b_value);
     }
 }
 
@@ -85,7 +87,7 @@ pub const Value = struct {
     pub const nil: Value = .{ .raw = .nil };
 
     pub inline fn typeOf(v: Value) Type {
-        return @enumFromInt(@intFromEnum(v.raw.typeOf()));
+        return @fromBackingInt(@intCast(@backingInt(v.raw.typeOf())));
     }
 
     pub inline fn isNil(v: Value) bool {
@@ -405,7 +407,7 @@ pub const State = opaque {
         const extra = try gpa.create(Extra);
         errdefer gpa.destroy(extra);
         extra.* = .{ .host = undefined, .gpa = gpa, .traceback = options.traceback, .context = options.context };
-        const libs = options.libs orelse if (options.io != null) Libs.initFull() else safe_libs;
+        const libs = options.libs orelse if (options.io != null) Libs.full else safe_libs;
         if (options.io == null and (libs.contains(.io) or libs.contains(.os)))
             @panic("lua: the io and os libraries need Options.io");
         extra.host.init(options.io orelse .failing);
@@ -472,7 +474,7 @@ pub const State = opaque {
     pub fn load(state: *State, source: []const u8, options: LoadOptions) Error!Function {
         const th = state.thread();
         const gpa = th.heap().allocator();
-        const z = try gpa.dupeZ(u8, source);
+        const z = try gpa.dupeSentinel(u8, source, 0);
         defer gpa.free(z);
         const f = base.loadChunk(th, z, options.name orelse source, modeString(options.mode)) catch |e|
             return loadError(th, e);
@@ -718,9 +720,9 @@ pub const State = opaque {
 
     /// Releases a reference; its slot is reused.
     pub fn unref(state: *State, r: Ref) void {
-        if (@intFromEnum(r) <= freelist) return;
+        if (@backingInt(r) <= freelist) return;
         const s = state.thread().state;
-        const i: i64 = @intFromEnum(r);
+        const i: i64 = @backingInt(r);
         // Both keys exist, so neither assignment allocates.
         s.registry.setInt(&s.heap, i, s.registry.getInt(freelist)) catch unreachable;
         s.registry.setInt(&s.heap, freelist, .int(i)) catch unreachable;
@@ -886,7 +888,7 @@ inline fn ensure(th: *Thread, n: usize) Error!void {
 /// How many values `args`, a tuple or `Values`, holds.
 inline fn argCount(args: anytype) usize {
     if (@TypeOf(args) == Values) return args.len;
-    return @typeInfo(@TypeOf(args)).@"struct".fields.len;
+    return @typeInfo(@TypeOf(args)).@"struct".field_names.len;
 }
 
 /// Where `Values` borrowed from `th`'s stack start in it, taken before
@@ -913,8 +915,8 @@ inline fn placeArgs(dst: *Thread, at: u32, args: anytype, from: ?u32) error{OutO
         @memmove(dst.stack[at..][0..args.len], src);
         return;
     }
-    inline for (@typeInfo(@TypeOf(args)).@"struct".fields, 0..) |field, i| {
-        dst.stack[at + i] = try toLua(dst, @field(args, field.name));
+    inline for (@typeInfo(@TypeOf(args)).@"struct".field_names, 0..) |name, i| {
+        dst.stack[at + i] = try toLua(dst, @field(args, name));
     }
 }
 
@@ -1193,7 +1195,7 @@ fn newRef(th: *Thread, v: IValue) Error!Ref {
         r = @intCast(reg.length() + 1);
     }
     try reg.setInt(heap, r, v);
-    return @enumFromInt(r);
+    return @fromBackingInt(@intCast(r));
 }
 
 /// One payload and one tag variable: with a return for `.nil` and one for
@@ -1204,7 +1206,7 @@ inline fn refValue(th: *Thread, r: Ref) IValue {
     var payload = IValue.nil.payload;
     var tag = IValue.nil.tag;
     if (r != .nil) {
-        const v = th.state.registry.getInt(@intFromEnum(r));
+        const v = th.state.registry.getInt(@backingInt(r));
         payload = v.payload;
         tag = v.tag;
     }
@@ -1270,10 +1272,10 @@ fn toLua(th: *Thread, x: anytype) error{OutOfMemory}!IValue {
         },
         .@"struct" => |st| {
             if (st.is_tuple) return sequence(th, x);
-            const t = try s.newTable(0, st.fields.len);
-            inline for (st.fields) |f| {
-                const fv = try toLua(th, @field(x, f.name));
-                if (!fv.isNil()) try t.setStr(&s.heap, try s.newString(f.name), fv);
+            const t = try s.newTable(0, st.field_names.len);
+            inline for (st.field_names) |name| {
+                const fv = try toLua(th, @field(x, name));
+                if (!fv.isNil()) try t.setStr(&s.heap, try s.newString(name), fv);
             }
             return .table(t);
         },
@@ -1404,11 +1406,11 @@ const Decoder = struct {
         var pbuf: [96]u8 = undefined;
         var buf: [256]u8 = undefined;
         const prefix = if (d.path) |c|
-            std.fmt.bufPrint(&buf, "field '{s}': ", .{c.write(&pbuf)}) catch ""
+            std.mem.print(&buf, "field '{s}': ", .{c.write(&pbuf)}) catch ""
         else
             "";
         const rest = buf[prefix.len..];
-        const msg = buf[0 .. prefix.len + (std.fmt.bufPrint(rest, fmt, args) catch rest).len];
+        const msg = buf[0 .. prefix.len + (std.mem.print(rest, fmt, args) catch rest).len];
         const th = d.th;
         if (th.frames.items.len == 1) extraOf(th.state).trace.clearRetainingCapacity();
         return mapError(switch (d.ctx) {
@@ -1474,8 +1476,9 @@ inline fn results(comptime R: type, th: *Thread, vals: [*]const IValue, n: u32) 
     if (R == Values) return @as([*]const Value, @ptrCast(vals))[0..n];
     if (@typeInfo(R) == .@"struct" and @typeInfo(R).@"struct".is_tuple) {
         var r: R = undefined;
-        inline for (@typeInfo(R).@"struct".fields, 0..) |f, i| {
-            @field(r, f.name) = try result(f.type, th, if (i < n) vals[i] else .nil, i + 1);
+        const st = @typeInfo(R).@"struct";
+        inline for (st.field_names, st.field_types, 0..) |name, F, i| {
+            @field(r, name) = try result(F, th, if (i < n) vals[i] else .nil, i + 1);
         }
         return r;
     }
@@ -1496,7 +1499,7 @@ fn resultSlow(comptime T: type, th: *Thread, v: IValue, n: u32) Error!T {
 fn resultCount(comptime R: type) i16 {
     if (R == void) return 0;
     if (R == Values) return -1;
-    if (@typeInfo(R) == .@"struct" and @typeInfo(R).@"struct".is_tuple) return @typeInfo(R).@"struct".fields.len;
+    if (@typeInfo(R) == .@"struct" and @typeInfo(R).@"struct".is_tuple) return @typeInfo(R).@"struct".field_names.len;
     return 1;
 }
 
@@ -1549,14 +1552,14 @@ fn newMetatable(th: *Thread, comptime T: type, id: u32) Error!*ITable {
     try mt.setStr(&s.heap, s.name_key, .string(try s.newString(userdataName(T))));
     if (comptime hasSpec(T, "methods")) {
         const methods = T.lua_userdata.methods;
-        const names = comptime std.meta.fieldNames(@TypeOf(methods));
+        const names = @typeInfo(@TypeOf(methods)).@"struct".field_names;
         const t = try s.newTable(0, names.len);
         inline for (names) |name| try t.setStr(&s.heap, try s.newString(name), try toLua(th, @field(methods, name)));
-        try mt.setStr(&s.heap, s.tm_names[@intFromEnum(IState.Tm.index)], .table(t));
+        try mt.setStr(&s.heap, s.tm_names[@backingInt(IState.Tm.index)], .table(t));
     }
     if (comptime hasSpec(T, "meta")) {
         const meta = T.lua_userdata.meta;
-        inline for (comptime std.meta.fieldNames(@TypeOf(meta))) |name| {
+        inline for (@typeInfo(@TypeOf(meta)).@"struct".field_names) |name| {
             try mt.setStr(&s.heap, try s.newString(name), try toLua(th, @field(meta, name)));
         }
     }
@@ -1641,7 +1644,7 @@ fn decodeAny(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue) Er
         },
         .pointer => |p| {
             if (p.size == .slice and p.child == u8) {
-                if (!p.is_const and !alloc)
+                if (!p.attrs.@"const" and !alloc)
                     @compileError("decoding " ++ @typeName(T) ++ " copies: use decodeAlloc, or []const u8");
                 return decodeString(T, alloc, d, v, p.sentinel() != null);
             }
@@ -1669,8 +1672,8 @@ fn decodeAny(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue) Er
             const t = try decodeAny(Table, alloc, d, v);
             var r: T = undefined;
             if (st.is_tuple) {
-                inline for (st.fields, 1..) |f, i| {
-                    @field(r, f.name) = try d.child(f.type, alloc, t.raw.getInt(i), "", i);
+                inline for (st.field_names, st.field_types, 1..) |name, F, i| {
+                    @field(r, name) = try d.child(F, alloc, t.raw.getInt(i), "", i);
                 }
                 return r;
             }
@@ -1682,12 +1685,12 @@ fn decodeAny(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue) Er
                     if (!isFieldName(T, e.key.raw)) return d.unknownKey(e.key.raw);
                 }
             }
-            inline for (st.fields) |f| {
-                const fv = t.raw.getStr(try th.state.newString(f.name));
-                if (fv.isNil() and f.defaultValue() != null) {
-                    @field(r, f.name) = f.defaultValue().?;
+            inline for (st.field_names, st.field_types, st.field_attrs) |name, F, attrs| {
+                const fv = t.raw.getStr(try th.state.newString(name));
+                if (fv.isNil() and attrs.defaultValue(F) != null) {
+                    @field(r, name) = attrs.defaultValue(F).?;
                 } else {
-                    @field(r, f.name) = try d.child(f.type, alloc, fv, f.name, 0);
+                    @field(r, name) = try d.child(F, alloc, fv, name, 0);
                 }
             }
             return r;
@@ -1700,7 +1703,7 @@ fn decodeAny(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue) Er
 fn isFieldName(comptime T: type, k: IValue) bool {
     if (!k.isString()) return false;
     const name = k.asString().bytes();
-    inline for (comptime std.meta.fieldNames(T)) |f| {
+    inline for (@typeInfo(T).@"struct".field_names) |f| {
         if (std.mem.eql(u8, f, name)) return true;
     }
     return false;
@@ -1723,7 +1726,7 @@ fn decodeString(comptime T: type, comptime alloc: bool, d: *Decoder, v: ?IValue,
         }
         break :blk s;
     };
-    if (alloc) return if (z) d.gpa.?.dupeZ(u8, s.bytes()) else d.gpa.?.dupe(u8, s.bytes());
+    if (alloc) return if (z) d.gpa.?.dupeSentinel(u8, s.bytes(), 0) else d.gpa.?.dupe(u8, s.bytes());
     return if (z) s.bytesZ() else s.bytes();
 }
 
@@ -1740,14 +1743,14 @@ fn Native(comptime f: anytype, comptime C: type) type {
         .@"fn" => |i| i,
         else => @compileError("expected a function, got " ++ @typeName(F)),
     };
-    if (C != void and info.params.len == 0) @compileError("a function bound to a context takes it first");
+    if (C != void and info.param_types.len == 0) @compileError("a function bound to a context takes it first");
     return struct {
         fn call(th: *Thread, b: u32) IError!u32 {
             const top = th.top;
             var args: std.meta.ArgsTuple(F) = undefined;
             comptime var n: u32 = 1;
-            inline for (info.params, 0..) |p, i| {
-                const P = p.type orelse @compileError("generic parameters are not supported");
+            inline for (info.param_types, 0..) |p, i| {
+                const P = p orelse @compileError("generic parameters are not supported");
                 if (C != void and i == 0) {
                     args[0] = boundContext(P, C, th.stack[b - 1].asNativeClosure().upvalues()[0]);
                 } else if (P == *State) {
@@ -1779,7 +1782,7 @@ inline fn pushResults(th: *Thread, r: anytype) IError!u32 {
         return @intCast(r.len);
     }
     if (@typeInfo(R) == .@"struct" and @typeInfo(R).@"struct".is_tuple) {
-        const n = @typeInfo(R).@"struct".fields.len;
+        const n = @typeInfo(R).@"struct".field_names.len;
         try th.ensureStack(n);
         inline for (0..n) |i| th.push(try toLua(th, r[i]));
         return n;

@@ -64,7 +64,7 @@ pub fn open(state: *State) Error!void {
         .{ "__unm", arithFn(.unm) },
     });
     try auxlib.setField(state, mt, "__index", .table(lib));
-    state.metatables[@intFromEnum(Value.Type.string)] = mt;
+    state.metatables[@backingInt(Value.Type.string)] = mt;
 }
 
 /// `posrelatI`: a 1-based start position, negative from the end, clipped
@@ -589,7 +589,7 @@ fn arithFn(comptime op: ArithOp) Value.NativeFn {
 /// One copy for the eight operators, which are not hot: inlined in each
 /// metamethod it was 1.8 KB a copy (`results/lean-20261031.md`).
 noinline fn arith(th: *Thread, base: u32, op: ArithOp) Error!u32 {
-    const event = mm_names[@intFromEnum(op)];
+    const event = mm_names[@backingInt(op)];
     const a: Args = .init(th, base, event);
     const x = a.get(1);
     const y = a.get(2);
@@ -614,8 +614,8 @@ noinline fn arith(th: *Thread, base: u32, op: ArithOp) Error!u32 {
 }
 
 const mm_names = blk: {
-    var names: [@typeInfo(ArithOp).@"enum".fields.len][]const u8 = undefined;
-    for (&names, @typeInfo(ArithOp).@"enum".fields) |*n, f| n.* = "__" ++ f.name;
+    var names: [@typeInfo(ArithOp).@"enum".field_names.len][]const u8 = undefined;
+    for (&names, @typeInfo(ArithOp).@"enum".field_names) |*n, name| n.* = "__" ++ name;
     break :blk names;
 };
 
@@ -1229,7 +1229,7 @@ fn angleUnlessB(th: *Thread, base: u32) Error!u32 {
         th.push(.nil);
     } else {
         var buf: [16]u8 = undefined;
-        try pushString(th, std.fmt.bufPrint(&buf, "<{s}>", .{s}) catch unreachable);
+        try pushString(th, std.mem.print(&buf, "<{s}>", .{s}) catch unreachable);
     }
     return 1;
 }
@@ -1324,13 +1324,13 @@ test "the string metatable: __index and arithmetic on numeric strings" {
     const state = try h.newState();
     defer state.destroy();
     try open(state);
-    const mt = state.metatables[@intFromEnum(Value.Type.string)].?;
+    const mt = state.metatables[@backingInt(Value.Type.string)].?;
     try testing.expect(
         mt.getStr(try state.newString("__index")).asTable() == (try h.global(state, "string")).asTable(),
     );
     const s = struct {
         fn f(st: *State, name: []const u8) !Value {
-            return st.metatables[@intFromEnum(Value.Type.string)].?.getStr(try st.newString(name));
+            return st.metatables[@backingInt(Value.Type.string)].?.getStr(try st.newString(name));
         }
     }.f;
     const cases = .{
@@ -1436,7 +1436,7 @@ test "errors from a native name the calling Lua function's line" {
             e.asString().bytes(),
         ),
     }
-    const mt = state.metatables[@intFromEnum(Value.Type.string)].?;
+    const mt = state.metatables[@backingInt(Value.Type.string)].?;
     switch (try h.callFromLua(state, mt.getStr(try state.newString("__mod")), &.{ try h.str(state, "1"), .int(0) })) {
         .ok => return error.TestExpectedError,
         .err => |e| try testing.expectEqualStrings("attempt to perform 'n%0'", e.asString().bytes()),
@@ -1464,9 +1464,10 @@ test "values natives hold survive collections in callbacks" {
     const state = try h.newState();
     defer state.destroy();
     try open(state);
-    const long = "words and more words " ** 4;
+    const long = std.mem.asBytes(&@as([4][21]u8, @splat("words and more words ".*)));
+    const shouted = std.mem.asBytes(&@as([4][21]u8, @splat("WORDS AND MORE WORDS ".*)));
     // gsub's subject, pattern, and buffer across collecting callbacks.
-    try h.expectShow(state, ("WORDS AND MORE WORDS " ** 4) ++ "\t16", try h.global(state, "string.gsub"), &.{
+    try h.expectShow(state, shouted ++ "\t16", try h.global(state, "string.gsub"), &.{
         try h.str(state, long), try h.str(state, "%a+"), .native(&collectingUpper),
     });
     // format keeps each %s result until it is written.

@@ -203,7 +203,7 @@ pub const Heap = struct {
     }
 
     pub inline fn param(heap: *const Heap, p: Param, x: isize) isize {
-        return applyParam(heap.params[@intFromEnum(p)], x);
+        return applyParam(heap.params[@backingInt(p)], x);
     }
 
     /// `luaE_setdebt`: the next step after `debt` more bytes (or at the
@@ -274,7 +274,7 @@ pub const Raw = struct {
     a: Allocator,
 
     inline fn fill(bytes: []u8) void {
-        if (builtin.mode == .Debug) @memset(bytes, undefined);
+        if (builtin.mode == .debug) @memset(bytes, undefined);
     }
 
     pub fn create(r: Raw, comptime T: type) Allocator.Error!*T {
@@ -314,7 +314,7 @@ pub const Raw = struct {
         const bytes: []u8 = @ptrCast(@constCast(memory));
         if (bytes.len == 0) return;
         fill(bytes);
-        r.a.rawFree(bytes, .fromByteUnits(info.alignment orelse @alignOf(info.child)), @returnAddress());
+        r.a.rawFree(bytes, .fromByteUnits(info.attrs.@"align" orelse @alignOf(info.child)), @returnAddress());
     }
 
     /// `Allocator.realloc`: in place when the allocator can, else a new
@@ -322,7 +322,7 @@ pub const Raw = struct {
     pub fn realloc(r: Raw, old: anytype, n: usize) Allocator.Error!@TypeOf(old) {
         const info = @typeInfo(@TypeOf(old)).pointer;
         const T = info.child;
-        const a = comptime std.mem.Alignment.fromByteUnits(info.alignment orelse @alignOf(T));
+        const a = comptime std.mem.Alignment.fromByteUnits(info.attrs.@"align" orelse @alignOf(T));
         if (old.len == 0) return r.alignedAlloc(T, a, n);
         if (n == 0) {
             r.free(old);
@@ -419,12 +419,12 @@ inline fn otherWhite(heap: *const Heap) u8 {
 }
 
 inline fn keepInvariant(heap: *const Heap) bool {
-    return @intFromEnum(heap.phase) <= @intFromEnum(Phase.atomic);
+    return @backingInt(heap.phase) <= @backingInt(Phase.atomic);
 }
 
 inline fn isSweepPhase(heap: *const Heap) bool {
-    const p = @intFromEnum(heap.phase);
-    return p >= @intFromEnum(Phase.swp_allgc) and p <= @intFromEnum(Phase.swp_end);
+    const p = @backingInt(heap.phase);
+    return p >= @backingInt(Phase.swp_allgc) and p <= @backingInt(Phase.swp_end);
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,7 +1669,7 @@ test "a collection frees exactly the unreachable objects of every kind" {
     lcl.setUpval(heap, 0, try Proto.Upval.createClosed(heap, .string(try state.newString("in a closed upvalue"))));
     try live.setInt(heap, 1, .luaClosure(lcl));
     const ncl = try Proto.NativeClosure.create(heap, &nativeNop, 1);
-    ncl.setUpvalue(heap, 0, .string(try state.newString("x" ** 50)));
+    ncl.setUpvalue(heap, 0, .string(try state.newString(&@as([50]u8, @splat('x')))));
     try live.setInt(heap, 2, .nativeClosure(ncl));
     const ud = try Userdata.create(heap, 24, 1);
     ud.setUserValue(heap, 0, .table(try state.newTable(0, 0)));
@@ -1687,7 +1687,7 @@ test "a collection frees exactly the unreachable objects of every kind" {
     // Unreachable: the same again, referenced from nowhere.
     const junk = try state.newTable(4, 4);
     for (0..100) |i| try junk.setInt(heap, @intCast(i + 1), .table(try state.newTable(0, 0)));
-    try junk.setStr(heap, try state.newString("long " ** 20), .int(1));
+    try junk.setStr(heap, try state.newString(std.mem.asBytes(&@as([20][5]u8, @splat("long ".*)))), .int(1));
     _ = try Proto.LuaClosure.create(heap, proto, 0);
     _ = try Proto.NativeClosure.create(heap, &nativeNop, 2);
     _ = try Userdata.create(heap, 100, 3);
@@ -1700,7 +1700,7 @@ test "a collection frees exactly the unreachable objects of every kind" {
     state.collect();
     try testing.expectEqual(live_objects, countObjects(heap));
     try testing.expectEqualStrings("in a closed upvalue", lcl.upvals()[0].v.asString().bytes());
-    try testing.expectEqualStrings("x" ** 50, ncl.upvalues()[0].asString().bytes());
+    try testing.expectEqualStrings(&@as([50]u8, @splat('x')), ncl.upvalues()[0].asString().bytes());
     try testing.expect(ud.userValues()[0].isTable());
     try testing.expectEqualStrings("on a coroutine stack", open.v.asString().bytes());
     try testing.expectEqualStrings("a constant", proto.k[0].asString().bytes());
@@ -1756,7 +1756,7 @@ test "the interner drops dead strings and keeps fixed ones" {
     defer state.destroy();
     const before = state.strings.count;
     var buf: [16]u8 = undefined;
-    for (0..500) |i| _ = try state.newString(try std.fmt.bufPrint(&buf, "tmp{d}", .{i}));
+    for (0..500) |i| _ = try state.newString(try std.mem.print(&buf, "tmp{d}", .{i}));
     try testing.expectEqual(before + 500, state.strings.count);
     state.collect();
     try testing.expectEqual(before, state.strings.count);

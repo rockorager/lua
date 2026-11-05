@@ -10,7 +10,7 @@ The repository is hosted on Amp at https://ampcode.com/@rockorager/lua, so proje
 
 ## Environment
 
-Zig 0.16 only. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just ci`. Run `just fmt` before you commit. The dev shell also provides reference C Lua 5.5.1 as `lua`, the oracle for differential tests and the baseline for benchmarks. `.agents/setup` installs Nix when an orb lacks it and warms the dev shell.
+Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just ci`. Run `just fmt` before you commit. The dev shell also provides reference C Lua 5.5.1 as `lua`, the oracle for differential tests and the baseline for benchmarks. `.agents/setup` installs Nix when an orb lacks it and warms the dev shell.
 
 ## Performance
 

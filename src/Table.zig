@@ -619,7 +619,7 @@ pub fn resize(t: *Table, heap: *gc.Heap, new_asize: u32, nhash: u32) error{OutOf
             @memcpy(t.array.? - 8 * @as(usize, keep), (old.array.? - 8 * @as(usize, keep))[0 .. 8 * @as(usize, keep)]);
             @memcpy((t.array.? + 4)[0..keep], (old.array.? + 4)[0..keep]);
         }
-        @memset((t.array.? + 4 + keep)[0 .. new_asize - keep], @intFromEnum(Tag.nil));
+        @memset((t.array.? + 4 + keep)[0 .. new_asize - keep], @backingInt(Tag.nil));
         // 5.5's initial hint, so `#` finds the reference's border in a
         // table with holes.
         t.lenHint().* = new_asize / 2;
@@ -813,7 +813,7 @@ test "the inline cache answers for its own key from any slot" {
     defer h.deinit();
     const t = try Table.create(&h.heap, 0, 0);
     var name: [8]u8 = undefined;
-    for (0..100) |i| try t.set(&h.heap, h.str(try std.fmt.bufPrint(&name, "k{d}", .{i})), .int(@intCast(i)));
+    for (0..100) |i| try t.set(&h.heap, h.str(try std.mem.print(&name, "k{d}", .{i})), .int(@intCast(i)));
     const x = h.str("k42").asString();
     const absent = h.str("absent").asString();
     // A slot naming another key's node, an empty node, or no node at all
@@ -843,7 +843,7 @@ test "string, float, boolean, and object keys" {
     defer h.deinit();
     const t = try Table.create(&h.heap, 0, 0);
     const other = try Table.create(&h.heap, 0, 0);
-    const long = "L" ** 64;
+    const long = &@as([64]u8, @splat('L'));
     try t.set(&h.heap, h.str("x"), .int(1));
     try t.set(&h.heap, h.str(long), .int(2));
     try t.set(&h.heap, .float(1.5), .int(3));
@@ -891,7 +891,7 @@ test "next visits every key once, even when the loop clears and reassigns fields
     const t = try Table.create(&h.heap, 0, 0);
     var buf: [16]u8 = undefined;
     for (1..51) |i| try t.setInt(&h.heap, @intCast(i), .int(@intCast(i)));
-    for (0..200) |i| try t.set(&h.heap, h.str(try std.fmt.bufPrint(&buf, "k{d}", .{i})), .int(@intCast(i)));
+    for (0..200) |i| try t.set(&h.heap, h.str(try std.mem.print(&buf, "k{d}", .{i})), .int(@intCast(i)));
     try t.set(&h.heap, .float(0.25), .int(1));
 
     var seen: usize = 0;

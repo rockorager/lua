@@ -221,7 +221,7 @@ fn fTostring(L: *lua_State) callconv(.c) c_int {
         _ = lua_pushstring(L, "file (closed)");
     } else {
         var buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "file (0x{x})", .{@intFromPtr(p.f)}) catch unreachable;
+        const s = std.mem.print(&buf, "file (0x{x})", .{@intFromPtr(p.f)}) catch unreachable;
         _ = lua_pushlstring(L, s.ptr, s.len);
     }
     return 1;

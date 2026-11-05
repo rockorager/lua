@@ -83,7 +83,7 @@ pub const Tag = enum(u8) {
     dead_key,
 
     pub inline fn isCollectable(t: Tag) bool {
-        return @intFromEnum(t) >= @intFromEnum(Tag.short_string) and t != .dead_key;
+        return @backingInt(t) >= @backingInt(Tag.short_string) and t != .dead_key;
     }
 };
 
@@ -99,7 +99,7 @@ pub const Type = enum(u8) {
     userdata,
     thread,
 
-    pub const count = @typeInfo(Type).@"enum".fields.len;
+    pub const count = @typeInfo(Type).@"enum".field_names.len;
 
     /// The name `type()` returns.
     pub fn name(t: Type) []const u8 {
@@ -175,7 +175,7 @@ pub inline fn isNil(v: Value) bool {
 
 /// `nil` and `false` are false; everything else is true.
 pub inline fn isFalsy(v: Value) bool {
-    return @intFromEnum(v.tag) <= @intFromEnum(Tag.bool_false);
+    return @backingInt(v.tag) <= @backingInt(Tag.bool_false);
 }
 
 pub inline fn isInt(v: Value) bool {
@@ -267,9 +267,9 @@ pub inline fn asLightUserdata(v: Value) ?*anyopaque {
 }
 
 const type_of_tag = blk: {
-    var types: [@typeInfo(Tag).@"enum".fields.len]Type = undefined;
-    for (@typeInfo(Tag).@"enum".fields) |f| {
-        types[f.value] = switch (@as(Tag, @enumFromInt(f.value))) {
+    var types: [@typeInfo(Tag).@"enum".field_names.len]Type = undefined;
+    for (@typeInfo(Tag).@"enum".field_values) |value| {
+        types[value] = switch (@as(Tag, @fromBackingInt(@intCast(value)))) {
             .nil, .dead_key, .proto, .upval => .nil,
             .bool_false, .bool_true => .boolean,
             .int, .float => .number,
@@ -286,7 +286,7 @@ const type_of_tag = blk: {
 
 /// The basic type of `v`.
 pub inline fn typeOf(v: Value) Type {
-    return type_of_tag[@intFromEnum(v.tag)];
+    return type_of_tag[@backingInt(v.tag)];
 }
 
 /// The float `f` as an integer if it has an exact integer value.

@@ -129,13 +129,13 @@ const kind_text = [_][]const u8{
 };
 
 const reserved: std.StaticStringMap(Kind) = .initComptime(blk: {
-    const first = @intFromEnum(Kind.@"and");
-    const last = @intFromEnum(Kind.@"while");
+    const first = @backingInt(Kind.@"and");
+    const last = @backingInt(Kind.@"while");
     var words: [last - first + 1 - @intFromBool(!global_is_reserved)]struct { []const u8, Kind } = undefined;
     var n = 0;
     for (first..last + 1) |k| {
-        if (k == @intFromEnum(Kind.global) and !global_is_reserved) continue;
-        words[n] = .{ kind_text[k - 256], @enumFromInt(k) };
+        if (k == @backingInt(Kind.global) and !global_is_reserved) continue;
+        words[n] = .{ kind_text[k - 256], @fromBackingInt(@intCast(k)) };
         n += 1;
     }
     break :blk words;
@@ -239,9 +239,9 @@ pub fn next(lx: *Lexer) Error!Token {
             },
             0 => {
                 if (p == src.len) return lx.token(.eos, start, p, .{ .none = {} });
-                return lx.token(@enumFromInt(0), start, p + 1, .{ .none = {} });
+                return lx.token(@fromBackingInt(@intCast(0)), start, p + 1, .{ .none = {} });
             },
-            else => |c| return lx.token(@enumFromInt(c), start, p + 1, .{ .none = {} }),
+            else => |c| return lx.token(@fromBackingInt(@intCast(c)), start, p + 1, .{ .none = {} }),
         }
     }
 }
@@ -537,14 +537,14 @@ pub fn errorMessage(lx: *const Lexer) []const u8 {
 /// expected": `'+'`, `'<\1>'` for an unprintable byte, `'=='`, `'and'`,
 /// `<eof>`, `<name>`.
 pub fn writeKind(w: *Writer, kind: Kind) Writer.Error!void {
-    const k = @intFromEnum(kind);
+    const k = @backingInt(kind);
     if (k < 256) {
         const c: u8 = @intCast(k);
         if (c >= ' ' and c < 0x7f) return w.print("'{c}'", .{c});
         return w.print("'<\\{d}>'", .{c});
     }
     const text = kind_text[k - 256];
-    if (@intFromEnum(kind) < @intFromEnum(Kind.eos)) return w.print("'{s}'", .{text});
+    if (@backingInt(kind) < @backingInt(Kind.eos)) return w.print("'{s}'", .{text});
     return w.writeAll(text);
 }
 
@@ -635,7 +635,9 @@ test "every operator and reserved word, and global as a name" {
         },
     );
     // Bytes that are not Lua tokens come back as themselves.
-    try expectKinds("$@\x00\x80", &.{ @enumFromInt('$'), @enumFromInt('@'), @enumFromInt(0), @enumFromInt(0x80) });
+    try expectKinds("$@\x00\x80", &.{
+        @fromBackingInt('$'), @fromBackingInt('@'), @fromBackingInt(0), @fromBackingInt(0x80),
+    });
     // Comments of every form, and a short comment at the end.
     try expectKinds("--x\n1 --[==[ ]] ]=] \n]==] 2 --[==x\n 3 --[[]]4--", &.{ .int, .int, .int, .int });
 }

@@ -175,7 +175,7 @@ noinline fn failArgs(ls: *Parser, line: u32, near: ?Token, fmt: []const u8, args
     w.print(":{d}: ", .{line}) catch return error.OutOfMemory;
     Thread.FormatArg.write(w, fmt, args) catch return error.OutOfMemory;
     if (near) |tok| {
-        if (@intFromEnum(tok.kind) != 0) {
+        if (@backingInt(tok.kind) != 0) {
             w.writeAll(" near ") catch return error.OutOfMemory;
             ls.lx.writeNear(w, tok.raw) catch return error.OutOfMemory;
         }
@@ -1130,12 +1130,12 @@ fn subExpr(ls: *Parser, v: *ExpDesc, limit: u8) Error!BinOpr {
         try ls.simpleExp(v);
     }
     var op = getBinOpr(ls.t.kind);
-    while (op != .none and priority[@intFromEnum(op)][0] > limit) {
+    while (op != .none and priority[@backingInt(op)][0] > limit) {
         var v2: ExpDesc = .{};
         const line = ls.lx.line;
         try ls.next();
         try @call(.never_inline, FuncState.infix, .{ ls.fs.?, op, v });
-        const nextop = try ls.subExpr(&v2, priority[@intFromEnum(op)][1]);
+        const nextop = try ls.subExpr(&v2, priority[@backingInt(op)][1]);
         try @call(.never_inline, FuncState.posfix, .{ ls.fs.?, op, v, &v2, line });
         op = nextop;
     }
@@ -1617,7 +1617,7 @@ fn retStat(ls: *Parser) Error!void {
             try fs.setMultRet(&e);
             if (e.k == .call and nret == 1 and !fs.bl.?.insidetbc) {
                 const i = fs.inst(e.info);
-                i.* = (i.* & ~@as(u32, 0x7f)) | @intFromEnum(opcodes.OpCode.tailcall);
+                i.* = (i.* & ~@as(u32, 0x7f)) | @backingInt(opcodes.OpCode.tailcall);
                 std.debug.assert(opcodes.a(i.*) == ls.nvarstack(fs));
             }
             nret = multret;

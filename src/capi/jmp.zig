@@ -131,7 +131,7 @@ pub inline fn call(regs: *Regs, f: *const anyopaque, a0: usize, a1: usize, a2: u
 /// the xmm ones carry the clobber. The AVX-512 mask registers and the x87
 /// stack have no names here; the code around a call holds nothing in
 /// them.
-const x86_clobbers: std.builtin.assembly.Clobbers = if (arch == .x86_64) .{
+const x86_clobbers: std.lang.assembly.Clobbers = if (arch == .x86_64) .{
     .memory = true,
     .cc = true,
     .dirflag = true,
@@ -213,7 +213,7 @@ const x86_clobbers: std.builtin.assembly.Clobbers = if (arch == .x86_64) .{
 
 /// x18 is Apple's platform register, which nothing may touch, and a
 /// temporary on Linux. The v names cover the whole vector registers.
-const aarch64_clobbers: std.builtin.assembly.Clobbers = if (arch == .aarch64) .{
+const aarch64_clobbers: std.lang.assembly.Clobbers = if (arch == .aarch64) .{
     .memory = true,
     .nzcv = true,
     .fpsr = true,

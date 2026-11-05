@@ -276,9 +276,9 @@ const Outcome = union(enum) {
     fn describe(o: Outcome) []const u8 {
         return switch (o) {
             .ok => "ok",
-            .leak => |n| std.fmt.allocPrint(gpa, "leak: {d} bytes held after close", .{n}) catch "leak",
+            .leak => |n| gpa.print("leak: {d} bytes held after close", .{n}) catch "leak",
             .wrong => |m| m,
-            .memory => |n| std.fmt.allocPrint(gpa, "memory: peak {d} bytes", .{n}) catch "memory",
+            .memory => |n| gpa.print("memory: peak {d} bytes", .{n}) catch "memory",
         };
     }
 
@@ -324,13 +324,13 @@ fn runOne(ctx: *Ctx, target: Target, input: []const u8, case: u64) Outcome {
 }
 
 fn setPhase(ctx: *Ctx, phase: Phase) void {
-    if (ctx.shared) |s| @atomicStore(u32, &s.phase, @intFromEnum(phase), .seq_cst);
+    if (ctx.shared) |s| @atomicStore(u32, &s.phase, @backingInt(phase), .seq_cst);
 }
 
 fn runParse(ctx: *Ctx, input: []const u8) Outcome {
     var counting: Counting = .{ .backing = std.heap.smp_allocator };
     {
-        const state = lua.State.init(counting.allocator(), .{ .libs = .initEmpty(), .seed = 1, .gc_stress = ctx.opts.gc_stress }) catch
+        const state = lua.State.init(counting.allocator(), .{ .libs = .empty, .seed = 1, .gc_stress = ctx.opts.gc_stress }) catch
             return .{ .wrong = "State.init failed" };
         defer state.close();
         setPhase(ctx, .load);
@@ -392,7 +392,7 @@ fn runBinary(ctx: *Ctx, input: []const u8) Outcome {
                 const msg = state.errorMessage();
                 if (std.mem.startsWith(u8, msg, "chunk: bad binary format (") or
                     std.mem.startsWith(u8, msg, "attempt to load a text chunk")) break :blk .ok;
-                break :blk .{ .wrong = std.fmt.allocPrint(gpa, "unexpected load error: {s}", .{msg}) catch "unexpected load error" };
+                break :blk .{ .wrong = gpa.print("unexpected load error: {s}", .{msg}) catch "unexpected load error" };
             },
             // The loader asks for the block a count needs, as the
             // reference does, but fills only what the chunk holds: a
@@ -505,7 +505,7 @@ fn oomCase(ctx: *Ctx, counting: *Counting, input: []const u8) Outcome {
         error.Runtime, error.Syntax => {
             const msg = state.errorMessage();
             if (!ctx.oom_lax and std.mem.indexOf(u8, msg, "not enough memory") == null)
-                return .{ .wrong = std.fmt.allocPrint(gpa, "{t}: {s}", .{ e, msg }) catch "wrong error" };
+                return .{ .wrong = gpa.print("{t}: {s}", .{ e, msg }) catch "wrong error" };
         },
     }
     // A lax program can fail on its own before the Nth allocation, which
@@ -514,7 +514,7 @@ fn oomCase(ctx: *Ctx, counting: *Counting, input: []const u8) Outcome {
     if (counting.fail_always) return .ok; // `close`, still failing, is the check
     // With allocations succeeding again, the state runs code.
     const n = state.doString(i64, "local t = {} for i = 1, 10 do t[i] = i .. '' end return #t", .{}) catch |e|
-        return .{ .wrong = std.fmt.allocPrint(gpa, "state unusable after the failure: {t}: {s}", .{ e, state.errorMessage() }) catch "unusable" };
+        return .{ .wrong = gpa.print("state unusable after the failure: {t}: {s}", .{ e, state.errorMessage() }) catch "unusable" };
     if (n != 10) return .{ .wrong = "state gives a wrong answer after the failure" };
     return .ok;
 }
@@ -605,7 +605,7 @@ fn loadCorpus(dirs: []const []const u8) ![]const []const u8 {
 const source_dirs = [_][]const u8{ "test/lua-5.5.1-tests", "bench", "test/diff", "test/fuzz/corpus/parse", "test/fuzz/crashers" };
 
 const interesting = "()[]{}=.,;:'\"\\-+*/%^#&|~<> \n\t0123456789abcdefxXeEp_";
-const numbers = [_][]const u8{ "0", "-0", "1e308", "1e-400", "0x7fffffffffffffff", "0x8000000000000000", "9223372036854775807", "9223372036854775808", "-9223372036854775808", "0x", "1e", ".5", "5.", "0x1p99999", "1" ++ "0" ** 40, "0x.1p-1080", "3e", "0xep1" };
+const numbers = [_][]const u8{ "0", "-0", "1e308", "1e-400", "0x7fffffffffffffff", "0x8000000000000000", "9223372036854775807", "9223372036854775808", "-9223372036854775808", "0x", "1e", ".5", "5.", "0x1p99999", "1" ++ &@as([40]u8, @splat('0')), "0x.1p-1080", "3e", "0xep1" };
 
 fn mutate(ctx: *Ctx, buf: *std.ArrayList(u8), binary: bool) !void {
     const r = ctx.rng;
@@ -892,11 +892,12 @@ fn waitChild(shared: *Shared, child: Child, timeout: i64) Status {
     var last = @atomicLoad(u64, &shared.heartbeat, .seq_cst);
     var since = nowMs();
     while (true) {
-        var status: u32 = 0;
-        const rc = linux.waitpid(child.pid, &status, linux.W.NOHANG);
+        var raw: i32 = 0;
+        const rc = linux.waitpid(child.pid, &raw, linux.W.NOHANG);
         if (rc == child.pid) {
+            const status: u32 = @bitCast(raw);
             if (linux.W.IFEXITED(status)) return .{ .exited = linux.W.EXITSTATUS(status) };
-            return .{ .signaled = @intFromEnum(linux.W.TERMSIG(status)) };
+            return .{ .signaled = @backingInt(linux.W.TERMSIG(status)) };
         }
         const beat = @atomicLoad(u64, &shared.heartbeat, .seq_cst);
         if (beat != last) {
@@ -904,7 +905,7 @@ fn waitChild(shared: *Shared, child: Child, timeout: i64) Status {
             since = nowMs();
         } else if (nowMs() - since > timeout) {
             _ = linux.kill(child.pid, .KILL);
-            _ = linux.waitpid(child.pid, &status, 0);
+            _ = linux.waitpid(child.pid, &raw, 0);
             return .hung;
         }
         sleepMs(5);
@@ -993,9 +994,9 @@ fn supervise(target: Target, opts_in: Options, seed: u64) !void {
             }
         }
     }
-    const dir = try std.fmt.allocPrint(gpa, "{s}/{t}{s}", .{ opts.out, target, if (opts.gc_stress != .off) "-stress" else "" });
+    const dir = try gpa.print("{s}/{t}{s}", .{ opts.out, target, if (opts.gc_stress != .off) "-stress" else "" });
     try std.Io.Dir.cwd().createDirPath(io, dir);
-    const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/child-{d}.log", .{ dir, seed % 100000 }, 0);
+    const log_path = try gpa.printSentinel("{s}/child-{d}.log", .{ dir, seed % 100000 }, 0);
     const start = nowMs();
     const deadline = start + @as(i64, @intCast(opts.seconds)) * 1000;
     var findings: u32 = 0;
@@ -1008,7 +1009,7 @@ fn supervise(target: Target, opts_in: Options, seed: u64) !void {
         const status = waitChild(shared, child, timeoutMs(target));
         const kind = kindOf(status) orelse break;
         restarts += 1;
-        const phase: Phase = @enumFromInt(shared.phase);
+        const phase: Phase = @fromBackingInt(@intCast(shared.phase));
         const input = try gpa.dupe(u8, shared.data[0..shared.len]);
         const log = readLog(log_path);
         const case = if (target.sweeps()) shared.done else 0;
@@ -1049,28 +1050,28 @@ fn record(ctx: *Ctx, target: Target, dir: []const u8, f: Finding, known: bool, s
     const hash = std.hash.Wyhash.hash(0, f.input) % 1_000_000;
     const sub = if (known) "known" else "findings";
     const base = if (target.sweeps())
-        try std.fmt.allocPrint(gpa, "{s}/{s}/{t}-{d}-n{d}{s}", .{ dir, sub, f.kind, hash, f.case >> 1, if (f.case & 1 == 1) "-always" else "" })
+        try gpa.print("{s}/{s}/{t}-{d}-n{d}{s}", .{ dir, sub, f.kind, hash, f.case >> 1, if (f.case & 1 == 1) "-always" else "" })
     else
-        try std.fmt.allocPrint(gpa, "{s}/{s}/{t}-{d}", .{ dir, sub, f.kind, hash });
-    try std.Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, sub }));
+        try gpa.print("{s}/{s}/{t}-{d}", .{ dir, sub, f.kind, hash });
+    try std.Io.Dir.cwd().createDirPath(io, try gpa.print("{s}/{s}", .{ dir, sub }));
     std.debug.print("{s}: {t} in {t} ({s}), {d} bytes{s}\n", .{ if (known) "known limit" else "FINDING", f.kind, f.phase, sig, f.input.len, if (target.sweeps() or known) "" else ", minimizing" });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.input", .{base}), .data = f.input });
-    const info = try std.fmt.allocPrint(gpa, "target: {t}\nkind: {t}\nphase: {t}\nstatus: {any}\ncase: n={d} {s}\nsignature: {s}\n\n{s}", .{ target, f.kind, f.phase, status, f.case >> 1, if (f.case & 1 == 1) "always" else "once", sig, f.log });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.txt", .{base}), .data = info });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.input", .{base}), .data = f.input });
+    const info = try gpa.print("target: {t}\nkind: {t}\nphase: {t}\nstatus: {any}\ncase: n={d} {s}\nsignature: {s}\n\n{s}", .{ target, f.kind, f.phase, status, f.case >> 1, if (f.case & 1 == 1) "always" else "once", sig, f.log });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.txt", .{base}), .data = info });
     if (target.sweeps() or known) return;
     // One minimized input per signature and kind is enough.
-    const key = try std.fmt.allocPrint(gpa, "{t}|{t}|{s}", .{ f.kind, f.phase, sig });
+    const key = try gpa.print("{t}|{t}|{s}", .{ f.kind, f.phase, sig });
     if (minimized.contains(key)) return;
     try minimized.put(gpa, key, {});
     const min = try minimize(ctx, target, f, sig, dir);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.min", .{base}), .data = min });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.min", .{base}), .data = min });
     std.debug.print("  minimized to {d} bytes: {s}.min\n", .{ min.len, base });
 }
 
 /// Delta debugging over lines, then bytes, keeping the failure's kind
 /// and signature. Each try runs in a fresh child.
 fn minimize(ctx: *Ctx, target: Target, f: Finding, sig: []const u8, dir: []const u8) ![]const u8 {
-    const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/minimize.log", .{dir}, 0);
+    const log_path = try gpa.printSentinel("{s}/minimize.log", .{dir}, 0);
     var best = try gpa.dupe(u8, f.input);
     const deadline = nowMs() + 120_000;
     const Tester = struct {
@@ -1131,7 +1132,7 @@ const Run = struct {
 fn runProcess(argv: []const []const u8, cwd: ?[]const u8, timeout_s: u32) !Run {
     var full: std.ArrayList([]const u8) = .empty;
     defer full.deinit(gpa);
-    const t = try std.fmt.allocPrint(gpa, "{d}", .{timeout_s});
+    const t = try gpa.print("{d}", .{timeout_s});
     // A run may take 2 GiB of address space: past that, an allocation
     // fails, so a runaway input cannot take the machine down.
     try full.appendSlice(gpa, &.{ "prlimit", "--as=2147483648", "timeout", "-s", "KILL", t });
@@ -1192,7 +1193,7 @@ fn normalize(text: []const u8, bin: []const u8) ![]const u8 {
 }
 
 fn which(name: []const u8) ![]const u8 {
-    const r = try std.process.run(perm, io, .{ .argv = &.{ "sh", "-c", try std.fmt.allocPrint(perm, "command -v {s}", .{name}) } });
+    const r = try std.process.run(perm, io, .{ .argv = &.{ "sh", "-c", try perm.print("command -v {s}", .{name}) } });
     return std.mem.trimEnd(u8, r.stdout, "\n");
 }
 
@@ -1218,7 +1219,7 @@ const DiffCtx = struct {
 /// Whether `src` still shows the difference; for `diff`, both arms must
 /// finish, so a timeout never counts.
 fn differs(d: *DiffCtx, src: []const u8) !bool {
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}/prog.lua", .{d.dir}), .data = try std.mem.concat(gpa, u8, &.{ d.header, src }) });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}/prog.lua", .{d.dir}), .data = try std.mem.concat(gpa, u8, &.{ d.header, src }) });
     switch (d.cmd) {
         .diff, .@"capi-diff" => {
             const a = try runProcess(&.{ d.ref, "prog.lua" }, d.dir, d.timeout);
@@ -1257,9 +1258,9 @@ fn maskListing(text: []const u8) []const u8 {
 }
 
 fn differential(cmd: DiffCommand, opts: Options, seed: u64) !void {
-    const dir = try std.fmt.allocPrint(perm, "{s}/{t}", .{ opts.out, cmd });
+    const dir = try perm.print("{s}/{t}", .{ opts.out, cmd });
     try std.Io.Dir.cwd().createDirPath(io, dir);
-    const work = try std.fmt.allocPrint(perm, "{s}/work-{d}", .{ dir, seed % 100000 });
+    const work = try perm.print("{s}/work-{d}", .{ dir, seed % 100000 });
     try std.Io.Dir.cwd().createDirPath(io, work);
     const abs = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", perm);
     var d: DiffCtx = .{
@@ -1272,7 +1273,7 @@ fn differential(cmd: DiffCommand, opts: Options, seed: u64) !void {
         .module = try std.fs.path.resolve(perm, &.{ abs, opts.module }),
     };
     if (cmd == .@"capi-diff") {
-        const so = try std.fmt.allocPrint(perm, "{s}/capifuzz.so", .{d.module});
+        const so = try perm.print("{s}/capifuzz.so", .{d.module});
         std.Io.Dir.cwd().access(io, so, .{}) catch {
             std.debug.print("fuzz capi-diff: no {s}; `just fuzz-capi` builds it\n", .{so});
             return error.NoModule;
@@ -1305,18 +1306,18 @@ fn differential(cmd: DiffCommand, opts: Options, seed: u64) !void {
                 if (!try differs(&d, buf.items)) continue;
                 found += 1;
                 const first = d.last;
-                const name = try std.fmt.allocPrint(gpa, "{s}/{t}-{d}.lua", .{ dir, cmd, programSeed(seed, iter) });
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.full", .{name}), .data = try std.mem.concat(gpa, u8, &.{ d.header, buf.items }) });
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.full.ref", .{name}), .data = first[0] });
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.full.ours", .{name}), .data = first[1] });
+                const name = try gpa.print("{s}/{t}-{d}.lua", .{ dir, cmd, programSeed(seed, iter) });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.full", .{name}), .data = try std.mem.concat(gpa, u8, &.{ d.header, buf.items }) });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.full.ref", .{name}), .data = first[0] });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.full.ours", .{name}), .data = first[1] });
                 std.debug.print("DIFFERS: {s}.full ({d} bytes), minimizing\n", .{ name, buf.items.len });
                 d.timeout = 3;
                 const min = try minimizeText(&d, buf.items, nowMs() + 180_000);
                 d.timeout = 20;
                 try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = name, .data = try std.mem.concat(gpa, u8, &.{ d.header, min }) });
                 _ = try differs(&d, min);
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.ref", .{name}), .data = d.last[0] });
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.ours", .{name}), .data = d.last[1] });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.ref", .{name}), .data = d.last[0] });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.ours", .{name}), .data = d.last[1] });
                 std.debug.print("  minimized to {d} bytes: {s}\n", .{ min.len, name });
             },
             .messages, .@"binary-diff" => {
@@ -1416,7 +1417,7 @@ fn batch(d: *DiffCtx, cmd: DiffCommand, opts: Options, seed: u64, dir: []const u
     const corpus = try cachedCorpus(cmd);
     var prng: std.Random.DefaultPrng = .init(seed);
     var ctx: Ctx = .{ .opts = opts, .rng = prng.random(), .corpus = corpus.sources, .dumps = corpus.dumps };
-    const runner = try std.fmt.allocPrint(gpa, "{s}/runner.lua", .{d.dir});
+    const runner = try gpa.print("{s}/runner.lua", .{d.dir});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = runner, .data = messages_runner });
     var argv_ref: std.ArrayList([]const u8) = .empty;
     try argv_ref.appendSlice(gpa, &.{ d.ref, "runner.lua", if (cmd == .messages) "t" else "b" });
@@ -1429,8 +1430,8 @@ fn batch(d: *DiffCtx, cmd: DiffCommand, opts: Options, seed: u64, dir: []const u
             // do not apply to load, but huge inputs make huge lines.
             if (buf.items.len > 32 << 10) buf.shrinkRetainingCapacity(32 << 10);
         } else try makeInput(&ctx, .binary, &buf, i);
-        const name = try std.fmt.allocPrint(gpa, "in{d}", .{i});
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ d.dir, name }), .data = buf.items });
+        const name = try gpa.print("in{d}", .{i});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}/{s}", .{ d.dir, name }), .data = buf.items });
         try argv_ref.append(gpa, name);
         try inputs.append(gpa, try gpa.dupe(u8, buf.items));
     }
@@ -1448,23 +1449,23 @@ fn batch(d: *DiffCtx, cmd: DiffCommand, opts: Options, seed: u64, dir: []const u
         // Unlike lundump.c, the loader refuses opcodes outside the set.
         if (cmd == .@"binary-diff" and std.mem.endsWith(u8, y, "bad binary format (invalid opcode)")) continue;
         const idx = i;
-        const key = try std.fmt.allocPrint(perm, "{s}|{s}", .{ classOf(x), classOf(y) });
+        const key = try perm.print("{s}|{s}", .{ classOf(x), classOf(y) });
         if (seen.contains(key)) continue;
         try seen.put(perm, key, {});
         found.* += 1;
-        const base = try std.fmt.allocPrint(gpa, "{s}/{t}-{d}-{d}", .{ dir, cmd, seed, idx });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.input", .{base}), .data = inputs.items[idx] });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.txt", .{base}), .data = try std.fmt.allocPrint(gpa, "ref:  {s}\nours: {s}\n", .{ x[0..@min(x.len, 4000)], y[0..@min(y.len, 4000)] }) });
+        const base = try gpa.print("{s}/{t}-{d}-{d}", .{ dir, cmd, seed, idx });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.input", .{base}), .data = inputs.items[idx] });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.txt", .{base}), .data = try gpa.print("ref:  {s}\nours: {s}\n", .{ x[0..@min(x.len, 4000)], y[0..@min(y.len, 4000)] }) });
         std.debug.print("DIFFERS: {s}\n  ref:  {s}\n  ours: {s}\n", .{ base, x[0..@min(x.len, 300)], y[0..@min(y.len, 300)] });
     }
     if (a.timed_out or b.timed_out or std.mem.indexOf(u8, b.out, "-- exit 0 --") == null) {
         // A whole batch that crashed or hung on one side: keep it.
         if (std.mem.indexOf(u8, a.out, "-- exit 0 --") != null) {
             found.* += 1;
-            const base = try std.fmt.allocPrint(gpa, "{s}/{t}-{d}-batch", .{ dir, cmd, seed });
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.txt", .{base}), .data = b.out[b.out.len -| 4000..] });
+            const base = try gpa.print("{s}/{t}-{d}-batch", .{ dir, cmd, seed });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.txt", .{base}), .data = b.out[b.out.len -| 4000..] });
             std.debug.print("BATCH FAILED on ours: {s}.txt (input {d})\n", .{ base, i });
-            if (i < inputs.items.len) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}.input", .{base}), .data = inputs.items[i] });
+            if (i < inputs.items.len) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try gpa.print("{s}.input", .{base}), .data = inputs.items[i] });
         }
     }
     return n;

@@ -33,7 +33,7 @@ fn divmod(a: i64, b: i64) !struct { i64, i64 } {
 
 fn greet(state: *lua.State, name: []const u8) ![]const u8 {
     if (name.len == 0) return state.raise("empty name", .{});
-    return std.fmt.allocPrint(arena(state), "hello, {s}", .{name});
+    return arena(state).print("hello, {s}", .{name});
 }
 
 fn arena(state: *lua.State) std.mem.Allocator {
@@ -118,7 +118,7 @@ test "libraries open as chosen, and a sandbox reaches no files" {
     try testing.expectError(error.Syntax, state.load("\x1bLua", .{}));
     try testing.expectEqualStrings("attempt to load a binary chunk (mode is 't')", state.errorMessage());
 
-    const none = try lua.State.init(testing.allocator, .{ .libs = .initEmpty() });
+    const none = try lua.State.init(testing.allocator, .{ .libs = .empty });
     defer none.close();
     try testing.expect(try none.doString(bool, "return print == nil and string == nil", .{}));
 }
@@ -349,7 +349,7 @@ const Counter = struct {
     }
 
     fn toString(state: *lua.State, self: *Counter) ![]const u8 {
-        return std.fmt.allocPrint(arenaOf(state), "Counter({d})", .{self.n});
+        return arenaOf(state).print("Counter({d})", .{self.n});
     }
 
     fn finalize(self: *Counter) void {

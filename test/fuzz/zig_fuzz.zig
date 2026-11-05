@@ -26,7 +26,7 @@ const seeds = [_][]const u8{
 fn compile(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [4096]u8 = undefined;
     const src = buf[0..smith.slice(&buf)];
-    const state = try lua.State.init(std.testing.allocator, .{ .libs = .initEmpty(), .seed = 1 });
+    const state = try lua.State.init(std.testing.allocator, .{ .libs = .empty, .seed = 1 });
     defer state.close();
     _ = state.load(src, .{ .name = "=fuzz" }) catch |e| switch (e) {
         error.Syntax => {},
@@ -57,7 +57,7 @@ fn undump(chunks: []const []const u8, smith: *std.testing.Smith) anyerror!void {
             else => buf[at] ^= @as(u8, 1) << smith.value(u3),
         }
     }
-    const state = try lua.State.init(std.testing.allocator, .{ .libs = .initEmpty(), .seed = 1 });
+    const state = try lua.State.init(std.testing.allocator, .{ .libs = .empty, .seed = 1 });
     defer state.close();
     _ = state.load(buf[0..len], .{ .name = "=c", .mode = .binary }) catch |e| switch (e) {
         error.Syntax => {

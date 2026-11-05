@@ -53,7 +53,7 @@ const Loader = struct {
 
     fn fail(s: *Loader, why: []const u8) Error {
         const gpa = s.th.heap().allocator();
-        const msg = try std.fmt.allocPrint(gpa, "{s}: bad binary format ({s})", .{ s.name, why });
+        const msg = try gpa.print("{s}: bad binary format ({s})", .{ s.name, why });
         defer gpa.free(msg);
         return s.th.throwRaw(.string(try s.th.state.newString(msg)));
     }
@@ -345,7 +345,7 @@ test "bad chunks raise the reference's messages and never crash" {
         var bad = chunk;
         bad[h.at] = h.byte;
         var buf: [64]u8 = undefined;
-        try expectFailure(th, &bad, try std.fmt.bufPrint(&buf, "c: bad binary format ({s})", .{h.msg}));
+        try expectFailure(th, &bad, try std.mem.print(&buf, "c: bad binary format ({s})", .{h.msg}));
     }
     // A count the bytes left cannot hold fails on its first bad item, as
     // the reference reads the items before running out: the header, then

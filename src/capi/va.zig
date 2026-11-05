@@ -1,7 +1,7 @@
 //! C's variable arguments for the C API's `...` and `va_list` functions
 //! (`lua_pushfstring`, `lua_pushvfstring`, `luaL_error`).
 //!
-//! Zig's `@cVaStart`, `@cVaArg`, and `std.builtin.VaList` serve every
+//! Zig's `@cVaStart`, `@cVaArg`, and `std.lang.VaList` serve every
 //! target the C API builds for but aarch64 Linux, where Zig 0.16 refuses
 //! them with LLVM ("disabled due to miscompilations"). There this file is
 //! AAPCS64's `va_list` (its §B.3): a variadic function's entry, written in
@@ -16,7 +16,7 @@ const builtin = @import("builtin");
 pub const native = !(builtin.cpu.arch == .aarch64 and builtin.os.tag == .linux);
 
 /// What a `va_list` parameter points to.
-pub const List = if (native) std.builtin.VaList else Aapcs64;
+pub const List = if (native) std.lang.VaList else Aapcs64;
 
 /// AAPCS64's `va_list`: the next argument on the stack, the ends of the
 /// saved general and vector registers, and the negative offsets of the

@@ -38,7 +38,7 @@ pub const Diagnostic = struct {
     }
 
     fn fail(d: *Diagnostic, comptime fmt: []const u8, args: anytype) Error {
-        const s = std.fmt.bufPrint(&d.buf, fmt, args) catch unreachable;
+        const s = std.mem.print(&d.buf, fmt, args) catch unreachable;
         d.len = @intCast(s.len);
         return error.PatternError;
     }
@@ -705,7 +705,7 @@ test "malformed patterns report the reference's messages" {
         .{ .p = "(%0)", .msg = "invalid capture index %0" },
         .{ .p = "(%1)", .msg = "invalid capture index %1" },
         .{ .p = "(.)%2", .msg = "invalid capture index %2" },
-        .{ .p = "(" ** 33, .msg = "too many captures" },
+        .{ .p = &@as([33]u8, @splat('(')), .msg = "too many captures" },
     };
     for (cases) |c| {
         var m: Matcher = .init("a", c.p);
@@ -713,11 +713,11 @@ test "malformed patterns report the reference's messages" {
         try testing.expectEqualStrings(c.msg, m.diag.message());
     }
     // The recursion limit counts nested items, so it takes a long subject.
-    var deep: Matcher = .init("a" ** 300, "a?" ** 300);
+    var deep: Matcher = .init(&@as([300]u8, @splat('a')), std.mem.asBytes(&@as([300][2]u8, @splat("a?".*))));
     try testing.expectError(error.PatternError, find(&deep, 0));
     try testing.expectEqualStrings("pattern too complex", deep.diag.message());
     // 32 captures is the limit, not an error.
-    var m: Matcher = .init("a", "(" ** 32 ++ ")" ** 32);
+    var m: Matcher = .init("a", &@as([32]u8, @splat('(')) ++ &@as([32]u8, @splat(')')));
     try testing.expect((try find(&m, 0)) != null);
     try testing.expectEqual(32, m.level);
 }
@@ -866,8 +866,8 @@ test "gmatch iterates with init and the empty-match rule" {
 }
 
 test "gmatch resets the recursion limit after an error" {
-    const p = "a?" ** 300;
-    var g: Gmatch = .init("a" ** 300, p, 0);
+    const p = std.mem.asBytes(&@as([300][2]u8, @splat("a?".*)));
+    var g: Gmatch = .init(&@as([300]u8, @splat('a')), p, 0);
     try testing.expectError(error.PatternError, g.next());
     try testing.expectEqualStrings("pattern too complex", g.m.diag.message());
     g.pos = 0;

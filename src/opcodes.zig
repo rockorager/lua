@@ -263,7 +263,7 @@ pub const Props = struct {
 pub const props: [std.enums.values(OpCode).len]Props = blk: {
     var p: [std.enums.values(OpCode).len]Props = undefined;
     for (std.enums.values(OpCode)) |o| {
-        const i = @intFromEnum(o);
+        const i = @backingInt(o);
         p[i] = switch (o) {
             .loadi, .loadf => .{ .mode = .iAsBx, .sets_a = true },
             .loadk, .loadkx, .forloop, .forprep, .tforloop, .closure => .{ .mode = .iABx, .sets_a = true },
@@ -316,7 +316,7 @@ pub const fields_per_flush = 50;
 // Decoding.
 
 pub inline fn op(i: Instruction) OpCode {
-    return @enumFromInt(@as(u7, @truncate(i)));
+    return @fromBackingInt(@intCast(@as(u7, @truncate(i))));
 }
 pub inline fn a(i: Instruction) u8 {
     return @truncate(i >> 7);
@@ -358,17 +358,17 @@ pub inline fn sj(i: Instruction) i32 {
 // Encoding.
 
 pub fn abc(o: OpCode, a_: u8, b_: u8, c_: u8, k_: bool) Instruction {
-    return @as(u32, @intFromEnum(o)) | @as(u32, a_) << 7 | @as(u32, @intFromBool(k_)) << 15 |
+    return @as(u32, @backingInt(o)) | @as(u32, a_) << 7 | @as(u32, @intFromBool(k_)) << 15 |
         @as(u32, b_) << 16 | @as(u32, c_) << 24;
 }
 
 pub fn vabc(o: OpCode, a_: u8, vb_: u6, vc_: u10, k_: bool) Instruction {
-    return @as(u32, @intFromEnum(o)) | @as(u32, a_) << 7 | @as(u32, @intFromBool(k_)) << 15 |
+    return @as(u32, @backingInt(o)) | @as(u32, a_) << 7 | @as(u32, @intFromBool(k_)) << 15 |
         @as(u32, vb_) << 16 | @as(u32, vc_) << 22;
 }
 
 pub fn abx(o: OpCode, a_: u8, bx_: u17) Instruction {
-    return @as(u32, @intFromEnum(o)) | @as(u32, a_) << 7 | @as(u32, bx_) << 15;
+    return @as(u32, @backingInt(o)) | @as(u32, a_) << 7 | @as(u32, bx_) << 15;
 }
 
 pub fn asbx(o: OpCode, a_: u8, sbx_: i32) Instruction {
@@ -376,11 +376,11 @@ pub fn asbx(o: OpCode, a_: u8, sbx_: i32) Instruction {
 }
 
 pub fn iax(o: OpCode, ax_: u25) Instruction {
-    return @as(u32, @intFromEnum(o)) | @as(u32, ax_) << 7;
+    return @as(u32, @backingInt(o)) | @as(u32, ax_) << 7;
 }
 
 pub fn isj(o: OpCode, sj_: i32) Instruction {
-    return @as(u32, @intFromEnum(o)) | @as(u32, @as(u25, @intCast(sj_ + offset_sj))) << 7;
+    return @as(u32, @backingInt(o)) | @as(u32, @as(u25, @intCast(sj_ + offset_sj))) << 7;
 }
 
 /// An 8-bit signed immediate (sB, sC) as its stored field.
@@ -392,15 +392,15 @@ const testing = std.testing;
 
 test "opcode numbers match Lua 5.5.1's" {
     // Spot checks against lopcodes.h's enum order.
-    try testing.expectEqual(0, @intFromEnum(OpCode.move));
-    try testing.expectEqual(11, @intFromEnum(OpCode.gettabup));
-    try testing.expectEqual(19, @intFromEnum(OpCode.newtable));
-    try testing.expectEqual(34, @intFromEnum(OpCode.add));
-    try testing.expectEqual(46, @intFromEnum(OpCode.mmbin));
-    try testing.expectEqual(57, @intFromEnum(OpCode.eq));
-    try testing.expectEqual(68, @intFromEnum(OpCode.call));
-    try testing.expectEqual(73, @intFromEnum(OpCode.forloop));
-    try testing.expectEqual(84, @intFromEnum(OpCode.extraarg));
+    try testing.expectEqual(0, @backingInt(OpCode.move));
+    try testing.expectEqual(11, @backingInt(OpCode.gettabup));
+    try testing.expectEqual(19, @backingInt(OpCode.newtable));
+    try testing.expectEqual(34, @backingInt(OpCode.add));
+    try testing.expectEqual(46, @backingInt(OpCode.mmbin));
+    try testing.expectEqual(57, @backingInt(OpCode.eq));
+    try testing.expectEqual(68, @backingInt(OpCode.call));
+    try testing.expectEqual(73, @backingInt(OpCode.forloop));
+    try testing.expectEqual(84, @backingInt(OpCode.extraarg));
     try testing.expectEqual(85, std.enums.values(OpCode).len);
 }
 

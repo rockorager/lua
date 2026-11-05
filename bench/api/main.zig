@@ -288,7 +288,7 @@ fn runInternal(state: *lua.State, scenario: Scenario, n: u32) !i64 {
             for (0..n) |i| {
                 try th.ensureStack(3);
                 const func = th.top;
-                th.push(s.registry.getInt(@intFromEnum(r)));
+                th.push(s.registry.getInt(@backingInt(r)));
                 th.push(.int(acc));
                 th.push(.int(@intCast(i)));
                 if (internal.vm.pcall(th, func, 1) != .ok) return error.LuaError;
@@ -324,7 +324,7 @@ fn runInternal(state: *lua.State, scenario: Scenario, n: u32) !i64 {
             const r = try state.ref(try state.doString(lua.Value, fields_table, .{}));
             var acc: i64 = 0;
             for (0..n) |_| {
-                const t = s.registry.getInt(@intFromEnum(r)).asTable();
+                const t = s.registry.getInt(@backingInt(r)).asTable();
                 const a = t.getStr(try s.newString("a"));
                 const b = t.getStr(try s.newString("b"));
                 const c = t.getStr(try s.newString("c"));
@@ -348,7 +348,7 @@ fn runInternal(state: *lua.State, scenario: Scenario, n: u32) !i64 {
             for (0..n) |i| {
                 try th.ensureStack(2);
                 const func = th.top;
-                th.push(s.registry.getInt(@intFromEnum(r)));
+                th.push(s.registry.getInt(@backingInt(r)));
                 th.push(.int(@intCast(i)));
                 if (internal.vm.pcall(th, func, -1) != .ok) return error.LuaError;
                 for (th.stack[func..th.top]) |v| acc +%= if (v.isInt()) v.asInt() else internal.auxlib.toInteger(v) orelse return error.LuaError;

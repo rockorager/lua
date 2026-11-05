@@ -33,11 +33,11 @@ pub fn build(b: *std.Build) void {
     // builds its own instance of the module without frame pointers in
     // optimized builds: the interpreter loop needs every register
     // (docs/slop/results/frame-pointer-20261030.md).
-    const omit_fp: ?bool = if (optimize == .Debug) null else true;
+    const omit_fp: ?bool = if (optimize == .debug) null else true;
     // Nor unwind tables: only Debug's stack traces read them, and they
     // are 50 KiB of read-only data mapped next to the constants
     // (docs/slop/results/lean-20261031.md).
-    const unwind: ?std.builtin.UnwindTables = if (optimize == .Debug) null else .none;
+    const unwind: ?std.lang.UnwindTables = if (optimize == .debug) null else .none;
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -77,7 +77,7 @@ pub fn build(b: *std.Build) void {
         // liblua for C hosts, as the reference's: `liblua.a`, `liblua.so`,
         // and a pkg-config file, exporting lua.h's, lauxlib.h's, and
         // lualib.h's functions (docs/slop/c-api.md).
-        for ([_]std.builtin.LinkMode{ .static, .dynamic }) |linkage| {
+        for ([_]std.lang.LinkMode{ .static, .dynamic }) |linkage| {
             const lib_mod = b.createModule(.{
                 .root_source_file = b.path("src/root.zig"),
                 .target = target,
@@ -100,31 +100,33 @@ pub fn build(b: *std.Build) void {
             if (linkage == .dynamic) liblua.setVersionScript(b.path("src/capi/liblua.map"));
             b.installArtifact(liblua);
         }
-        const pc = b.addWriteFiles().add("lua5.5.pc", b.fmt(
-            \\prefix={s}
-            \\libdir=${{prefix}}/lib
-            \\includedir=${{prefix}}/include
+        // The install prefix is not known while build.zig runs, so the
+        // file finds it relative to itself.
+        const pc = b.addWriteFiles().add("lua5.5.pc",
+            \\prefix=${pcfiledir}/../..
+            \\libdir=${prefix}/lib
+            \\includedir=${prefix}/include
             \\
             \\Name: Lua
             \\Description: Lua 5.5.1 in Zig, with the C API
             \\Version: 5.5.1
-            \\Libs: -L${{libdir}} -llua
-            \\Cflags: -I${{includedir}}
+            \\Libs: -L${libdir} -llua
+            \\Cflags: -I${includedir}
             \\
-        , .{b.install_prefix}));
+        );
         b.getInstallStep().dependOn(&b.addInstallFileWithDir(pc, .lib, "pkgconfig/lua5.5.pc").step);
     }
     // Optimized builds put the functions a short run calls first ahead of
     // the rest (src/order.ld, from `just order`): the kernel maps code
     // 64 KiB around each page that faults, so scattered first calls kept
     // nearly all of it resident (docs/slop/results/lean-20261031.md).
-    if (optimize != .Debug) {
+    if (optimize != .debug) {
         exe.link_function_sections = true;
         exe.setLinkerScript(b.path("src/order.ld"));
     }
     b.installArtifact(exe);
     const run_exe = b.addRunArtifact(exe);
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
     b.step("run", "Run the lua interpreter").dependOn(&run_exe.step);
 
     // The bytecode lister `just bytecode` compares with `luac -l -l`.
@@ -192,7 +194,7 @@ pub fn build(b: *std.Build) void {
     });
     const example = b.addExecutable(.{ .name = "example-host", .root_module = example_mod });
     const run_example = b.addRunArtifact(example);
-    if (b.args) |args| run_example.addArgs(args);
+    run_example.addPassthruArgs();
     b.step("example", "Run the example host").dependOn(&run_example.step);
 
     // The embedding API's cost against the engine's own path, for `just
@@ -221,10 +223,10 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     // Tests read the vendored suite under `test/`, so they run from the root.
     run_mod_tests.setCwd(b.path("."));
-    run_mod_tests.addArg(b.fmt("--seed=0x{x}", .{b.graph.random_seed}));
+    run_mod_tests.addPassthruArgs();
     const example_tests = b.addTest(.{ .root_module = example_mod, .test_runner = runner });
     const run_example_tests = b.addRunArtifact(example_tests);
-    run_example_tests.addArg(b.fmt("--seed=0x{x}", .{b.graph.random_seed}));
+    run_example_tests.addPassthruArgs();
     const test_step = b.step("test", "Run the unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_example_tests.step);

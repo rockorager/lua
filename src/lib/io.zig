@@ -149,9 +149,9 @@ pub fn execResult(th: *Thread, term: std.process.Child.Term) Error!u32 {
         .exited => |c| c,
         .signal => |s| blk: {
             what = "signal";
-            break :blk @intFromEnum(s);
+            break :blk @backingInt(s);
         },
-        .stopped => |s| @intFromEnum(s),
+        .stopped => |s| @backingInt(s),
         .unknown => |u| u,
     };
     th.push(if (std.mem.eql(u8, what, "exit") and code == 0) .true else .nil);
@@ -930,7 +930,7 @@ fn fTostring(th: *Thread, b: u32) Error!u32 {
         th.push(.string(try th.state.newString("file (closed)")));
     } else {
         var buf: [64]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "file (0x{x})", .{@intFromPtr(s)}) catch unreachable;
+        const text = std.mem.print(&buf, "file (0x{x})", .{@intFromPtr(s)}) catch unreachable;
         th.push(.string(try th.state.newString(text)));
     }
     return 1;

@@ -113,8 +113,8 @@ fn pattern(gpa: std.mem.Allocator, name: []const u8, wild: bool) ![]const u8 {
 fn trace(gpa: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8, envp: [*:null]const ?[*:0]const u8) ![]const []const u8 {
     var funcs = try readFuncs(gpa, io, argv[0]);
     const pid = try spawnTraced(gpa, argv, envp);
-    var status: u32 = 0;
-    _ = linux.waitpid(pid, &status, 0); // stopped at the exec
+    var raw: i32 = 0;
+    _ = linux.waitpid(pid, &raw, 0); // stopped at the exec
     for (funcs.items) |*f| {
         const word = try peek(pid, f.addr);
         f.saved = @truncate(word);
@@ -124,10 +124,11 @@ fn trace(gpa: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8, envp: [
     var sig: usize = 0;
     while (true) {
         _ = linux.ptrace(linux.PTRACE.CONT, pid, 0, sig, 0);
-        _ = linux.waitpid(pid, &status, 0);
+        _ = linux.waitpid(pid, &raw, 0);
+        const status: u32 = @bitCast(raw);
         if (linux.W.IFEXITED(status) or linux.W.IFSIGNALED(status)) break;
-        sig = @intFromEnum(linux.W.STOPSIG(status));
-        if (sig != @intFromEnum(linux.SIG.TRAP)) continue;
+        sig = @backingInt(linux.W.STOPSIG(status));
+        if (sig != @backingInt(linux.SIG.TRAP)) continue;
         sig = 0;
         // rip is word 16 of `user_regs_struct`; it is one past the int3.
         const rip = try peekUser(pid, 16 * 8);

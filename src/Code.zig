@@ -85,11 +85,11 @@ pub const ExpKind = enum(u8) {
     vararg,
 
     pub fn isVar(k: ExpKind) bool {
-        return @intFromEnum(k) >= @intFromEnum(ExpKind.local) and @intFromEnum(k) <= @intFromEnum(ExpKind.indexstr);
+        return @backingInt(k) >= @backingInt(ExpKind.local) and @backingInt(k) <= @backingInt(ExpKind.indexstr);
     }
 
     pub fn isIndexed(k: ExpKind) bool {
-        return @intFromEnum(k) >= @intFromEnum(ExpKind.indexed) and @intFromEnum(k) <= @intFromEnum(ExpKind.indexstr);
+        return @backingInt(k) >= @backingInt(ExpKind.indexed) and @backingInt(k) <= @backingInt(ExpKind.indexstr);
     }
 
     pub fn hasMultRet(k: ExpKind) bool {
@@ -183,7 +183,7 @@ pub const BinOpr = enum(u8) {
     none,
 
     fn foldable(o: BinOpr) bool {
-        return @intFromEnum(o) <= @intFromEnum(BinOpr.shr);
+        return @backingInt(o) <= @backingInt(BinOpr.shr);
     }
 };
 
@@ -218,7 +218,7 @@ const KKey = struct {
     /// forwarding stall on every lookup.
     const Context = struct {
         pub fn hash(_: Context, k: KKey) u64 {
-            return std.hash.int(k.bits ^ @as(u64, @intFromEnum(k.tag)) << 61);
+            return std.hash.int(k.bits ^ @as(u64, @backingInt(k.tag)) << 61);
         }
 
         pub fn eql(_: Context, a: KKey, b: KKey) bool {
@@ -395,7 +395,7 @@ pub const FuncState = struct {
 
     /// The instruction controlling the jump at `at`: its test, or itself.
     fn getJumpControl(fs: *FuncState, at: i32) *Instruction {
-        if (at >= 1 and opcodes.props[@intFromEnum(opcodes.op(fs.inst(at - 1).*))].is_test) return fs.inst(at - 1);
+        if (at >= 1 and opcodes.props[@backingInt(opcodes.op(fs.inst(at - 1).*))].is_test) return fs.inst(at - 1);
         return fs.inst(at);
     }
 
@@ -491,7 +491,7 @@ pub const FuncState = struct {
     }
 
     pub fn codeAbck(fs: *FuncState, o: OpCode, a_: i32, b_: i32, c_: i32, k_: bool) Error!i32 {
-        std.debug.assert(opcodes.props[@intFromEnum(o)].mode == .iABC);
+        std.debug.assert(opcodes.props[@backingInt(o)].mode == .iABC);
         return fs.code(opcodes.abc(o, @intCast(a_), @intCast(b_), @intCast(c_), k_));
     }
 
@@ -500,7 +500,7 @@ pub const FuncState = struct {
     }
 
     pub fn codevAbck(fs: *FuncState, o: OpCode, a_: i32, b_: i32, c_: i32, k_: bool) Error!i32 {
-        std.debug.assert(opcodes.props[@intFromEnum(o)].mode == .ivABC);
+        std.debug.assert(opcodes.props[@backingInt(o)].mode == .ivABC);
         return fs.code(opcodes.vabc(o, @intCast(a_), @intCast(b_), @intCast(c_), k_));
     }
 
@@ -896,7 +896,7 @@ pub const FuncState = struct {
 
     fn negateCondition(fs: *FuncState, e: *ExpDesc) void {
         const i = fs.getJumpControl(e.info);
-        std.debug.assert(opcodes.props[@intFromEnum(opcodes.op(i.*))].is_test);
+        std.debug.assert(opcodes.props[@backingInt(opcodes.op(i.*))].is_test);
         std.debug.assert(opcodes.op(i.*) != .testset);
         std.debug.assert(opcodes.op(i.*) != .@"test");
         setK(i, !opcodes.k(i.*));
@@ -1049,7 +1049,7 @@ pub const FuncState = struct {
         e1.info = at;
         e1.k = .reloc;
         try fs.fixLine(line);
-        _ = try fs.codeAbck(mmop, v1, v2, @intFromEnum(event), flip);
+        _ = try fs.codeAbck(mmop, v1, v2, @backingInt(event), flip);
         try fs.fixLine(line);
     }
 
@@ -1238,7 +1238,7 @@ pub const FuncState = struct {
     pub fn posfix(fs: *FuncState, opr_: BinOpr, e1: *ExpDesc, e2: *ExpDesc, line: u32) Error!void {
         var opr = opr_;
         try fs.dischargeVars(e2);
-        if (opr.foldable() and constFolding(@enumFromInt(@intFromEnum(opr)), e1, e2)) return;
+        if (opr.foldable() and constFolding(@fromBackingInt(@intCast(@backingInt(opr))), e1, e2)) return;
         switch (opr) {
             .@"and" => {
                 std.debug.assert(e1.t == no_jump);
@@ -1498,11 +1498,11 @@ fn constFolding(o: FoldOp, e1: *ExpDesc, e2: *const ExpDesc) bool {
 }
 
 fn binopr2op(opr: BinOpr, baser: BinOpr, base: OpCode) OpCode {
-    return @enumFromInt(@intFromEnum(opr) - @intFromEnum(baser) + @intFromEnum(base));
+    return @fromBackingInt(@intCast(@backingInt(opr) - @backingInt(baser) + @backingInt(base)));
 }
 
 fn binopr2tm(opr: BinOpr) State.Tm {
-    return @enumFromInt(@intFromEnum(opr) - @intFromEnum(BinOpr.add) + @intFromEnum(State.Tm.add));
+    return @fromBackingInt(@intCast(@backingInt(opr) - @backingInt(BinOpr.add) + @backingInt(State.Tm.add)));
 }
 
 /// ceil(log2(x)) for x >= 1, `luaO_ceillog2`.
@@ -1525,7 +1525,7 @@ fn finalTarget(insts: []const Instruction, i_: i32) i32 {
 // Instruction field setters.
 
 fn setOp(i: *Instruction, o: OpCode) void {
-    i.* = (i.* & ~@as(u32, 0x7f)) | @intFromEnum(o);
+    i.* = (i.* & ~@as(u32, 0x7f)) | @backingInt(o);
 }
 
 fn setA(i: *Instruction, v: i32) void {
@@ -1795,5 +1795,5 @@ fn writeInstruction(w: *std.Io.Writer, p: *const Proto, i: Instruction, pc: usiz
 
 fn tmName(c: u8) []const u8 {
     if (c >= State.Tm.count) return "?";
-    return @as(State.Tm, @enumFromInt(c)).name();
+    return @as(State.Tm, @fromBackingInt(@intCast(c))).name();
 }

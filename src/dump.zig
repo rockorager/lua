@@ -84,7 +84,8 @@ const Dumper = struct {
     /// Zeros up to a multiple of `alignment`, counted from the start.
     fn alignTo(d: *Dumper, alignment: usize) Writer.Error!void {
         const pad = (alignment - d.offset % alignment) % alignment;
-        try d.block(("\x00" ** 8)[0..pad]);
+        const zeros: [8]u8 = @splat(0);
+        try d.block(zeros[0..pad]);
     }
 
     /// An unsigned integer in MSB-first varint: 7 bits a byte, the high
@@ -207,7 +208,7 @@ const Parser = @import("Parser.zig");
 /// `TFORLOOP` luac encodes as a forced absolute line.
 pub const test_source = "local t, s = {}, \"a string longer than forty bytes, so it is long\"\n" ++
     "local function f(a, ...) return a, -7, 2.5, s, \"k\", \"k\" end\n" ++
-    "for k in pairs(t) do" ++ "\n" ** 130 ++ " s = k end\n" ++
+    "for k in pairs(t) do" ++ &@as([130]u8, @splat('\n')) ++ " s = k end\n" ++
     "return f";
 
 /// `luac -o` and `luac -s -o` of `test_source` saved as "golden.lua".

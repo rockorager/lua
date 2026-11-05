@@ -18,7 +18,7 @@ const build_options = @import("build_options");
 /// peak memory: the native stack's limit raises "C stack overflow" before
 /// it runs out (`docs/slop/results/stack-20261031.md`). Debug keeps both,
 /// for stack traces.
-pub const std_options: std.Options = if (builtin.mode == .Debug) .{} else .{
+pub const std_options: std.Options = if (builtin.mode == .debug) .{} else .{
     .enable_segfault_handler = false,
     .signal_stack_size = null,
 };
@@ -26,7 +26,7 @@ pub const std_options: std.Options = if (builtin.mode == .Debug) .{} else .{
 /// Release builds print a panic's message without a stack trace: the
 /// trace needs std's DWARF reader, ELF loader, and decompressor, a third
 /// of the executable's code (`docs/slop/results/lean-20261031.md`).
-pub const panic = std.debug.FullPanic(if (builtin.mode == .Debug) std.debug.defaultPanic else releasePanic);
+pub const panic = std.debug.FullPanic(if (builtin.mode == .debug) std.debug.defaultPanic else releasePanic);
 
 fn releasePanic(msg: []const u8, _: ?usize) noreturn {
     @branchHint(.cold);
@@ -261,7 +261,7 @@ const Interp = struct {
             const t = state.errorValue().typeOf();
             const text = if (t == .string or t == .number) state.errorMessage() else "(null)";
             const shown = text[0..@min(text.len, 400)];
-            it.message(std.fmt.bufPrint(&msg, "error calling 'print' ({s})", .{shown}) catch text);
+            it.message(std.mem.print(&msg, "error calling 'print' ({s})", .{shown}) catch text);
         };
     }
 };
@@ -417,22 +417,21 @@ fn pmain(it: *Interp, state: *lua.State) lua.Error!bool {
 const io_vtable: std.Io.VTable = blk: {
     const full = std.Io.Threaded.global_single_threaded.io().vtable.*;
     const unused = [_][]const u8{
-        "async",                   "concurrent",            "await",                 "cancel",
-        "groupAsync",              "groupConcurrent",       "groupAwait",            "groupCancel",
-        "dirCreateDirPath",        "dirCreateDirPathOpen",  "dirCreateFileAtomic",   "dirRenamePreserve",
-        "dirSymLink",              "dirReadLink",           "dirSetOwner",           "dirSetFileOwner",
-        "dirSetPermissions",       "dirSetFilePermissions", "dirSetTimestamps",      "dirHardLink",
-        "fileWriteFilePositional", "fileSetOwner",          "fileSetPermissions",    "fileSetTimestamps",
-        "fileLock",                "fileTryLock",           "fileUnlock",            "fileDowngradeLock",
-        "fileRealPath",            "fileHardLink",          "fileMemoryMapCreate",   "fileMemoryMapDestroy",
-        "fileMemoryMapSetLength",  "fileMemoryMapRead",     "fileMemoryMapWrite",    "processExecutableOpen",
-        "processExecutablePath",   "processSetCurrentDir",  "processSetCurrentPath", "processReplace",
-        "processReplacePath",      "progressParentFile",    "netListenIp",           "netAccept",
-        "netBindIp",               "netConnectIp",          "netListenUnix",         "netConnectUnix",
-        "netSocketCreatePair",     "netSend",               "netRead",               "netWrite",
-        "netWriteFile",            "netClose",              "netShutdown",           "netInterfaceNameResolve",
-        "netInterfaceName",        "netLookup",             "lockStderr",            "tryLockStderr",
-        "unlockStderr",
+        "async",                   "concurrent",              "await",                 "cancel",
+        "groupAsync",              "groupConcurrent",         "groupAwait",            "groupCancel",
+        "dirCreateDirPath",        "dirCreateDirPathOpen",    "dirCreateFileAtomic",   "dirRenamePreserve",
+        "dirSymLink",              "dirReadLink",             "dirSetOwner",           "dirSetFileOwner",
+        "dirSetPermissions",       "dirSetFilePermissions",   "dirSetTimestamps",      "dirHardLink",
+        "fileWriteFilePositional", "fileSetOwner",            "fileSetPermissions",    "fileSetTimestamps",
+        "fileLock",                "fileTryLock",             "fileUnlock",            "fileDowngradeLock",
+        "fileRealPath",            "fileHardLink",            "fileMemoryMapCreate",   "fileMemoryMapDestroy",
+        "fileMemoryMapSetLength",  "fileMemoryMapRead",       "fileMemoryMapWrite",    "processExecutableOpen",
+        "processExecutablePath",   "processSetCurrentDir",    "processSetCurrentPath", "processReplace",
+        "progressParentFile",      "inheritParentDir",        "inheritParentFile",     "netListenIp",
+        "netAccept",               "netBindIp",               "netConnectIp",          "netListenUnix",
+        "netConnectUnix",          "netSocketCreatePair",     "netWriteFile",          "netClose",
+        "netShutdown",             "netInterfaceNameResolve", "netInterfaceName",      "netLookup",
+        "lockStderr",              "tryLockStderr",           "unlockStderr",
     };
     var v = full;
     for (unused) |name| @field(v, name) = @ptrCast(&Unsupported(name).f);
@@ -450,11 +449,12 @@ fn Unsupported(comptime name: []const u8) type {
 pub fn main(init: std.process.Init.Minimal) u8 {
     // Debug builds keep the leak-checking allocator; the others use a fast
     // general-purpose one.
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer if (builtin.mode == .Debug) {
+    var debug_allocator: std.heap.SafeAllocator =
+        if (builtin.mode == .debug) .init(std.heap.page_allocator, .{}) else undefined;
+    defer if (builtin.mode == .debug) {
         _ = debug_allocator.deinit();
     };
-    const gpa = if (builtin.mode == .Debug) debug_allocator.allocator() else std.heap.smp_allocator;
+    const gpa = if (builtin.mode == .debug) debug_allocator.allocator() else std.heap.smp_allocator;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     var threaded: std.Io.Threaded = .init(gpa, .{ .argv0 = .init(init.args), .environ = init.environ });

@@ -40,7 +40,7 @@ const libs = [_]struct { []const u8, *const fn (*Thread) Value.Error!void }{
 };
 
 comptime {
-    std.debug.assert(libs.len == @typeInfo(Lib).@"enum".fields.len);
+    std.debug.assert(libs.len == @typeInfo(Lib).@"enum".field_names.len);
 }
 
 /// Adapts a library whose `open` takes the state.
@@ -56,7 +56,7 @@ fn onState(comptime open: fn (*State) Value.Error!void) fn (*Thread) Value.Error
 /// records each in `package.loaded`, as `luaL_requiref` does. `host`
 /// supplies their I/O and must outlive the state.
 pub fn openLibs(th: *Thread, host: *base.Host) Value.Error!void {
-    return openSome(th, host, .initFull());
+    return openSome(th, host, .full);
 }
 
 /// `openLibs` for the libraries in `which` only, in linit.c's order.
@@ -65,7 +65,7 @@ pub fn openSome(th: *Thread, host: *base.Host, which: std.EnumSet(Lib)) Value.Er
     const state = th.state;
     const loaded = try package.registryTable(state, package.loaded_key);
     for (libs, 0..) |lib, i| {
-        if (!which.contains(@enumFromInt(i))) continue;
+        if (!which.contains(@fromBackingInt(@intCast(i)))) continue;
         try lib[1](th);
         const name = try state.newString(lib[0]);
         try loaded.setStr(&state.heap, name, state.globals.getStr(name));
